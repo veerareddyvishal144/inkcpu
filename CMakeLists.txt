@@ -17,7 +17,7 @@ enable_testing()
 find_package(Threads REQUIRED)
 
 # Modules are optional so each owner can add theirs independently. Order = dependency order.
-foreach(m kernels_gemv kernels_misc core engine capi)
+foreach(m kernels_gemv kernels_misc kernels_gemm core engine capi)
   if(EXISTS ${CMAKE_SOURCE_DIR}/src/${m}/CMakeLists.txt)
     add_subdirectory(src/${m})
   endif()

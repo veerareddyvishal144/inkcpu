@@ -1,0 +1,22 @@
+# Private top level for agent C1 builds (the root configure is blocked while other modules are mid-edit):
+#   cmake -S src/engine/standalone -B build-c1 -G Ninja && ninja -C build-c1
+cmake_minimum_required(VERSION 3.20)
+project(inkcpu_c1 LANGUAGES C CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_compile_options(-O3 -march=skylake-avx512 -mfma -mf16c -fno-math-errno -Wall -Wextra -Wno-unused-parameter)
+get_filename_component(ROOT ${CMAKE_CURRENT_LIST_DIR}/../../.. ABSOLUTE)
+include_directories(${ROOT}/include)
+find_package(Threads REQUIRED)
+add_library(ink_kernels_gemv STATIC ${ROOT}/src/kernels_gemv/threadpool.cpp ${ROOT}/src/kernels_gemv/gemv.cpp ${ROOT}/src/kernels_gemv/gemv_ref.cpp)
+target_link_libraries(ink_kernels_gemv PUBLIC Threads::Threads)
+target_compile_options(ink_kernels_gemv PRIVATE -ffp-contract=off)
+add_library(ink_kernels_misc STATIC ${ROOT}/src/kernels_misc/vecmath.cpp ${ROOT}/src/kernels_misc/norms.cpp ${ROOT}/src/kernels_misc/sconv.cpp
+  ${ROOT}/src/kernels_misc/router_mix.cpp ${ROOT}/src/kernels_misc/attention.cpp ${ROOT}/src/kernels_misc/reference.cpp)
+target_link_libraries(ink_kernels_misc PUBLIC Threads::Threads)
+add_subdirectory(${ROOT}/src/engine engine)
+add_subdirectory(${ROOT}/src/capi capi)

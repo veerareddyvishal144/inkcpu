@@ -1,0 +1,43 @@
+loadavg_before 6.89 8.15 6.87 start 22:04:20
+0.01.858.445 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.02.055.015 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.714.018 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.597.415 I cmn          init: llama threadpool init, n_threads = 8
+0.05.089.854 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.05.816.572 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.05.937.856 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.05.937.872 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|>tool_declare<|content_xml|>[{"description":"Get the current weather for a city","name":"get_weather","parameters":{"properties":{"city":{"description":"City name","type":"string"},"unit":{"enum":["celsius","fahrenheit"],"type":"string"}},"required":["city"],"type":"object"},"type":"function"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>What is the weather like in Lisbon right now? Please use celsius.<|end_message|><|message_model|>0.05.963.504 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.05.963.509 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.05.963.510 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.05.963.745 I init: DFlash target features via device buffer
+<|content_thinking|>The user asks for current weather in Lisbon in celsius. Need use get_weather tool. Need call function. Then answer based on result.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Lisbon","unit":"celsius"}}<|end_message|>
+
+0.42.347.738 I encoded  153 tokens in   20.491 seconds, speed:    7.467 t/s
+0.42.347.741 I decoded   72 tokens in   15.894 seconds, speed:    4.530 t/s
+0.42.347.742 I 
+0.42.347.743 I n_draft   = 7
+0.42.347.743 I n_predict = 72
+0.42.347.744 I n_drafted = 98
+0.42.347.744 I n_accept  = 58
+0.42.347.745 I accept    = 59.184%
+0.42.347.746 I 
+0.42.347.746 I draft:
+
+0.42.347.790 I 
+0.42.347.790 I target:
+
+0.42.347.796 I common_perf_print:    sampling time =      42.88 ms
+0.42.347.797 I common_perf_print:    samplers time =      12.92 ms /    72 tokens
+0.42.347.803 I common_perf_print:        load time =    2914.46 ms
+0.42.347.806 I common_perf_print: prompt eval time =   11675.91 ms /   264 tokens (   44.23 ms per token,    22.61 tokens per second)
+0.42.347.807 I common_perf_print:        eval time =       0.00 ms /     1 runs   (    0.00 ms per token,      inf tokens per second)
+0.42.347.809 I common_perf_print:       total time =   37258.02 ms /   265 tokens
+0.42.347.811 I common_perf_print: unaccounted time =   25539.22 ms /  68.5 %      (total - sampling - prompt eval - eval) / (total)
+0.42.347.812 I common_perf_print:    graphs reused =         13
+0.42.347.812 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 12.00 9.34 7.34 end 22:05:04 exit=0

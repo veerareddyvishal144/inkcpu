@@ -1,0 +1,97 @@
+# version 3 tensors 54 kv 41
+KV general.architecture = dflash
+KV general.type = model
+KV general.name = Inkling-2-Mini
+KV general.size_label = 318M
+KV dflash.block_count = 3
+KV dflash.context_length = 1048576
+KV dflash.embedding_length = 2304
+KV dflash.feed_forward_length = 9216
+KV dflash.attention.head_count = 24
+KV dflash.attention.head_count_kv = 8
+KV dflash.rope.freq_base = 1000000.0
+KV dflash.attention.layer_norm_rms_epsilon = 9.999999974752427e-07
+KV dflash.attention.key_length = 128
+KV dflash.attention.value_length = 128
+KV dflash.vocab_size = 201024
+KV dflash.vocab_size_unpadded = 200058
+KV dflash.block_size = 8
+KV dflash.target_layers = [5, 23, 41, 48]
+KV dflash.dspark.markov_rank = 256
+KV dflash.sample_from_anchor = False
+KV dflash.has_confidence_head = False
+KV dflash.attention.causal = False
+KV dflash.attention.sliding_window = 1024
+KV dflash.attention.sliding_window_pattern = [True, False, True]
+KV dflash.rope.dimension_count = 128
+KV dflash.final_logit_softcapping = 30.0
+KV tokenizer.ggml.model = gpt2
+KV tokenizer.ggml.pre = inkling2
+KV tokenizer.ggml.tokens = ['!', '"', '#', '$', '%', '&', "'", '(', ')', '*', '+', ',']...(200058 items)
+KV tokenizer.ggml.token_type = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]...(200058 items)
+KV tokenizer.ggml.merges = ['i n', 'e r', 't h', 'a n', 'o n', 'r e', 'e n', 'a t', 'o r', 's t', 'a l', 'a r']...(424413 items)
+KV tokenizer.ggml.eos_token_id = 200006
+KV tokenizer.ggml.eot_token_id = 200006
+KV tokenizer.ggml.add_bos_token = False
+KV tokenizer.ggml.add_eos_token = False
+KV tokenizer.chat_template = {%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}
+{%- set role_token = {"user": "<|message_user|>", "assistant": "<|message_mod...
+KV tokenizer.ggml.clean_spaces = False
+KV tokenizer.ggml.mask_token_id = 0
+KV general.basename = Inkling-2-Mini
+KV general.quantization_version = 2
+KV general.file_type = 7
+T dspark_fuse.weight [4, 4] F32
+T dspark_hidden_out.bias [2304] F32
+T dspark_hidden_out.weight [256, 2304] BF16
+T dspark_norm.weight [2304] F32
+T joint_proj.bias [768] F32
+T joint_proj.weight [5120, 768] BF16
+T markov_w1.weight [256, 201024] BF16
+T mask_embd.weight [2304] F32
+T output_norm.weight [2304] F32
+T blk.0.attn_k.weight [2304, 1024] Q8_0
+T blk.0.attn_k_ctx.weight [2304, 1024] Q8_0
+T blk.0.attn_k_ctx_norm.weight [128] F32
+T blk.0.attn_k_norm.weight [128] F32
+T blk.0.attn_norm.weight [2304] F32
+T blk.0.attn_output.weight [3072, 2304] Q8_0
+T blk.0.attn_q.weight [2304, 3072] Q8_0
+T blk.0.attn_q_norm.weight [128] F32
+T blk.0.attn_v.weight [2304, 1024] Q8_0
+T blk.0.attn_v_ctx.weight [2304, 1024] Q8_0
+T blk.0.dflare_norm.weight [2304] F32
+T blk.0.ffn_down.weight [9216, 2304] Q8_0
+T blk.0.ffn_gate.weight [2304, 9216] Q8_0
+T blk.0.ffn_norm.weight [2304] F32
+T blk.0.ffn_up.weight [2304, 9216] Q8_0
+T blk.1.attn_k.weight [2304, 1024] Q8_0
+T blk.1.attn_k_ctx.weight [2304, 1024] Q8_0
+T blk.1.attn_k_ctx_norm.weight [128] F32
+T blk.1.attn_k_norm.weight [128] F32
+T blk.1.attn_norm.weight [2304] F32
+T blk.1.attn_output.weight [3072, 2304] Q8_0
+T blk.1.attn_q.weight [2304, 3072] Q8_0
+T blk.1.attn_q_norm.weight [128] F32
+T blk.1.attn_v.weight [2304, 1024] Q8_0
+T blk.1.attn_v_ctx.weight [2304, 1024] Q8_0
+T blk.1.dflare_norm.weight [2304] F32
+T blk.1.ffn_down.weight [9216, 2304] Q8_0
+T blk.1.ffn_gate.weight [2304, 9216] Q8_0
+T blk.1.ffn_norm.weight [2304] F32
+T blk.1.ffn_up.weight [2304, 9216] Q8_0
+T blk.2.attn_k.weight [2304, 1024] Q8_0
+T blk.2.attn_k_ctx.weight [2304, 1024] Q8_0
+T blk.2.attn_k_ctx_norm.weight [128] F32
+T blk.2.attn_k_norm.weight [128] F32
+T blk.2.attn_norm.weight [2304] F32
+T blk.2.attn_output.weight [3072, 2304] Q8_0
+T blk.2.attn_q.weight [2304, 3072] Q8_0
+T blk.2.attn_q_norm.weight [128] F32
+T blk.2.attn_v.weight [2304, 1024] Q8_0
+T blk.2.attn_v_ctx.weight [2304, 1024] Q8_0
+T blk.2.dflare_norm.weight [2304] F32
+T blk.2.ffn_down.weight [9216, 2304] Q8_0
+T blk.2.ffn_gate.weight [2304, 9216] Q8_0
+T blk.2.ffn_norm.weight [2304] F32
+T blk.2.ffn_up.weight [2304, 9216] Q8_0

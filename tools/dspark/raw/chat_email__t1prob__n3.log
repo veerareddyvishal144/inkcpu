@@ -1,0 +1,47 @@
+loadavg_before 17.49 16.87 13.46 start 22:21:01
+0.03.100.676 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.03.398.492 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.04.502.858 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.07.938.946 I cmn          init: llama threadpool init, n_threads = 8
+0.08.452.096 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.09.637.442 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.09.860.413 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.09.860.436 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a short, friendly email to a colleague asking to move our Tuesday project meeting to Thursday afternoon.<|end_message|><|message_model|><|content_text|>0.09.890.172 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.09.890.180 I common_speculative_impl_draft_dflash: - n_max=3, n_min=0, p_min=0.00
+0.09.890.181 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.09.890.387 I init: DFlash target features via device buffer
+Hi [Colleague's Name],
+
+I hope you’re having a great week so far. Would you be free to move our Tuesday project meeting to Thursday afternoon instead? I’d love to reschedule it so we can fit it in more smoothly, and I think Thursday would work better for everyone involved.
+
+Let me know if that time works for you—happy to adjust anything
+
+1.07.065.911 I encoded   36 tokens in    6.657 seconds, speed:    5.408 t/s
+1.07.065.915 I decoded   81 tokens in   50.519 seconds, speed:    1.603 t/s
+1.07.065.916 I 
+1.07.065.917 I n_draft   = 3
+1.07.065.917 I n_predict = 81
+1.07.065.918 I n_drafted = 114
+1.07.065.919 I n_accept  = 41
+1.07.065.921 I accept    = 35.965%
+1.07.065.921 I 
+1.07.065.922 I draft:
+
+1.07.065.974 I 
+1.07.065.975 I target:
+
+1.07.065.984 I common_perf_print:    sampling time =    2680.32 ms
+1.07.065.986 I common_perf_print:    samplers time =     408.35 ms /    81 tokens
+1.07.065.996 I common_perf_print:        load time =    4845.68 ms
+1.07.066.000 I common_perf_print: prompt eval time =   36035.82 ms /   188 tokens (  191.68 ms per token,     5.22 tokens per second)
+1.07.066.003 I common_perf_print:        eval time =     430.03 ms /     1 runs   (  430.03 ms per token,     2.33 tokens per second)
+1.07.066.005 I common_perf_print:       total time =   58613.99 ms /   189 tokens
+1.07.066.009 I common_perf_print: unaccounted time =   19467.82 ms /  33.2 %      (total - sampling - prompt eval - eval) / (total)
+1.07.066.010 I common_perf_print:    graphs reused =         36
+1.07.066.011 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 22.71 18.50 14.27 end 22:22:10 exit=0

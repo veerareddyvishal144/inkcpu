@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>A train leaves city A at 9:00 travelling toward city B at 80 km/h. City B is 300 km away. A second train leaves B at 9:30 travelling toward A at 100 km/h. At what time and how far from A do they meet?<|end_message|><|message_model|><|content_thinking|>

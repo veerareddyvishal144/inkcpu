@@ -1,0 +1,13 @@
+import heapq
+from collections import defaultdict
+
+
+def dijkstra(graph, source):
+    """Return the shortest distance from source to every reachable node.
+
+    graph is an adjacency dict: graph[u] = [(v, weight), ...] with non-negative weights.
+    """
+    dist = defaultdict(lambda: float("inf"))
+    dist[source] = 0
+    heap = [(0, source)]
+    while heap:

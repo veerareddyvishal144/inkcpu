@@ -1,0 +1,47 @@
+loadavg_before 8.13 8.52 6.94 start 22:03:44
+0.01.322.869 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.449.195 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.01.933.990 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.566.285 I cmn          init: llama threadpool init, n_threads = 8
+0.03.842.330 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.366.557 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.470.451 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.470.467 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>A train leaves city A at 9:00 travelling toward city B at 80 km/h. City B is 300 km away. A second train leaves B at 9:30 travelling toward A at 100 km/h. At what time and how far from A do they meet?<|end_message|><|message_model|><|content_thinking|>0.04.486.726 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.04.486.730 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.04.486.731 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.04.486.853 I init: DFlash target features via device buffer
+We need answer math. Need compute carefully.
+
+Train1 leaves A at 9:00 toward B at 80 km/h. City B 300 km away. Train2 leaves B at 9:30 toward A at 100 km/h. Need time and distance from A where meet.
+
+Set t in hours after 9:00. Train1 position from A: x1
+
+0.34.318.331 I encoded   80 tokens in    6.224 seconds, speed:   12.853 t/s
+0.34.318.333 I decoded   81 tokens in   23.607 seconds, speed:    3.431 t/s
+0.34.318.334 I 
+0.34.318.335 I n_draft   = 7
+0.34.318.335 I n_predict = 81
+0.34.318.336 I n_drafted = 158
+0.34.318.337 I n_accept  = 56
+0.34.318.338 I accept    = 35.443%
+0.34.318.339 I 
+0.34.318.340 I draft:
+
+0.34.318.450 I 
+0.34.318.450 I target:
+
+0.34.318.456 I common_perf_print:    sampling time =      57.37 ms
+0.34.318.458 I common_perf_print:    samplers time =      17.86 ms /    81 tokens
+0.34.318.465 I common_perf_print:        load time =    2288.03 ms
+0.34.318.470 I common_perf_print: prompt eval time =   17462.02 ms /   261 tokens (   66.90 ms per token,    14.95 tokens per second)
+0.34.318.473 I common_perf_print:        eval time =     376.46 ms /     1 runs   (  376.46 ms per token,     2.66 tokens per second)
+0.34.318.475 I common_perf_print:       total time =   30476.21 ms /   262 tokens
+0.34.318.478 I common_perf_print: unaccounted time =   12580.36 ms /  41.3 %      (total - sampling - prompt eval - eval) / (total)
+0.34.318.479 I common_perf_print:    graphs reused =         20
+0.34.318.480 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 6.89 8.15 6.87 end 22:04:20 exit=0

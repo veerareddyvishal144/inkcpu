@@ -1,0 +1,45 @@
+loadavg_before 17.80 14.24 10.00 start 22:09:53
+0.01.556.729 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.718.276 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.284.731 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.949.363 I cmn          init: llama threadpool init, n_threads = 8
+0.04.269.228 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.931.603 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.05.055.391 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.05.055.404 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+The old lighthouse keeper had not spoken to another living soul in nearly three weeks when the storm finally cleared. The sea, grey and heaving, slowly settled back into its long habit of rolling toward the rocks, and far out on the horizon, where the clouds had begun to break into ragged strips of pale gold, he saw the first sail.0.05.081.529 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.05.081.535 I common_speculative_impl_draft_dflash: - n_max=4, n_min=0, p_min=0.00
+0.05.081.536 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.05.081.676 I init: DFlash target features via device buffer
+
+
+He had been watching the horizon every hour for days, but he had not expected to see anything so soon. The sail was small and dark, and it moved with the slow, deliberate rhythm of a vessel that had been under way for a long time. He stood at the rail of the lighthouse, his hands cold and his eyes fixed on the distant shape, and he felt something shift inside
+
+1.07.356.394 I encoded   74 tokens in    7.654 seconds, speed:    9.668 t/s
+1.07.356.396 I decoded   81 tokens in   54.621 seconds, speed:    1.483 t/s
+1.07.356.397 I 
+1.07.356.397 I n_draft   = 4
+1.07.356.398 I n_predict = 81
+1.07.356.398 I n_drafted = 183
+1.07.356.398 I n_accept  = 32
+1.07.356.399 I accept    = 17.486%
+1.07.356.400 I 
+1.07.356.400 I draft:
+
+1.07.356.454 I 
+1.07.356.455 I target:
+
+1.07.356.460 I common_perf_print:    sampling time =      72.11 ms
+1.07.356.461 I common_perf_print:    samplers time =      24.50 ms /    81 tokens
+1.07.356.469 I common_perf_print:        load time =    2445.10 ms
+1.07.356.471 I common_perf_print: prompt eval time =   43783.28 ms /   303 tokens (  144.50 ms per token,     6.92 tokens per second)
+1.07.356.473 I common_perf_print:        eval time =     619.08 ms /     2 runs   (  309.54 ms per token,     3.23 tokens per second)
+1.07.356.475 I common_perf_print:       total time =   63087.33 ms /   305 tokens
+1.07.356.477 I common_perf_print: unaccounted time =   18612.87 ms /  29.5 %      (total - sampling - prompt eval - eval) / (total)
+1.07.356.477 I common_perf_print:    graphs reused =         45
+1.07.356.478 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 18.28 15.07 10.59 end 22:11:01 exit=0

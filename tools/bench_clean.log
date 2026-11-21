@@ -1,2 +1,5 @@
 decode threads=12: 5.45 +- 0.05 tok/s (load1 1.46 -> 6.22, other CPUs busy 0.2, 38 s)
 prefill threads=12: 19.02 +- 0.14 tok/s (load1 1.93 -> 8.14, other CPUs busy 0.2, 57 s)
+decode threads=16: 4.71 +- 0.07 tok/s (load1 1.79 -> 8.87, other CPUs busy 0.4, 44 s)
+prefill threads=16: 22.43 +- 1.27 tok/s (load1 1.73 -> 9.64, other CPUs busy 0.7, 48 s)
+bench_llama: rows appended to tools/bench_baseline_clean.csv

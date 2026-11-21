@@ -1,0 +1,20 @@
+# Module kernels_gemm (agent G): batched GEMM kernels for prompt processing (Q8_0, NVFP4, MoE grouped, BF16/F32).
+add_library(ink_kernels_gemm STATIC gemm.cpp gemm_small.cpp)
+target_include_directories(ink_kernels_gemm PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(ink_kernels_gemm PUBLIC ink_kernels_gemv)
+# results must match the gemv kernels bit for bit: no implicit mul+add contraction
+target_compile_options(ink_kernels_gemm PRIVATE -ffp-contract=off)
+
+set(INK_GEMM_TESTS ${CMAKE_SOURCE_DIR}/tests/kernels_gemm)
+add_executable(test_gemm ${INK_GEMM_TESTS}/test_gemm.cpp)
+target_include_directories(test_gemm PRIVATE ${CMAKE_SOURCE_DIR}/tests/kernels_gemv)
+target_compile_options(test_gemm PRIVATE -ffp-contract=off)
+target_link_libraries(test_gemm ink_kernels_gemm)
+add_test(NAME test_gemm COMMAND test_gemm)
+foreach(b bench_peak bench_gemm)
+  if(EXISTS ${INK_GEMM_TESTS}/${b}.cpp)
+    add_executable(${b} ${INK_GEMM_TESTS}/${b}.cpp)
+    target_include_directories(${b} PRIVATE ${CMAKE_SOURCE_DIR}/tests/kernels_gemv)
+    target_link_libraries(${b} ink_kernels_gemm)
+  endif()
+endforeach()

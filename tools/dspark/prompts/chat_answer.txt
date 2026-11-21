@@ -1,0 +1,1 @@
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Explain in one short paragraph why the sky is blue during the day and red at sunset.<|end_message|><|message_model|><|content_text|>

@@ -1,0 +1,43 @@
+loadavg_before 16.10 13.04 9.21 start 22:08:20
+0.01.466.064 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.596.002 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.102.038 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.607.201 I cmn          init: llama threadpool init, n_threads = 8
+0.03.949.902 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.590.727 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.711.131 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.711.144 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Explain in one short paragraph why the sky is blue during the day and red at sunset.<|end_message|><|message_model|><|content_text|>0.04.732.049 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.04.732.054 I common_speculative_impl_draft_dflash: - n_max=4, n_min=0, p_min=0.00
+0.04.732.055 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.04.732.190 I init: DFlash target features via device buffer
+The sky appears blue during the day because sunlight scatters off tiny air molecules, with shorter blue wavelengths scattering more strongly in all directions. At sunset, the sun is low on the horizon, so its light travels through a much thicker layer of atmosphere. This longer path scatters away most of the blue light, leaving the red and orange wavelengths—which are longer and less easily
+
+0.47.896.585 I encoded   34 tokens in    3.065 seconds, speed:   11.093 t/s
+0.47.896.588 I decoded   81 tokens in   40.100 seconds, speed:    2.020 t/s
+0.47.896.589 I 
+0.47.896.590 I n_draft   = 4
+0.47.896.591 I n_predict = 81
+0.47.896.592 I n_drafted = 173
+0.47.896.593 I n_accept  = 36
+0.47.896.595 I accept    = 20.809%
+0.47.896.595 I 
+0.47.896.596 I draft:
+
+0.47.896.658 I 
+0.47.896.659 I target:
+
+0.47.896.666 I common_perf_print:    sampling time =      73.80 ms
+0.47.896.668 I common_perf_print:    samplers time =      24.77 ms /    81 tokens
+0.47.896.678 I common_perf_print:        load time =    2249.84 ms
+0.47.896.682 I common_perf_print: prompt eval time =   31793.61 ms /   250 tokens (  127.17 ms per token,     7.86 tokens per second)
+0.47.896.686 I common_perf_print:        eval time =     361.40 ms /     1 runs   (  361.40 ms per token,     2.77 tokens per second)
+0.47.896.688 I common_perf_print:       total time =   43946.86 ms /   251 tokens
+0.47.896.691 I common_perf_print: unaccounted time =   11718.05 ms /  26.7 %      (total - sampling - prompt eval - eval) / (total)
+0.47.896.692 I common_perf_print:    graphs reused =         42
+0.47.896.693 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 16.06 13.42 9.53 end 22:09:10 exit=0

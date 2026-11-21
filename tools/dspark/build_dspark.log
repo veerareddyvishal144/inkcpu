@@ -1,0 +1,128 @@
+From https://github.com/ggml-org/llama.cpp
+ * branch            refs/pull/32218/head -> FETCH_HEAD
+Previous HEAD position was e854428 Merge pull request #393 from unslothai/pinset/repin-389
+HEAD is now at 0a9105d llama : implement Inkling2 DSpark block drafting
+0a9105d llama : implement Inkling2 DSpark block drafting
+e50c254 sycl: bound CONV_TRANSPOSE_1D input iteration (#31109)
+660be55 ggml : improvements to the memory access pattern in `ggml_compute_forward_mul_mat_one_chunk` (#30846)
+0a9105de42d2c3e3cbc72cb1f398c743ada4f342 Piotr Wilkin Sat Nov 21 17:24:19 2026 +0100 llama : implement Inkling2 DSpark block drafting
+
+ common/sampling.cpp            |   7 +-
+ common/speculative.cpp         | 282 +++++++++++++++++++++++++++++++++++------
+ include/llama.h                |   1 +
+ src/llama-arch.cpp             |  14 ++
+ src/llama-arch.h               |   7 +
+ src/llama-batch.cpp            |   3 +
+ src/llama-context.cpp          |  99 ++++++++++-----
+ src/llama-context.h            |   4 +-
+ src/llama-hparams.h            |   1 +
+ src/llama-model.cpp            |   4 +
+ src/llama-model.h              |  10 ++
+ src/models/dflash.cpp          |  58 ++++++++-
+ src/models/dspark.cpp          | 239 ++++++++++++++++++++++++++++++++--
+ src/models/inkling2-loop.cpp   |   4 +
+ src/models/inkling2.cpp        |   2 +
+ src/models/models.h            |   8 ++
+ tests/test-backend-sampler.cpp |  49 +++----
+ 17 files changed, 672 insertions(+), 120 deletions(-)
+From https://github.com/ggml-org/llama.cpp
+ * branch            78d779424d83e17a450807fe42e28445510134b4 -> FETCH_HEAD
+-- Adding CPU backend variant ggml-cpu: -march=native 
+-- ggml version: 1.0.0
+-- ggml commit:  0a9105d
+-- OpenSSL found: 3.0.2
+-- Generating embedded license file for target: llama-app
+-- Configuring done
+-- Generating done
+-- Build files have been written to: /data/inkling-mini/llama-unsloth/build
+[136/188] Building CXX object common/CMakeFiles/llama-common.dir/jinja/runtime.cpp.o
+[137/188] Building CXX object common/CMakeFiles/llama-common.dir/speculative.cpp.o
+[138/188] Building CXX object common/CMakeFiles/llama-common.dir/jinja/caps.cpp.o
+[139/188] Building CXX object common/CMakeFiles/llama-common.dir/jinja/value.cpp.o
+[140/188] Linking CXX shared library bin/libllama-common.so.1.0.0
+[141/188] Creating library symlink bin/libllama-common.so.1 bin/libllama-common.so
+[142/188] Linking CXX executable bin/llama-speculative-simple
+[143/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-queue.cpp.o
+[144/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-chat.cpp.o
+[145/188] Provisioning UI assets
+-- UI: downloading from b30: https://huggingface.co/buckets/ggml-org/llama-ui/resolve/b30/dist.tar.gz
+-- UI: download dist.tar.gz.sha256 from b30 failed: "HTTP response code said error"
+-- UI: downloading from latest: https://huggingface.co/buckets/ggml-org/llama-ui/resolve/latest/dist.tar.gz
+-- UI: archive verified and extracted
+-- UI: HF download succeeded, stamp updated (ggml-org/llama-ui|b30, resolved: latest)
+-- UI: gzip compression applied (/data/inkling-mini/llama-unsloth/build/ui/apps/chat/ui-gzip/_gzip)
+-- UI: embedded 291 assets
+[146/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-decision.cpp.o
+[147/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-task.cpp.o
+[148/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-common.cpp.o
+[149/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-stream.cpp.o
+[150/188] Building CXX object tools/cli/CMakeFiles/llama-cli.dir/main.cpp.o
+[151/188] Building CXX object ui/apps/chat/CMakeFiles/llama-ui.dir/ui.cpp.o
+[152/188] Linking CXX static library ui/apps/chat/libllama-ui.a
+[153/188] Building CXX object tools/cli/CMakeFiles/llama-cli-impl.dir/cli.cpp.o
+[154/188] Building CXX object tools/cli/CMakeFiles/llama-cli-impl.dir/cli-client.cpp.o
+[155/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-realtime.cpp.o
+[156/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-mcp.cpp.o
+[157/188] Building CXX object tools/cli/CMakeFiles/llama-cli-impl.dir/cli-context.cpp.o
+[158/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-slot-sched.cpp.o
+[159/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-schema.cpp.o
+[160/188] Building CXX object tools/server/CMakeFiles/llama-server.dir/main.cpp.o
+[161/188] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-connect.cpp.o
+[162/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-tools.cpp.o
+[163/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/Unity/unity_4_cxx.cxx.o
+[164/188] Building CXX object tools/server/CMakeFiles/server-context.dir/server-context.cpp.o
+[165/188] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server.cpp.o
+[166/188] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-models-sched.cpp.o
+[167/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/Unity/unity_1_cxx.cxx.o
+[168/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/Unity/unity_2_cxx.cxx.o
+[169/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/Unity/unity_0_cxx.cxx.o
+[170/188] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-http.cpp.o
+[171/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/Unity/unity_3_cxx.cxx.o
+[172/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-audio.cpp.o
+[173/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-image.cpp.o
+[174/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-helper-video-ffmpeg.cpp.o
+[175/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-graph.cpp.o
+[176/188] Building CXX object tools/server/CMakeFiles/llama-server-impl.dir/server-models.cpp.o
+[177/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-helper-gen.cpp.o
+[178/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd.cpp.o
+[179/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-subcontext.cpp.o
+[180/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-helper.cpp.o
+[181/188] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-model.cpp.o
+[182/188] Linking CXX shared library bin/libmtmd.so.1.0.0
+[183/188] Creating library symlink bin/libmtmd.so.1 bin/libmtmd.so
+[184/188] Linking CXX static library tools/server/libserver-context.a
+[185/188] Linking CXX shared library bin/libllama-server-impl.so
+[186/188] Linking CXX shared library bin/libllama-cli-impl.so
+[187/188] Linking CXX executable bin/llama-server
+[188/188] Linking CXX executable bin/llama-cli
+BUILD_DONE
+total 35172
+drwxr-x---  2 azureuser users    4096 Nov 21 21:51 .
+drwxr-x--- 13 azureuser users    4096 Nov 21 21:48 ..
+lrwxrwxrwx  1 azureuser users      17 Nov 21 21:49 libggml-base.so -> libggml-base.so.1
+lrwxrwxrwx  1 azureuser users      22 Nov 21 21:45 libggml-base.so.0 -> libggml-base.so.0.27.0
+-rwxr-x---  1 azureuser users  906112 Nov 21 21:45 libggml-base.so.0.27.0
+lrwxrwxrwx  1 azureuser users      21 Nov 21 21:49 libggml-base.so.1 -> libggml-base.so.1.0.0
+-rwxr-x---  1 azureuser users  937600 Nov 21 21:49 libggml-base.so.1.0.0
+lrwxrwxrwx  1 azureuser users      16 Nov 21 21:49 libggml-cpu.so -> libggml-cpu.so.1
+lrwxrwxrwx  1 azureuser users      21 Nov 21 21:45 libggml-cpu.so.0 -> libggml-cpu.so.0.27.0
+-rwxr-x---  1 azureuser users 1524528 Nov 21 21:45 libggml-cpu.so.0.27.0
+lrwxrwxrwx  1 azureuser users      20 Nov 21 21:49 libggml-cpu.so.1 -> libggml-cpu.so.1.0.0
+-rwxr-x---  1 azureuser users 1590360 Nov 21 21:49 libggml-cpu.so.1.0.0
+lrwxrwxrwx  1 azureuser users      12 Nov 21 21:49 libggml.so -> libggml.so.1
+lrwxrwxrwx  1 azureuser users      17 Nov 21 21:45 libggml.so.0 -> libggml.so.0.27.0
+-rwxr-x---  1 azureuser users   55584 Nov 21 21:45 libggml.so.0.27.0
+lrwxrwxrwx  1 azureuser users      16 Nov 21 21:49 libggml.so.1 -> libggml.so.1.0.0
+-rwxr-x---  1 azureuser users   55584 Nov 21 21:49 libggml.so.1.0.0
+-rwxr-x---  1 azureuser users  285856 Nov 21 21:51 libllama-cli-impl.so
+lrwxrwxrwx  1 azureuser users      20 Nov 21 21:50 libllama-common.so -> libllama-common.so.1
+lrwxrwxrwx  1 azureuser users      24 Nov 21 21:50 libllama-common.so.1 -> libllama-common.so.1.0.0
+-rwxr-x---  1 azureuser users 7059696 Nov 21 21:50 libllama-common.so.1.0.0
+-rwxr-x---  1 azureuser users 7963368 Nov 21 21:51 libllama-server-impl.so
+lrwxrwxrwx  1 azureuser users      13 Nov 21 21:49 libllama.so -> libllama.so.1
+lrwxrwxrwx  1 azureuser users      17 Nov 21 21:45 libllama.so.0 -> libllama.so.0.7.0
+-rwxr-x---  1 azureuser users 5274880 Nov 21 21:45 libllama.so.0.7.0
+lrwxrwxrwx  1 azureuser users      17 Nov 21 21:49 libllama.so.1 -> libllama.so.1.0.0
+-rwxr-x---  1 azureuser users 5657632 Nov 21 21:49 libllama.so.1.0.0
+lrwxrwxrwx  1 azureuser users      12 Nov 21 21:51 libmtmd.so -> libmtmd.so.1
+lrwxrwxrwx  1 azureuser users      16 Nov 21 21:51 libmtmd.so.1 -> libmtmd.so.1.0.0

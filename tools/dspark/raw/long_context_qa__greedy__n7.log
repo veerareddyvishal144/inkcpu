@@ -1,0 +1,57 @@
+loadavg_before 12.00 9.34 7.34 start 22:05:04
+0.01.442.911 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.572.821 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.099.100 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.609.271 I cmn          init: llama threadpool init, n_threads = 8
+0.03.928.876 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.494.791 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.602.537 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.602.551 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Read the following passage and then answer the question.
+
+Passage:
+= Homarus gammarus =
+Homarus gammarus, known as the European lobster or common lobster, is a species of clawed lobster from the eastern Atlantic Ocean, Mediterranean Sea and parts of the Black Sea. It is closely related to the American lobster, H. americanus. It may grow to a length of 60 cm ( 24 in ) and a mass of 6 kilograms ( 13 lb ), and bears a conspicuous pair of claws. In life, the lobsters are blue, only becoming " lobster red " on cooking. Mating occurs in the summer, producing eggs which are carried by the females for up to a year before hatching into planktonic larvae. Homarus gammarus is a highly esteemed food, and is widely caught using lobster pots, mostly around the British Isles.
+= = Description = =
+Homarus gammarus is a large crustacean, with a body length up to 60 centimetres ( 24 in ) and weighing up to 5 – 6 kilograms ( 11 – 13 lb ), although the lobsters caught in lobster pots are usually 23 – 38 cm ( 9 – 15 in ) long and weigh 0.7 – 2.2 kg ( 1.5 – 4.9 lb ). Like other crustaceans, lobsters have a hard exoskeleton which they must shed in order to grow, in a process called ecdysis ( moulting ). This may occur several times a year for young lobsters, but decreases to once every 1 – 2 years for larger animals.
+The first pair of pereiopods is armed with a large, asymmetrical pair of claws. The larger one is the " crusher ", and has rounded nodules used for crushing prey; the other is the " cutter ", which has sharp inner edges, and is used for holding or tearing the prey. Usually, the left claw is the crusher, and the right is the cutter.
+The exoskeleton is generally blue above, with spots that coalesce, and yellow below. The red colour associated with lobsters only appears after cooking. This occurs because, in life, the red pigment astaxanthin is bound to a protein complex, but the complex is broken up by the heat of cooking, releasing the red pigment.
+The closest relative of H. gammarus is the American lobster, Homarus americanus. The two species are very similar, and can be crossed artificially, although hybrids are unlikely to occur in the wild since their ranges do not overlap. The two species can be distinguished by a number of characteristics :
+The rostrum of H. americanus bears one or more spines on the underside, which are lacking in H. gammarus.
+The spines on the claws of H. americanus are red or red-tipped, while those of H. gammarus are white or white-tipped.
+The underside of the claw of H.
+
+Question: Summarise the passage above in three sentences.<|end_message|><|message_model|><|content_text|>0.04.626.309 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.04.626.314 I common_speculative_impl_draft_dflash: - n_max=7, n_min=0, p_min=0.00
+0.04.626.315 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.04.626.484 I init: DFlash target features via device buffer
+Homarus gammarus, commonly known as the European lobster, is a large crustacean found in the eastern Atlantic, Mediterranean, and parts of the Black Sea, growing up to 60 cm and 6 kg. It is characterized by a blue and yellow exoskeleton that turns red when cooked, and it possesses a large, asymmetrical pair of claws used for crush
+
+1.43.340.759 I encoded  715 tokens in   67.257 seconds, speed:   10.631 t/s
+1.43.340.767 I decoded   81 tokens in   31.457 seconds, speed:    2.575 t/s
+1.43.340.768 I 
+1.43.340.769 I n_draft   = 7
+1.43.340.769 I n_predict = 81
+1.43.340.770 I n_drafted = 169
+1.43.340.770 I n_accept  = 54
+1.43.340.772 I accept    = 31.953%
+1.43.340.772 I 
+1.43.340.790 I draft:
+
+1.43.340.855 I 
+1.43.340.856 I target:
+
+1.43.340.862 I common_perf_print:    sampling time =      52.15 ms
+1.43.340.864 I common_perf_print:    samplers time =      15.63 ms /    81 tokens
+1.43.340.871 I common_perf_print:        load time =    2250.95 ms
+1.43.340.875 I common_perf_print: prompt eval time =   23911.81 ms /   908 tokens (   26.33 ms per token,    37.97 tokens per second)
+1.43.340.878 I common_perf_print:        eval time =     595.03 ms /     2 runs   (  297.51 ms per token,     3.36 tokens per second)
+1.43.340.881 I common_perf_print:       total time =   99412.07 ms /   910 tokens
+1.43.340.883 I common_perf_print: unaccounted time =   74853.08 ms /  75.3 %      (total - sampling - prompt eval - eval) / (total)
+1.43.340.884 I common_perf_print:    graphs reused =         22
+1.43.340.885 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 16.73 11.86 8.46 end 22:06:48 exit=0

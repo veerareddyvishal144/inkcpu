@@ -1,0 +1,4 @@
+loadavg_before 22.71 18.50 14.27 start 22:22:10
+0.02.734.375 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.02.986.577 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.03.987.353 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect

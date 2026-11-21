@@ -1,0 +1,18 @@
+loadavg_before 9.03 start 22:25:57
+0.01.333.659 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.462.965 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.01.969.975 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.603.745 I cmn          init: llama threadpool init, n_threads = 8
+0.03.874.937 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.429.235 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.939.632 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.939.647 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.954.879 I speculative decoding will use checkpoints (context does not support partial sequence removal)
+
+
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Explain in one short paragraph why the sky is blue during the day and red at sunset.<|end_message|><|message_model|><|content_text|>0.04.957.756 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.04.957.760 I common_speculative_impl_draft_dflash: - n_max=0, n_min=0, p_min=0.00
+0.04.957.761 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.04.957.882 I init: DFlash target features via device buffer
+0.07.715.684 E DSPARK instrumentation does not handle checkpoint replay
+loadavg_after 8.67 end 22:26:06

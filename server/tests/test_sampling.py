@@ -50,12 +50,49 @@ def test_filters_restrict_the_support():
     assert all(p[t] >= thr for t in _draws(SamplingParams(min_p=0.2, seed=2), x, 200))
 
 
-def test_large_vocab_partial_path_equals_full_sort():
+def test_large_vocab_threshold_candidates_equal_full_sort_reference():
+    # same seed -> same uniform -> the same token: the threshold candidate sets are prefixes of the fully sorted vocabulary
     x = _logits(5, 200058, 2.0)
-    for kw in (dict(top_p=0.9), dict(top_p=0.99), dict(min_p=0.01), dict(top_p=0.95, min_p=0.001)):
-        for seed in range(6):
+    for kw in (dict(top_p=0.9), dict(top_p=0.99), dict(top_p=0.99, temperature=1.4), dict(min_p=0.01), dict(top_p=0.95, min_p=0.001),
+               dict(top_k=40), dict(top_k=40, top_p=0.9), dict(top_k=40, min_p=0.05), dict(top_k=300, top_p=0.8, min_p=0.01, temperature=0.7),
+               dict(top_k=250000, top_p=0.9), dict(temperature=0.3, top_p=0.5)):
+        for seed in range(8):
             s1, s2 = Sampler(SamplingParams(seed=seed, **kw)), Sampler(SamplingParams(seed=seed, **kw))
-            assert s1.sample(x) == s2._sample_full_sort(x, float(x.max())), (kw, seed)
+            assert s1.sample(x) == s2._reference(x), (kw, seed)
+
+
+def test_pure_temperature_two_level_draw_equals_cumsum_draw():
+    x = _logits(9, 200058, 3.0)
+    for temp in (1.0, 0.6, 2.0):
+        for seed in range(100):
+            s1, s2 = Sampler(SamplingParams(seed=seed, temperature=temp)), Sampler(SamplingParams(seed=seed, temperature=temp))
+            e = s2._scores(x).copy()
+            assert s1.sample(x) == s2._draw(e), (temp, seed)
+
+
+def test_logits_row_is_not_modified_and_not_copied_without_penalties():
+    x = _logits(4, 20000, 2.0)
+    keep = x.copy()
+    for kw in (dict(temperature=0.0), dict(), dict(top_k=20), dict(top_p=0.9), dict(min_p=0.1), dict(repetition_penalty=1.3, presence_penalty=0.4)):
+        s = Sampler(SamplingParams(seed=1, **kw), prompt_ids=[1, 2, 3])
+        for _ in range(3):
+            s.accept(s.sample(x))
+        assert np.array_equal(x, keep), kw          # penalties work on a private copy
+    v = x[::1]                                      # a view works (the engine backend hands out views of its slot buffers)
+    assert Sampler(SamplingParams(temperature=0.0)).sample(v) == int(np.argmax(x))
+
+
+def test_sampling_cost_is_far_below_one_engine_step():
+    import time
+    x = _logits(2, 200058, 3.0)
+    for kw, limit in ((dict(temperature=0.0), 0.002), (dict(temperature=0.6), 0.004), (dict(temperature=0.6, top_k=40), 0.004)):
+        s = Sampler(SamplingParams(seed=5, **kw))
+        s.sample(x)
+        t0 = time.perf_counter()
+        for _ in range(20):
+            s.sample(x)
+        per = (time.perf_counter() - t0) / 20
+        assert per < limit, (kw, per)               # was 5.6 ms for temperature sampling before the rewrite (limit is loose: shared host)
 
 
 def test_penalties():

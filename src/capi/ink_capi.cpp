@@ -76,8 +76,8 @@ int ink_forward(ink_engine* h, int slot, const int32_t* tokens, int n, float* lo
         return -11;
     }
     if (rc) set_err("ink_forward failed: code " + std::to_string(rc) + " (-1 bad slot, -2 context full, -3 bad token, -4 n < 1)");
-    h->total_us = h->e->last_total_us;
-    h->kernel_us = h->e->last_total_us;
+    h->total_us = h->e->last_forward_us;   // all tokens of the call; every microsecond is spent inside the executor
+    h->kernel_us = h->e->last_forward_us;
     return rc;
 }
 

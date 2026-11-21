@@ -1,0 +1,30 @@
+loadavg_before 13.11 start 22:27:37
+0.01.553.920 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.689.634 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.243.584 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.843.689 I cmn          init: llama threadpool init, n_threads = 8
+0.04.175.417 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.713.637 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.05.274.136 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.05.274.149 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.05.290.343 I speculative decoding will use checkpoints (context does not support partial sequence removal)
+
+
+import heapq
+from collections import defaultdict
+
+
+def dijkstra(graph, source):
+    """Return the shortest distance from source to every reachable node.
+
+    graph is an adjacency dict: graph[u] = [(v, weight), ...] with non-negative weights.
+    """
+    dist = defaultdict(lambda: float("inf"))
+    dist[source] = 0
+    heap = [(0, source)]
+    while heap:0.05.292.899 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.05.292.906 I common_speculative_impl_draft_dflash: - n_max=0, n_min=0, p_min=0.00
+0.05.292.907 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.05.293.096 I init: DFlash target features via device buffer
+0.13.480.267 E DSPARK instrumentation does not handle checkpoint replay
+loadavg_after 13.39 end 22:27:51

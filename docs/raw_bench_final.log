@@ -1,0 +1,18 @@
+=== clean bench start 2026-11-21T23:36:14Z loadavg 2.07 11.43 18.04
+loaded in 1.5 s, 16.97 GB packed; loadavg at start 2.07
+
+   ctx  threads     tok/s    ms/tok     all reps loadavg(before/after)
+# prefill 16 tokens via decode path: 1.1 s
+    16       12     14.05      71.2   13.25 13.84 14.05  2.07/4.34  split_keys=384
+    16       16     14.45      69.2   14.45 4.61 1.33  4.34/20.82  split_keys=384
+# prefill 1000 tokens via decode path: 418.4 s
+  1000       12     13.11      76.3   13.11 12.57 13.05  24.30/21.79  split_keys=384
+  1000       16     13.66      73.2   13.66 13.17 13.46  21.79/20.72  split_keys=384
+=== decode done 2026-11-21T23:45:11Z loadavg 20.72 23.24 21.66
+bench_prefill: chunk 256, attention prefill kernel, reps 3; load at start 20.18
+threads  prompt  best s    tok/s     all reps (tok/s)         load before/after
+12       16      0.441     36.2      36.2 34.3 35.3           20.18/20.18
+12       64      1.145     55.9      55.6 55.8 55.9           20.18/19.53
+12       256     3.771     67.9      67.0 67.9 66.3           19.53/18.37
+=== prefill done 2026-11-21T23:46:09Z loadavg 15.60 21.30 21.09
+DONE

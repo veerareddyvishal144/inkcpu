@@ -2,3 +2,51 @@ loadavg_before 22.71 18.50 14.27 start 22:22:10
 0.02.734.375 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
 0.02.986.577 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
 0.03.987.353 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.07.048.112 I cmn          init: llama threadpool init, n_threads = 8
+0.07.516.706 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.08.575.176 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.08.775.367 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.08.775.390 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a Python function is_palindrome(s) that ignores case and punctuation, with a short docstring and two example calls.<|end_message|><|message_model|><|content_text|>0.08.802.982 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.08.802.990 I common_speculative_impl_draft_dflash: - n_max=3, n_min=0, p_min=0.00
+0.08.802.991 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.08.803.212 I init: DFlash target features via device buffer
+```python
+def is_palindrome(s):
+    """
+    Return True if s is a palindrome ignoring case and punctuation.
+    """
+    cleaned = ''.join(char.lower() for char in s if char.isalnum())
+    return cleaned == cleaned[::-1]
+
+# Example calls:
+print(is_palind
+
+0.42.984.615 I encoded   44 tokens in    7.822 seconds, speed:    5.625 t/s
+0.42.984.619 I decoded   81 tokens in   26.360 seconds, speed:    3.073 t/s
+0.42.984.625 I 
+0.42.984.626 I n_draft   = 3
+0.42.984.627 I n_predict = 81
+0.42.984.628 I n_drafted = 77
+0.42.984.628 I n_accept  = 54
+0.42.984.630 I accept    = 70.130%
+0.42.984.637 I 
+0.42.984.637 I draft:
+
+0.42.984.700 I 
+0.42.984.701 I target:
+
+0.42.984.711 I common_perf_print:    sampling time =    2121.33 ms
+0.42.984.713 I common_perf_print:    samplers time =     360.74 ms /    81 tokens
+0.42.984.721 I common_perf_print:        load time =    4331.73 ms
+0.42.984.725 I common_perf_print: prompt eval time =   17545.02 ms /   146 tokens (  120.17 ms per token,     8.32 tokens per second)
+0.42.984.728 I common_perf_print:        eval time =     324.07 ms /     1 runs   (  324.07 ms per token,     3.09 tokens per second)
+0.42.984.730 I common_perf_print:       total time =   35468.11 ms /   147 tokens
+0.42.984.732 I common_perf_print: unaccounted time =   15477.69 ms /  43.6 %      (total - sampling - prompt eval - eval) / (total)
+0.42.984.733 I common_perf_print:    graphs reused =         24
+0.42.984.734 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 20.21 18.45 14.46 end 22:22:54 exit=0

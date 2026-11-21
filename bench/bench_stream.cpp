@@ -2,6 +2,8 @@
 // Usage (under the shared lock): tools/with_bench_lock.sh build-c1c/engine/bench_stream [threads list] [GB]
 #include <immintrin.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -50,40 +52,43 @@ int main(int argc, char** argv) {
             const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             best = std::max(best, bytes / s / 1e9);
         }
-        // 2) engine-like: 24 MB "phases" (barrier separated), each streamed by dynamic 32 KB chunks
-        double best2 = 0;
-        const size_t phase_bytes = 24u << 20;
-        const int nphase = (int)(bytes / phase_bytes);
-        for (int rep = 0; rep < 4; ++rep) {
-            const auto t0 = std::chrono::steady_clock::now();
-            std::atomic<int64_t> ctr[64];
-            for (auto& c : ctr) c.store(0);
-            pool.run([&](int tid, int nth) {
-                __m512i acc = _mm512_setzero_si512();
-                for (int ph = 0; ph < nphase; ++ph) {
-                    const char* base = buf + (size_t)ph * phase_bytes;
-                    const int64_t nch = phase_bytes / 32768;
-                    std::atomic<int64_t>& a = ctr[ph & 63];
-                    if (tid == 0 && ph >= 32) a.store(0);   // (reset is safe: counter (ph-32) was used 32 phases ago)
-                    for (;;) {
-                        const int64_t c = a.fetch_add(1, std::memory_order_relaxed);
-                        if (c >= nch) break;
-                        const char* p = base + (size_t)c * 32768;
-                        for (int o = 0; o < 32768; o += 256) {
-                            acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o));
-                            acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 64));
-                            acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 128));
-                            acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 192));
+        // 2) engine-like: barrier-separated phases of different sizes, each streamed by dynamic 32 KB chunks
+        std::printf("threads %2d: free stream %.1f GB/s | phase size -> GB/s, loss per phase vs free stream:", n, best);
+        for (size_t pm : {3u, 6u, 12u, 24u, 96u}) {
+            const size_t phase_bytes = (size_t)pm << 20;
+            const int nphase = (int)std::min<size_t>(bytes / phase_bytes, 256);
+            std::vector<std::atomic<int64_t>> ctr(nphase);
+            double best2 = 0;
+            for (int rep = 0; rep < 5; ++rep) {
+                for (auto& c : ctr) c.store(0);
+                const auto t0 = std::chrono::steady_clock::now();
+                pool.run([&](int tid, int nth) {
+                    __m512i acc = _mm512_setzero_si512();
+                    for (int ph = 0; ph < nphase; ++ph) {
+                        const char* base = buf + (size_t)(ph % (bytes / phase_bytes)) * phase_bytes;
+                        const int64_t nch = phase_bytes / 32768;
+                        for (;;) {
+                            const int64_t c = ctr[ph].fetch_add(1, std::memory_order_relaxed);
+                            if (c >= nch) break;
+                            const char* p = base + (size_t)c * 32768;
+                            for (int o = 0; o < 32768; o += 256) {
+                                acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o));
+                                acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 64));
+                                acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 128));
+                                acc = _mm512_add_epi32(acc, _mm512_loadu_si512(p + o + 192));
+                            }
                         }
+                        pool.barrier();
                     }
-                    pool.barrier();
-                }
-                sums[tid * 8] += (double)_mm512_reduce_add_epi32(acc);
-            });
-            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            best2 = std::max(best2, (double)nphase * phase_bytes / s / 1e9);
-            if (nphase > 64) break;
+                    sums[tid * 8] += (double)_mm512_reduce_add_epi32(acc);
+                });
+                const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                best2 = std::max(best2, (double)nphase * phase_bytes / s / 1e9);
+            }
+            const double t_free = phase_bytes / (best * 1e9) * 1e6, t_ph = phase_bytes / (best2 * 1e9) * 1e6;
+            std::printf("  %zuMB: %.1f (%.0f us)", pm, best2, t_ph - t_free);
         }
+        std::printf("\n");
         std::FILE* f = std::fopen("/proc/loadavg", "r");
         char l[64] = {0};
         if (f) {
@@ -91,7 +96,7 @@ int main(int argc, char** argv) {
             std::fclose(f);
         }
         *std::strchr(l, ' ') = 0;
-        std::printf("threads %2d: stream (64 KB chunks) %.1f GB/s, 24 MB barrier-separated phases %.1f GB/s   loadavg %s   (checksum %g)\n", n, best, best2, l, sums[0]);
+        std::printf("   loadavg %s (checksum %g)\n", l, sums[0]);
         std::fflush(stdout);
     }
     return 0;

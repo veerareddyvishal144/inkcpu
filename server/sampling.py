@@ -7,6 +7,16 @@ give the same tokens (greedy draws nothing).
 
 Penalties: repetition_penalty (HF/vLLM semantics) over prompt + generated tokens; frequency_penalty / presence_penalty
 (OpenAI semantics: logit -= freq*count + pres*[count>0]) over the generated tokens only.
+
+Speed (V, 2026-11-21; vocabulary 200058, one engine decode step takes ~75 ms; numbers in docs/SERVING.md):
+  * the logits row is NEVER copied unless a penalty has to modify it (the backend hands out a view of its per-slot buffer);
+  * greedy = one np.argmax;
+  * pure temperature: e = exp((x - max) / T) into ONE preallocated float32 buffer and a two-level inverse CDF (block sums in
+    float64, then one block) instead of a 200k-element float64 cumsum;
+  * top_k / top_p / min_p: the candidate set is a THRESHOLD on e (min_p: e >= min_p exactly; top_k / top_p: widened
+    1e-3, 1e-6, 1e-12, 0 until the set holds k tokens / covers the nucleus), so the sort only sees a few hundred tokens.
+    A threshold set is always a prefix of the fully sorted vocabulary, so the result equals the full-sort reference
+    (`Sampler._reference`, used by the tests).
 """
 from __future__ import annotations
 
@@ -42,20 +52,28 @@ class SamplingParams:
         if self.repetition_penalty <= 0.0:
             raise ValueError("repetition_penalty must be > 0")
 
+    @property
+    def has_penalties(self) -> bool:
+        return self.repetition_penalty != 1.0 or self.frequency_penalty != 0.0 or self.presence_penalty != 0.0
+
 
 class Sampler:
-    _K0 = 4096  # candidate pre-selection for top_p / min_p without top_k (exactness is checked, else full sort)
+    _BLOCK = 512                      # block size of the two-level inverse CDF
+    _FLOOR = np.float32(-80.0)        # exp(-80) = 1.8e-35 is still a normal float32 (no denormal slow path)
 
     def __init__(self, params: SamplingParams, prompt_ids: Optional[Iterable[int]] = None):
         self.p = params
         seed = params.seed if params.seed is not None else secrets.randbits(63)
         self.rng = np.random.Generator(np.random.PCG64(seed))
         self.counts: Dict[int, int] = {}
+        self._track = params.has_penalties
         self._prompt_unique = (np.unique(np.fromiter(prompt_ids, dtype=np.int64))
                                if (prompt_ids is not None and params.repetition_penalty != 1.0) else None)
+        self._buf: Optional[np.ndarray] = None
 
     def accept(self, tok: int) -> None:
-        self.counts[tok] = self.counts.get(tok, 0) + 1
+        if self._track:
+            self.counts[tok] = self.counts.get(tok, 0) + 1
 
     def _penalize(self, x: np.ndarray) -> np.ndarray:
         p = self.p
@@ -74,70 +92,115 @@ class Sampler:
             x[idx] -= p.frequency_penalty * cnt + p.presence_penalty * (cnt > 0)
         return x
 
+    # ---------------------------------------------------------------- draws
     def _draw(self, probs: np.ndarray) -> int:
+        """Inverse CDF over a (small) array of unnormalised probabilities, in array order; one uniform draw."""
         c = np.cumsum(probs, dtype=np.float64)
         u = self.rng.random() * c[-1]
         return int(min(np.searchsorted(c, u, side="right"), probs.size - 1))
 
+    def _draw_full(self, e: np.ndarray) -> int:
+        """Inverse CDF in token-id order over the whole vocabulary without a 200k-element float64 cumsum."""
+        V, B = e.size, self._BLOCK
+        nb = V // B
+        if nb < 2:
+            return self._draw(e)
+        bs = e[:nb * B].reshape(nb, B).sum(axis=1, dtype=np.float64)
+        if nb * B < V:
+            bs = np.append(bs, e[nb * B:].sum(dtype=np.float64))
+        cb = np.cumsum(bs)
+        u = self.rng.random() * cb[-1]
+        j = min(int(np.searchsorted(cb, u, side="right")), cb.size - 1)
+        lo, hi = j * B, min(j * B + B, V)
+        inner = np.cumsum(e[lo:hi], dtype=np.float64)
+        u2 = u - (cb[j - 1] if j else 0.0)
+        return lo + min(int(np.searchsorted(inner, u2, side="right")), hi - lo - 1)
+
+    # ---------------------------------------------------------------- scores
+    def _scores(self, x: np.ndarray) -> np.ndarray:
+        """e = exp((x - max) / T) in float32 (max == 1), written into the per-sampler buffer."""
+        e = self._buf
+        if e is None or e.size != x.size:
+            e = self._buf = np.empty(x.size, dtype=np.float32)
+        np.subtract(x, np.float32(x.max()), out=e)
+        if self.p.temperature != 1.0:
+            np.multiply(e, np.float32(1.0 / self.p.temperature), out=e)
+        np.maximum(e, self._FLOOR, out=e)
+        np.exp(e, out=e)
+        return e
+
+    @staticmethod
+    def _widen(thr: float) -> float:
+        return thr * 1e-3 if thr > 1e-12 else 0.0
+
+    @classmethod
+    def _topk_candidates(cls, e: np.ndarray, k: int) -> np.ndarray:
+        thr = 1e-3
+        while True:
+            idx = np.flatnonzero(e >= np.float32(thr)) if thr > 0.0 else np.arange(e.size)
+            if idx.size >= k or thr <= 0.0:
+                break
+            thr = cls._widen(thr)
+        if idx.size > k:
+            idx = idx[np.argpartition(e[idx], idx.size - k)[idx.size - k:]]
+        return idx
+
+    def _keep(self, ec: np.ndarray, z: Optional[float]) -> int:
+        """Number of leading entries of the descending-sorted scores `ec` that survive top_p / min_p."""
+        p = self.p
+        keep = ec.size
+        if p.top_p < 1.0:
+            cum = np.cumsum(ec, dtype=np.float64) / z
+            keep = min(keep, int(np.searchsorted(cum, p.top_p, side="left")) + 1)
+        if p.min_p > 0.0:
+            keep = min(keep, int(np.searchsorted(-ec, -(np.float32(p.min_p) * ec[0]), side="right")))
+        return max(keep, 1)
+
+    # ---------------------------------------------------------------- main entry
     def sample(self, logits: np.ndarray) -> int:
         p = self.p
-        x = np.array(logits, dtype=np.float32, copy=True)
+        x = logits
         V = x.size
-        if p.repetition_penalty != 1.0 or self.counts:
-            x = self._penalize(x)
+        if p.repetition_penalty != 1.0 or ((p.frequency_penalty != 0.0 or p.presence_penalty != 0.0) and self.counts):
+            x = self._penalize(np.array(x, dtype=np.float32, copy=True))   # the only copy of the logits row
         if p.temperature <= 0.0 or p.top_k == 1:
             return int(np.argmax(x))
-        if p.temperature != 1.0:
-            x /= np.float32(p.temperature)
-        cand = None  # None = whole vocabulary, else array of candidate token ids
-        if 0 < p.top_k < V:
-            cand = np.argpartition(x, V - p.top_k)[V - p.top_k:]
-        need_sort = p.top_p < 1.0 or p.min_p > 0.0
-        partial = False
-        if cand is None and need_sort:
-            if V > self._K0:
-                cand = np.argpartition(x, V - self._K0)[V - self._K0:]
-                partial = True
-            else:
-                cand = np.arange(V)
-        m = float(x.max())
-        if cand is None:
-            probs = np.exp(x - m, dtype=np.float32).astype(np.float64)
-            return self._draw(probs)
-        lx = x[cand]
-        e = np.exp(lx - m).astype(np.float64)
-        if partial:  # normaliser over the FULL vocabulary so that coverage can be checked exactly
-            z_full = float(np.exp(x - m, dtype=np.float32).sum(dtype=np.float64))
-        else:
-            z_full = float(e.sum())
-        if need_sort:
-            order = np.argsort(-e, kind="stable")
-            cand, e = cand[order], e[order]
-            pr = e / z_full
-            keep = e.size
+        e = self._scores(x)
+        use_k = 0 < p.top_k < V
+        if not use_k and p.top_p >= 1.0 and p.min_p <= 0.0:
+            return self._draw_full(e)
+        z = None
+        if use_k:                                            # top_k first; top_p renormalises over the top_k set (HF)
+            idx = self._topk_candidates(e, p.top_k)
             if p.top_p < 1.0:
-                cum = np.cumsum(pr)
-                if partial and cum[-1] < p.top_p:  # candidate set does not cover the nucleus: exact full sort
-                    return self._sample_full_sort(x, m)
-                keep = min(keep, int(np.searchsorted(cum, p.top_p, side="left")) + 1)
-            if p.min_p > 0.0:
-                thr = p.min_p * pr[0]
-                if partial and pr[-1] >= thr:  # tokens above thr might lie outside the candidate set
-                    return self._sample_full_sort(x, m)
-                keep = min(keep, int(np.searchsorted(-pr, -thr, side="right")))
-            cand, e = cand[:max(keep, 1)], e[:max(keep, 1)]
-        return int(cand[self._draw(e)])
+                z = float(e[idx].sum(dtype=np.float64))
+        elif p.top_p < 1.0:                                  # nucleus: widen the threshold until the set covers top_p
+            z = float(e.sum(dtype=np.float64))
+            thr = 1e-3
+            while True:
+                idx = np.flatnonzero(e >= np.float32(thr)) if thr > 0.0 else np.arange(V)
+                if (thr <= 0.0 or float(e[idx].sum(dtype=np.float64)) >= p.top_p * z
+                        or (p.min_p > 0.0 and thr <= p.min_p)):   # (min_p alone cuts inside a set that holds all e >= min_p)
+                    break
+                thr = self._widen(thr)
+        else:                                                # min_p only: exact threshold, always contains the max token
+            idx = np.flatnonzero(e >= np.float32(p.min_p))
+        ec = e[idx]
+        order = np.argsort(-ec, kind="stable")
+        idx, ec = idx[order], ec[order]
+        keep = self._keep(ec, z)
+        return int(idx[self._draw(ec[:keep])])
 
-    def _sample_full_sort(self, x: np.ndarray, m: float) -> int:
+    def _reference(self, x: np.ndarray) -> int:
+        """Slow full-sort implementation of the same semantics (tests): one uniform draw, whole vocabulary sorted."""
         p = self.p
-        e = np.exp(x - m, dtype=np.float32).astype(np.float64)
+        if p.temperature <= 0.0 or p.top_k == 1:
+            return int(np.argmax(x))
+        e = self._scores(np.asarray(x, dtype=np.float32)).copy()
         order = np.argsort(-e, kind="stable")
         es = e[order]
-        pr = es / es.sum()
-        keep = es.size
-        if p.top_p < 1.0:
-            keep = min(keep, int(np.searchsorted(np.cumsum(pr), p.top_p, side="left")) + 1)
-        if p.min_p > 0.0:
-            keep = min(keep, int(np.searchsorted(-pr, -(p.min_p * pr[0]), side="right")))
-        keep = max(keep, 1)
+        if 0 < p.top_k < es.size:
+            es, order = es[:p.top_k], order[:p.top_k]
+        z = float(es.sum(dtype=np.float64))
+        keep = self._keep(es, z)
         return int(order[:keep][self._draw(es[:keep])])

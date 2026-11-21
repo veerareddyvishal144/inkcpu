@@ -12,6 +12,13 @@ SLOT POLICY (append-only prefix reuse)
   Caveat: the model's thinking is part of the history; a client that drops `reasoning_content` from the assistant message
   changes the rendered prompt and gets a reset (prefill from scratch). Clients that send `reasoning_content` back hit the cache.
 
+SPECULATIVE STEPS (backends with supports_spec, e.g. MockSpecBackend today, agent S2's ink_spec_* later)
+  The first token after the prefill is sampled here from the logits (it becomes the ANCHOR: emitted to the client, not yet
+  processed by the engine). Every following scheduler step hands the anchor to backend.spec_step(), which samples inside the
+  engine and returns >= 1 emitted tokens plus `fed`, the tokens the engine really appended to the slot. The last emitted token is
+  the next anchor. Tokens after a stop token / a stop string / the max_tokens limit are dropped; the slot history is `fed`
+  (engine truth, cross-checked with slot_pos), never the emitted list. Requests with penalties use the plain path.
+
 THREADING
   ONE engine thread owns the backend (load, prefill, step, slot calls; the C ABI is single-thread). It round-robins between
   active sequences, one work unit at a time (a prefill chunk of <= prefill_chunk tokens, or one decode step), samples with
@@ -31,7 +38,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .backends import Backend
+from .backends import Backend, BackendError, SpecRequest
 from .parser import Event, ParsedMessage, StopMatcher, StreamParser
 from .sampling import Sampler, SamplingParams
 from .tokenizer import InkTokenizer
@@ -133,6 +140,12 @@ class Finish:
     total_s: float
     ttft_s: float
     errors: List[str] = field(default_factory=list)
+    decode_engine_s: float = 0.0        # time inside backend calls during the decode phase
+    sample_s: float = 0.0               # time in the numpy sampler
+    token_ids: List[int] = field(default_factory=list)   # generated tokens that were emitted (without the stop token)
+    spec_steps: int = 0                 # speculative steps (0 = plain decode)
+    spec_drafted: int = 0
+    spec_accepted: int = 0
 
 
 class Sequence:
@@ -157,6 +170,12 @@ class Sequence:
         self.t_prefill = 0.0
         self.t_decode = 0.0
         self.t_first: Optional[float] = None
+        self.t_sample = 0.0
+        self.t_engine_dec = 0.0
+        self.token_ids: List[int] = []
+        self.anchor: Optional[int] = None                 # emitted but not yet processed by the engine (speculative path)
+        self.use_spec = bool(sched.spec_enabled and sched.backend.supports_spec and not req.sampling.has_penalties)
+        self.spec_steps = self.spec_drafted = self.spec_accepted = 0
         self._content: List[str] = []
         self._reasoning: List[str] = []
         if self.parser is not None and req.parser_prefix_ids:  # forced tokens (e.g. tool_choice) are part of the output
@@ -172,26 +191,62 @@ class Sequence:
         if self.phase == "prefill":
             t0 = time.monotonic()
             chunk = self.req.prompt_ids[self.pos:self.pos + self.sched.prefill_chunk]
-            logits = be.prefill(self.slot.id, chunk)
+            last = self.pos + len(chunk) >= len(self.req.prompt_ids)
+            logits = be.prefill(self.slot.id, chunk, want_logits=last)   # only the last chunk needs the lm head
             self.slot.tokens.extend(chunk)
             self.slot.last_logits = logits
             self.pos += len(chunk)
             self.t_prefill += time.monotonic() - t0
-            if self.pos >= len(self.req.prompt_ids):
+            if last:
                 self.phase, self.logits = "decode", logits
             return False
         t0 = time.monotonic()
-        tok = self.sampler.sample(self.logits)
-        self.sampler.accept(tok)
-        if self.t_first is None:
-            self.t_first = time.monotonic()
-        if self._on_token(tok):
+        try:
+            if self.anchor is None:                       # a token is sampled from the logits (plain decode / first token)
+                ts = time.perf_counter()
+                tok = self.sampler.sample(self.logits)
+                self.sampler.accept(tok)
+                self.t_sample += time.perf_counter() - ts
+                if self.t_first is None:
+                    self.t_first = time.monotonic()
+                if self._on_token(tok):
+                    return True
+                if self.use_spec:
+                    self.anchor = tok                     # the next step processes it together with the drafts
+                else:
+                    te = time.perf_counter()
+                    self.logits = be.step(self.slot.id, tok)
+                    self.t_engine_dec += time.perf_counter() - te
+                    self.slot.tokens.append(tok)
+                    self.slot.last_logits = self.logits
+                return False
+            return self._spec_step(be)
+        finally:
             self.t_decode += time.monotonic() - t0
-            return True
-        self.logits = be.step(self.slot.id, tok)
-        self.slot.tokens.append(tok)
-        self.slot.last_logits = self.logits
-        self.t_decode += time.monotonic() - t0
+
+    def _spec_step(self, be: Backend) -> bool:
+        sp, slot = self.req.sampling, self.slot
+        remaining = self.req.max_tokens - self.n_completion          # >= 1: _on_token ends the request at max_tokens
+        sreq = SpecRequest(temperature=sp.temperature, top_k=sp.top_k, top_p=sp.top_p, min_p=sp.min_p, seed=sp.seed,
+                           stop_ids=tuple(self.sched.tokenizer.stop_ids), max_emit=max(1, remaining))
+        te = time.perf_counter()
+        res = be.spec_step(slot.id, self.anchor, sreq)
+        self.t_engine_dec += time.perf_counter() - te
+        slot.tokens.extend(res.fed)                                   # the slot history is what the engine really processed
+        slot.last_logits = res.logits
+        if be.slot_pos(slot.id) != len(slot.tokens):
+            raise BackendError("slot %d history out of sync: engine holds %d tokens, server expects %d"
+                               % (slot.id, be.slot_pos(slot.id), len(slot.tokens)))
+        if not res.tokens:
+            raise BackendError("speculative step returned no token")
+        self.spec_steps += 1
+        self.spec_drafted += res.drafted
+        self.spec_accepted += res.accepted
+        for tok in res.tokens:
+            self.sampler.accept(tok)
+            if self._on_token(tok):
+                return True                                           # tokens after the stop / the limit are dropped
+        self.anchor = res.tokens[-1]
         return False
 
     def _emit(self, events: List[Event]) -> None:
@@ -223,6 +278,7 @@ class Sequence:
                 self.parser.feed_token(tok)
             return True
         self.n_completion += 1
+        self.token_ids.append(tok)
         if self.parser is not None:
             self._emit(self.parser.feed_token(tok))
             if self.parser.in_reasoning:
@@ -261,13 +317,15 @@ class Sequence:
         t_first = (self.t_first - self.req.created) if self.t_first else 0.0
         return Finish(fr, pm, len(self.req.prompt_ids), self.n_completion, self.n_reused, self.reasoning_tokens,
                       self.t_start - self.req.created, self.t_prefill, self.t_decode, now - self.req.created, t_first,
-                      list(pm.errors) + ([self.error] if self.error else []))
+                      list(pm.errors) + ([self.error] if self.error else []), self.t_engine_dec, self.t_sample,
+                      list(self.token_ids), self.spec_steps, self.spec_drafted, self.spec_accepted)
 
 
 class Scheduler:
     def __init__(self, backend: Backend, tokenizer: InkTokenizer, max_queue: int = 8, prefill_chunk: int = 256,
-                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None):
+                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None, spec: bool = True):
         self.backend, self.tokenizer = backend, tokenizer
+        self.spec_enabled = spec
         self.max_queue, self.prefill_chunk = max_queue, max(1, prefill_chunk)
         self.on_finish = on_finish
         self.table: Optional[SlotTable] = None
@@ -297,6 +355,14 @@ class Scheduler:
 
     def n_waiting(self) -> int:
         return len(self._pending)
+
+    def slot_snapshot(self) -> List[Dict[str, Any]]:
+        """Per-slot view for /slots and /metrics (plain python data only: no engine call, any thread)."""
+        if self.table is None:
+            return []
+        now = time.monotonic()
+        return [{"id": s.id, "n_tokens": len(s.tokens), "busy": s.busy, "idle_s": round(now - s.last_used, 1) if s.last_used else None,
+                 "has_logits": s.last_logits is not None} for s in list(self.table.slots.values())]
 
     def n_active(self) -> int:
         return self._n_running

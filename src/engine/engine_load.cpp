@@ -10,6 +10,9 @@
 #include <thread>
 
 #include "engine_priv.h"
+#ifdef INK_HAVE_PREFILL
+#include "ink/engine_prefill.h"
+#endif
 
 namespace ink {
 
@@ -28,6 +31,18 @@ const char* const kProfNames[PH_COUNT] = {"embed",
 
 std::vector<int> engine_default_cpus(int n) {
     std::vector<int> c;
+    if (const char* e = std::getenv("INK_CPUS")) {   // explicit CPU list (e.g. to stay off the CPUs other tenants pin to), wraps around
+        std::vector<int> l;
+        for (const char* p = e; *p;) {
+            l.push_back(std::atoi(p));
+            while (*p && *p != ',') ++p;
+            if (*p == ',') ++p;
+        }
+        if (!l.empty()) {
+            for (int i = 0; i < n; ++i) c.push_back(l[(size_t)i % l.size()]);
+            return c;
+        }
+    }
     const int ncpu = std::max(2, (int)std::thread::hardware_concurrency());
     if (n <= 15) {
         for (int i = 0; i < n; ++i) c.push_back((2 * (i + 1)) % ncpu);
@@ -86,6 +101,7 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
     e->tune.chunk_router = envi("INK_CHUNK_ROUTER", e->tune.chunk_router);
     e->tune.chunk_ctrl = envi("INK_CHUNK_CTRL", e->tune.chunk_ctrl);
     e->tune.split_keys = envi("INK_SPLIT_KEYS", e->tune.split_keys);
+    e->tune.swa_blocks = std::max(16, envi("INK_SWA_BLOCKS", e->tune.swa_blocks));
     g_gemv_prefetch_bytes = envi("INK_PF", g_gemv_prefetch_bytes);     // B1 tunables (experiments)
     g_gemv_prefetch_hint = envi("INK_PFH", g_gemv_prefetch_hint);
     e->prof.tsc_per_us = calibrate_tsc_per_us();
@@ -319,6 +335,9 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
 }
 
 Engine::~Engine() {
+#ifdef INK_HAVE_PREFILL
+    engine_prefill_release(*this);   // the scratch of the batched executor lives in a registry keyed by Engine*
+#endif
     pool.reset();
     for (auto& s : slots) free_slot(s);
     if (arena_) free_weight_buffer(arena_);
@@ -340,7 +359,7 @@ bool Engine::alloc_slot(SlotState& s, std::string* err) {
     const size_t cap_blocks = ((size_t)opt.max_ctx + kKvBlock - 1) / kKvBlock + 1;
     for (int v = 0; v < kVisits; ++v) {
         const bool swa = layers[plan[v].phys].swa;
-        const size_t nb = swa ? 16 : cap_blocks;
+        const size_t nb = swa ? (size_t)tune.swa_blocks : cap_blocks;
         const size_t bytes = nb * blk_bytes;
         void* k = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         void* vv = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -351,7 +370,7 @@ bool Engine::alloc_slot(SlotState& s, std::string* err) {
         s.kv[v].k = (uint16_t*)k;
         s.kv[v].v = (uint16_t*)vv;
         s.kv[v].ring = swa;
-        s.kv[v].n_blocks = swa ? 16 : 1;
+        s.kv[v].n_blocks = swa ? (uint32_t)tune.swa_blocks : 1;
         s.kv_map_bytes[v] = bytes;
     }
     s.hist = (float*)std::aligned_alloc(64, align_up(kVisits * kHistPerVisit * 4, 64));
@@ -371,12 +390,19 @@ void Engine::free_slot(SlotState& s) {
     s.hist = nullptr;
 }
 
+// blocks of a visit that may hold data: global = grown extent, ring = written blocks (all once the ring has wrapped)
+static size_t used_blocks(const SlotState& s, int v) {
+    const KvLayer& L = s.kv[v];
+    if (!L.ring) return L.n_blocks;
+    return std::min<size_t>(L.n_blocks, (size_t)((s.pos + kKvBlock - 1) / kKvBlock));
+}
+
 void Engine::slot_reset(int slot) {
     if (slot < 0 || slot >= (int)slots.size()) return;
     SlotState& s = slots[slot];
     const size_t blk_bytes = kKvBlockElems * 2;
     for (int v = 0; v < kVisits; ++v) {
-        const size_t used = s.kv[v].ring ? (size_t)16 : (size_t)s.kv[v].n_blocks;
+        const size_t used = used_blocks(s, v);
         std::memset(s.kv[v].k, 0, used * blk_bytes);
         std::memset(s.kv[v].v, 0, used * blk_bytes);
         if (!s.kv[v].ring) s.kv[v].n_blocks = 1;
@@ -407,18 +433,15 @@ bool Engine::slot_copy(int src, int dst) {
     SlotState& b = slots[dst];
     const size_t blk_bytes = kKvBlockElems * 2;
     for (int v = 0; v < kVisits; ++v) {
-        const size_t nbk = a.kv[v].ring ? (size_t)16 : (size_t)a.kv[v].n_blocks;
-        if (!a.kv[v].ring) {
-            const size_t have = b.kv_map_bytes[v] / blk_bytes;
-            if (nbk > have) return false;
-            if (b.kv[v].n_blocks > nbk) {   // clear what the destination used beyond the source's extent
-                std::memset(b.kv[v].k + nbk * kKvBlockElems, 0, (b.kv[v].n_blocks - nbk) * blk_bytes);
-                std::memset(b.kv[v].v + nbk * kKvBlockElems, 0, (b.kv[v].n_blocks - nbk) * blk_bytes);
-            }
-            b.kv[v].n_blocks = a.kv[v].n_blocks;
+        const size_t na = used_blocks(a, v), nb_used = used_blocks(b, v);
+        if (!a.kv[v].ring && na > b.kv_map_bytes[v] / blk_bytes) return false;
+        if (nb_used > na) {   // clear what the destination used beyond the source's extent
+            std::memset(b.kv[v].k + na * kKvBlockElems, 0, (nb_used - na) * blk_bytes);
+            std::memset(b.kv[v].v + na * kKvBlockElems, 0, (nb_used - na) * blk_bytes);
         }
-        std::memcpy(b.kv[v].k, a.kv[v].k, nbk * blk_bytes);
-        std::memcpy(b.kv[v].v, a.kv[v].v, nbk * blk_bytes);
+        if (!a.kv[v].ring) b.kv[v].n_blocks = a.kv[v].n_blocks;
+        std::memcpy(b.kv[v].k, a.kv[v].k, na * blk_bytes);
+        std::memcpy(b.kv[v].v, a.kv[v].v, na * blk_bytes);
     }
     std::memcpy(b.hist, a.hist, kVisits * kHistPerVisit * 4);
     b.pos = a.pos;

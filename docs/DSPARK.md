@@ -8,7 +8,8 @@ Agent R, 2026-11-21. Scope: (1) a spec precise enough to implement the drafter a
 - greedy, n=3 (T=4): L = **2.37 +- 0.08** (acc@1 0.64), break-even L* = 2.05 (M) / 1.99 (R); estimated speed-up 1.16x (M), 1.22x (Q), 1.19x (R)
 - greedy, n=4 (T=5): L = **2.57 +- 0.10** (acc@1 0.62), break-even L* = 2.24 (M) / 2.16 (R); estimated speed-up 1.15x (M), 1.21x (Q), 1.19x (R)
 - greedy, n=7 (T=8): L = **2.77 +- 0.15** (acc@1 0.58), break-even L* = 2.75 (M) / 2.59 (R); estimated speed-up 1.00x (M), 1.06x (Q), 1.07x (R)
-- t1prob, n=3 (T=4): L = **2.51 +- 0.10** (acc@1 0.69), break-even L* = 2.05 (M) / 1.99 (R); estimated speed-up 1.23x (M), 1.29x (Q), 1.26x (R)
+- t1prob, n=3 (T=4): L = **2.51 +- 0.08** (acc@1 0.69), break-even L* = 2.05 (M) / 1.99 (R); estimated speed-up 1.23x (M), 1.29x (Q), 1.26x (R)
+- t1prob, n=7 (T=8): L = **2.17 +- 0.19** (acc@1 0.50), break-even L* = 2.75 (M) / 2.59 (R); estimated speed-up 0.79x (M), 0.83x (Q), 0.83x (R)
 - best bytes-model speed-up (M) among measured configs: 1.23x (t1prob, n=3). Recommendation and caveats: section 10.
 
 ## 1. Sources and confidence tags
@@ -228,7 +229,8 @@ The ROUTING.md caveat (verify of rejected tokens may touch more experts than the
 | greedy | 3 (T=4) | 8/8 | 260 | **2.37 +- 0.08** | 1.37 | 0.64 | 0.41 | 0.32 | - | - | - | - |
 | greedy | 4 (T=5) | 8/8 | 238 | **2.57 +- 0.10** | 1.57 | 0.62 | 0.41 | 0.31 | 0.24 | - | - | - |
 | greedy | 7 (T=8) | 8/8 | 214 | **2.77 +- 0.15** | 1.77 | 0.58 | 0.37 | 0.28 | 0.22 | 0.14 | 0.10 | 0.07 |
-| t1prob | 3 (T=4) | 5/8 | 155 | **2.51 +- 0.10** | 1.51 | 0.69 | 0.47 | 0.35 | - | - | - | - |
+| t1prob | 3 (T=4) | 8/8 | 247 | **2.51 +- 0.08** | 1.51 | 0.69 | 0.48 | 0.34 | - | - | - | - |
+| t1prob | 7 (T=8) | 3/8 | 103 | **2.17 +- 0.19** | 1.17 | 0.50 | 0.21 | 0.14 | 0.09 | 0.08 | 0.08 | 0.07 |
 
 acc@j = fraction of verify steps in which draft position j was accepted (cumulative: positions 1..j all accepted).
 
@@ -239,20 +241,21 @@ acc@j = fraction of verify steps in which draft position j was accepted (cumulat
 | greedy | 3 | 0.64 | 0.64 | 0.77 | - | - | - | - |
 | greedy | 4 | 0.62 | 0.66 | 0.75 | 0.77 | - | - | - |
 | greedy | 7 | 0.58 | 0.63 | 0.76 | 0.78 | 0.62 | 0.76 | 0.73 |
-| t1prob | 3 | 0.69 | 0.68 | 0.74 | - | - | - | - |
+| t1prob | 3 | 0.69 | 0.69 | 0.71 | - | - | - | - |
+| t1prob | 7 | 0.50 | 0.42 | 0.64 | 0.64 | 0.89 | 1.00 | 0.88 |
 
 #### Per prompt: L (steps) 
 
-| prompt | greedy n=3 | greedy n=4 | greedy n=7 | t1prob n=3 |
-|---|---|---|---|---|
-| chat_answer | 1.77 (44) | 1.81 (43) | 1.79 (42) | 2.05 (38) |
-| code_completion | 3.67 (21) | 4.33 (18) | 5.92 (13) | 3.50 (22) |
-| prose_continuation | 1.67 (46) | 1.71 (45) | 1.66 (44) | 1.75 (44) |
-| reasoning | 2.85 (27) | 3.17 (24) | 3.48 (21) | 2.89 (27) |
-| tool_call | 3.13 (23) | 3.79 (19) | 5.14 (14) | 3.29 (24) |
-| long_context_qa | 2.72 (29) | 2.85 (27) | 3.17 (23) | - |
-| chat_email | 1.73 (45) | 1.85 (41) | 1.85 (40) | - |
-| chat_code | 3.12 (25) | 3.71 (21) | 4.41 (17) | - |
+| prompt | greedy n=3 | greedy n=4 | greedy n=7 | t1prob n=3 | t1prob n=7 |
+|---|---|---|---|---|---|
+| chat_answer | 1.77 (44) | 1.81 (43) | 1.79 (42) | 2.05 (38) | 1.92 (38) |
+| code_completion | 3.67 (21) | 4.33 (18) | 5.92 (13) | 3.50 (22) | 5.50 (14) |
+| prose_continuation | 1.67 (46) | 1.71 (45) | 1.66 (44) | 1.75 (44) | 1.43 (51) |
+| reasoning | 2.85 (27) | 3.17 (24) | 3.48 (21) | 2.89 (27) | - |
+| tool_call | 3.13 (23) | 3.79 (19) | 5.14 (14) | 3.29 (24) | - |
+| long_context_qa | 2.72 (29) | 2.85 (27) | 3.17 (23) | 2.57 (30) | - |
+| chat_email | 1.73 (45) | 1.85 (41) | 1.85 (40) | 2.08 (37) | - |
+| chat_code | 3.12 (25) | 3.71 (21) | 4.41 (17) | 3.08 (25) | - |
 
 #### Bytes-model speed-up estimates (ROUTING.md, mean expert-union bytes; decode bandwidth-bound; speed-up = L * B1 / S(T))
 
@@ -266,6 +269,7 @@ S(T) = N + E(T) + Dr: N = 2014.6 MB, B1 = 3861.9 MB/token, E(T) from ROUTING.md 
 | greedy | 4 | 5 | 2.57 | 2.16 | 2.24 | 2.13 | 1.19x | 1.15x | 1.21x | 0.85x | 8666 |
 | greedy | 7 | 8 | 2.77 | 2.59 | 2.75 | 2.60 | 1.07x | 1.00x | 1.06x | 0.65x | 10631 |
 | t1prob | 3 | 4 | 2.51 | 1.99 | 2.05 | 1.94 | 1.26x | 1.23x | 1.29x | 0.96x | 7898 |
+| t1prob | 7 | 8 | 2.17 | 2.59 | 2.75 | 2.60 | 0.83x | 0.79x | 0.83x | 0.51x | 10631 |
 
 #### llama.cpp reference timing (this machine, 8 threads, shared host: indicative; tokens/s from the log's `decoded` line)
 
@@ -274,14 +278,16 @@ S(T) = N + E(T) + Dr: N = 2014.6 MB, B1 = 3861.9 MB/token, E(T) from ROUTING.md 
 | greedy | 3 | 111 | 515 | 2.3 | 4.19 | 2.7..14.3 |
 | greedy | 4 | 167 | 779 | 3.4 | 3.15 | 13.5..19.0 |
 | greedy | 7 | 225 | 862 | 3.8 | 3.19 | 6.9..17.1 |
-| t1prob | 3 | 159 | 572 | 2.9 | 3.29 | 13.9..15.7 |
+| t1prob | 3 | 183 | 663 | 3.1 | 2.96 | 13.9..22.7 |
+| t1prob | 7 | 319 | 903 | 3.7 | 2.44 | 12.6..20.2 |
 
 #### Histogram of accepted drafts per step (pooled; count of steps with k accepted)
 
 - greedy n=3: 0:93, 1:60, 2:25, 3:82
 - greedy n=4: 0:90, 1:51, 2:24, 3:17, 4:56
 - greedy n=7: 0:89, 1:46, 2:19, 3:13, 4:18, 5:7, 6:6, 7:16
-- t1prob n=3: 0:48, 1:34, 2:19, 3:54
+- t1prob n=3: 0:76, 1:53, 2:34, 3:84
+- t1prob n=7: 0:51, 1:30, 2:8, 3:5, 4:1, 5:0, 6:1, 7:7
 
 
 #### Break-even table (bytes model of docs/ROUTING.md, no measurement)
@@ -298,11 +304,20 @@ S(T) = N + E(T) + Dr: N = 2014.6 MB, B1 = 3861.9 MB/token, E(T) from ROUTING.md 
 
 
 ### 9.3 Speed of this llama.cpp build (reference only)
-(speed runs not available)
+Greedy, 8 threads, taken under `tools/with_bench_lock.sh` after the acceptance matrix finished (my own matrix runs were not under the lock; other agents' load is in the last column). n=0 is plain decoding through the same binary (no draft). `ms per step: target verify` is the time of the target forward over T tokens, `drafter` the time of the drafting call (the ctx injection is ~2 ms).
+
+| prompt | n (T=n+1) | tokens/s (80 new tokens) | speed vs n=0 | L | ms per step: drafter | ms per step: target verify | loadavg before / after |
+|---|---|---|---|---|---|---|---|
+| chat_answer | 0 (T=1) | nan | nanx | nan | nan | nan | 9.03 / 8.67 |
+| chat_answer | 3 (T=4) | 2.97 | nanx | 1.77 | 106 | 495 | 8.67 / 11.35 |
+| chat_answer | 7 (T=8) | 1.73 | nanx | 1.79 | 223 | 852 | 11.35 / 13.11 |
+| code_completion | 0 (T=1) | nan | nanx | nan | nan | nan | 13.11 / 13.39 |
+| code_completion | 3 (T=4) | 5.82 | nanx | 3.67 | 105 | 518 | 13.39 / 14.01 |
+| code_completion | 7 (T=8) | 5.55 | nanx | 5.92 | 217 | 839 | 14.01 / 14.53 |
 
 
 ## 10. Implication for this CPU and recommendation
-**What was measured** (section 9.2; llama.cpp PR 32218, Q4_K_XL target, Q8_0 drafter, 8 prompts, greedy). Mean tokens per verify step L = **2.37 +- 0.08** at n = 3 (T = 4, 260 steps), **2.57** at n = 4 (T = 5), **2.77 +- 0.15** at n = 7 (T = 8). Cumulative per-position acceptance falls fast (acc@1 about 0.64, acc@2 about 0.4, acc@3 about 0.3, acc@7 about 0.07), but conditional acceptance is 0.6-0.8 at every position: once the first tokens are right the rest usually are. At temperature 1.0 with sampled drafts and rejection sampling (the paper / vLLM-recipe mode) L = 2.51 at n = 3 and n/a at n = 7 (n/a = not finished when this was assembled; the tables in 9.2 are authoritative).
+**What was measured** (section 9.2; llama.cpp PR 32218, Q4_K_XL target, Q8_0 drafter, 8 prompts, greedy). Mean tokens per verify step L = **2.37 +- 0.08** at n = 3 (T = 4, 260 steps), **2.57** at n = 4 (T = 5), **2.77 +- 0.15** at n = 7 (T = 8). Cumulative per-position acceptance falls fast (acc@1 about 0.64, acc@2 about 0.4, acc@3 about 0.3, acc@7 about 0.07), but conditional acceptance is 0.6-0.8 at every position: once the first tokens are right the rest usually are. At temperature 1.0 with sampled drafts and rejection sampling (the paper / vLLM-recipe mode) L = 2.51 at n = 3 and 2.17 at n = 7 (n/a = not finished when this was assembled; the tables in 9.2 are authoritative).
 **There are two regimes**, and the pooled mean describes neither (per-prompt L, steps 13-46 per cell, so +-0.3 noise per cell):
 
 | prompt (text type) | L n=3 | L n=4 | L n=7 | speed-up (M) n=3 | speed-up (M) n=4 | speed-up (M) n=7 | best choice (M) |

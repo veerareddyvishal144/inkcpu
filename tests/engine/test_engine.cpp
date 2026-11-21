@@ -345,7 +345,8 @@ int mode_slots(int argc, char** argv) {
     std::printf("  ink_slot_pos check: %lld (expect %zu)\n", (long long)e->slot_pos(c), t1.size());
 
     // ring wrap: > 1024 tokens
-    std::string rdir = argc > 2 ? argv[2] : kRoot + "/build-c1/ring";
+    for (int ri = 2; ri < std::max(argc, 3); ++ri) {
+    std::string rdir = argc > ri ? argv[ri] : kRoot + "/build-c1/ring";
     auto rt = read_file<int32_t>(rdir + "/tokens.i32");
     auto rl = read_file<float>(rdir + "/logits_last.f32");
     if (rt.size() > 1030) {
@@ -359,24 +360,32 @@ int mode_slots(int argc, char** argv) {
             if (!std::isfinite(lg[i])) finite = false;
             mx = std::max(mx, std::fabs(lg[i]));
         }
-        std::printf("  ring wrap: %zu tokens decoded in %.1f s, logits finite=%d max|logit|=%.2f\n", rt.size(),
+        std::printf("  ring wrap [%s]: %zu tokens (SWA ring %d positions) decoded in %.1f s, logits finite=%d max|logit|=%.2f\n", rdir.c_str(), rt.size(), e->tune.swa_blocks * 64,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), finite, mx);
         if (!finite || mx > 31) ++fails;
         if (rl.size() == nv) {
             const double cs = cosine(lg.data(), rl.data(), nv);
             const int ov = overlap(lg.data(), rl.data(), nv, 10);
-            std::printf("  ring wrap vs llama.cpp logits_last: argmax %d/%d top10 overlap %d cosine %.6f %s\n", argmax(rl.data(), nv), argmax(lg.data(), nv), ov, cs,
+            std::printf("  ring wrap vs llama.cpp logits_last: argmax %d/%d top10 overlap %d cosine %.7f %s\n", argmax(rl.data(), nv), argmax(lg.data(), nv), ov, cs,
                         (cs >= 0.99 && argmax(rl.data(), nv) == argmax(lg.data(), nv)) ? "PASS" : "CHECK");
             if (cs < 0.99) ++fails;
         }
-        // determinism of the long run across thread counts
-        std::vector<float> lg2(nv);
-        e->set_threads(8);
-        e->slot_reset(a);
-        for (size_t i = 0; i < rt.size(); ++i) e->decode(a, rt[i], i + 1 == rt.size() ? lg2.data() : nullptr);
-        chk("ring-wrap run, 8 threads == 12 threads", lg, lg2);
+        if (const char* sv = std::getenv("INK_SAVE_LOGITS")) {   // for cross-binary / cross-ring-size regression checks (cmp)
+            std::string base = rdir;
+            while (!base.empty() && base.back() == '/') base.pop_back();
+            write_f32(std::string(sv) + "_" + base.substr(base.find_last_of('/') + 1) + ".f32", lg);
+        }
+        if (ri == 2) {   // determinism of the long run across thread counts (one directory is enough)
+            std::vector<float> lg2(nv);
+            e->set_threads(8);
+            e->slot_reset(a);
+            for (size_t i = 0; i < rt.size(); ++i) e->decode(a, rt[i], i + 1 == rt.size() ? lg2.data() : nullptr);
+            chk("ring-wrap run, 8 threads == 12 threads", lg, lg2);
+        }
     } else {
         std::printf("  ring wrap: no token file in %s (need > 1030 tokens), skipped\n", rdir.c_str());
+    }
+    e->set_threads(env_threads());
     }
     std::printf("gate (e) %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

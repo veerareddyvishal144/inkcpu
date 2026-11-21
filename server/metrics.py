@@ -22,6 +22,9 @@ class Metrics:
         self.ttft_count = 0
         self.prefill_tps = 0.0
         self.decode_tps = 0.0
+        self.sec = {"prefill": 0.0, "decode_engine": 0.0, "decode_sampling": 0.0, "decode_other": 0.0, "queue": 0.0}
+        self.finished: Dict[str, int] = {}
+        self.spec = {"steps": 0, "drafted": 0, "accepted": 0, "emitted": 0}
         self.started = time.time()
 
     def inc_request(self, endpoint: str, status: int) -> None:
@@ -39,6 +42,17 @@ class Metrics:
             self.tokens["reasoning"] += fin.reasoning_tokens
             self.dur_sum += fin.total_s
             self.dur_count += 1
+            self.finished[fin.finish_reason] = self.finished.get(fin.finish_reason, 0) + 1
+            self.sec["prefill"] += fin.prefill_s
+            self.sec["queue"] += fin.queue_s
+            self.sec["decode_engine"] += fin.decode_engine_s
+            self.sec["decode_sampling"] += fin.sample_s
+            self.sec["decode_other"] += max(0.0, fin.decode_s - fin.decode_engine_s - fin.sample_s)
+            if fin.spec_steps:
+                self.spec["steps"] += fin.spec_steps
+                self.spec["drafted"] += fin.spec_drafted
+                self.spec["accepted"] += fin.spec_accepted
+                self.spec["emitted"] += fin.completion_tokens
             i = 0
             while i < len(_BUCKETS) and fin.total_s > _BUCKETS[i]:
                 i += 1
@@ -78,6 +92,22 @@ class Metrics:
             L.append("ink_request_duration_seconds_sum %.4f\nink_request_duration_seconds_count %d" % (self.dur_sum, self.dur_count))
             g("ink_ttft_seconds_sum", "sum of time to first token", "counter", "%.4f" % self.ttft_sum)
             g("ink_ttft_seconds_count", "requests with a first token", "counter", self.ttft_count)
+            L.append("# HELP ink_finished_total finished generations by finish reason\n# TYPE ink_finished_total counter")
+            for k, v in sorted(self.finished.items()):
+                L.append('ink_finished_total{reason="%s"} %d' % (k, v))
+            L.append("# HELP ink_seconds_total wall time by phase (decode_other = parser, stop strings, queueing the SSE events)\n"
+                     "# TYPE ink_seconds_total counter")
+            for k, v in self.sec.items():
+                L.append('ink_seconds_total{phase="%s"} %.4f' % (k, v))
+            L.append("# HELP ink_spec_total speculative decoding counters\n# TYPE ink_spec_total counter")
+            for k, v in self.spec.items():
+                L.append('ink_spec_total{kind="%s"} %d' % (k, v))
+            slots = sched.slot_snapshot()
+            if slots:
+                L.append("# HELP ink_slot_tokens tokens held in the slot (KV cache fill)\n# TYPE ink_slot_tokens gauge")
+                for s_ in slots:
+                    L.append('ink_slot_tokens{slot="%d",busy="%d"} %d' % (s_["id"], 1 if s_["busy"] else 0, s_["n_tokens"]))
+                g("ink_context_tokens", "context length per slot", "gauge", sched.backend.max_ctx)
             g("ink_prefill_tokens_per_second", "prefill speed of the last request", "gauge", "%.2f" % self.prefill_tps)
             g("ink_decode_tokens_per_second", "decode speed of the last request", "gauge", "%.2f" % self.decode_tps)
         return "\n".join(L) + "\n"

@@ -1,0 +1,15 @@
+STEP new=1 n_draft=7 n_acc=3 t_draft_us=225016 t_target_us=906129 t_proc_us=3441 rej=0
+STEP new=1 n_draft=7 n_acc=1 t_draft_us=217979 t_target_us=830742 t_proc_us=3538 rej=0
+STEP new=1 n_draft=7 n_acc=2 t_draft_us=214145 t_target_us=807167 t_proc_us=3977 rej=0
+STEP new=1 n_draft=7 n_acc=2 t_draft_us=211148 t_target_us=876111 t_proc_us=3537 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=220113 t_target_us=855610 t_proc_us=3149 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=218612 t_target_us=824469 t_proc_us=3549 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=217641 t_target_us=823281 t_proc_us=3069 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=213019 t_target_us=819512 t_proc_us=3271 rej=0
+STEP new=1 n_draft=7 n_acc=6 t_draft_us=217378 t_target_us=842496 t_proc_us=3321 rej=0
+STEP new=1 n_draft=7 n_acc=1 t_draft_us=211156 t_target_us=818677 t_proc_us=5786 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=221546 t_target_us=822442 t_proc_us=3031 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=213253 t_target_us=844253 t_proc_us=3271 rej=0
+STEP new=1 n_draft=7 n_acc=7 t_draft_us=219788 t_target_us=836048 t_proc_us=3471 rej=0
+STEP new=1 n_draft=2 n_acc=2 t_draft_us=75247 t_target_us=444214 t_proc_us=1594 rej=0
+STEP new=1 n_draft=0 n_acc=0 t_draft_us=1 t_target_us=258773 t_proc_us=1162 rej=0

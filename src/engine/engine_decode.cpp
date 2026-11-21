@@ -13,6 +13,11 @@
 
 #include "engine_priv.h"
 #include "ink/kernels_misc_simd.h"
+#ifdef INK_HAVE_PREFILL
+#include <cstdlib>
+
+#include "ink/engine_prefill.h"
+#endif
 
 namespace ink {
 
@@ -516,10 +521,28 @@ int Engine::forward(int slot, const int32_t* tokens, int n, float* logits_last) 
     if (n < 1) return -4;
     if (slot < 0 || slot >= (int)slots.size() || !slots[slot].used) return -1;
     if (slots[slot].pos + n > opt.max_ctx) return -2;
+#ifdef INK_HAVE_PREFILL
+    {   // batched executor (agent P): bit-identical to the loop below up to 767 visible keys, ~3.5x the token rate on prompts.
+        // INK_PREFILL_MIN = smallest n routed to it (default 3; 0 = never, i.e. always the decode loop).
+        static const int pf_min = [] {
+            const char* s = std::getenv("INK_PREFILL_MIN");
+            return s ? std::atoi(s) : 3;
+        }();
+        if (pf_min > 0 && n >= pf_min) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const int rc = engine_prefill(*this, slot, tokens, n, logits_last);
+            last_forward_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            return rc;
+        }
+    }
+#endif
+    double us = 0;
     for (int i = 0; i < n; ++i) {
         const int rc = decode(slot, tokens[i], i + 1 == n ? logits_last : nullptr);
         if (rc) return rc;
+        us += last_total_us;
     }
+    last_forward_us = us;
     return 0;
 }
 

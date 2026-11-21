@@ -65,6 +65,10 @@ class LiveServer:
         self.thread.join(10)
 
 
+class Skip(Exception):
+    """Raise inside a test to skip it (e.g. the real-engine tests without INK_GGUF / INK_LIB)."""
+
+
 def run_module(mod_globals):
     """Run every test_* function of a module; return number of failures."""
     fails = 0
@@ -73,6 +77,8 @@ def run_module(mod_globals):
         try:
             mod_globals[name]()
             print("PASS %-48s %.2fs" % (name, time.time() - t0), flush=True)
+        except Skip as e:
+            print("SKIP %-48s %s" % (name, e), flush=True)
         except Exception:
             fails += 1
             print("FAIL %-48s %.2fs" % (name, time.time() - t0), flush=True)

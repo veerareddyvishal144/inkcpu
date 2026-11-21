@@ -1,0 +1,63 @@
+loadavg_before 13.39 start 22:27:51
+0.01.668.889 E llama_init_from_model: failed to initialize the context: dflash requires ctx_other to be set (this warning is normal during memory fitting)
+0.01.813.499 W operator(): failed to measure the memory of the extra model, fitting without it: failed to create llama_context from model
+0.02.363.410 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.03.953.876 I cmn          init: llama threadpool init, n_threads = 8
+0.04.271.003 I common_speculative_init_result: loading draft model '/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf'
+0.04.785.544 W load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+0.04.889.607 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+0.04.889.622 E set_token_state: state size mismatch, got 1 rows x 2304 = 2304, expected 6912
+
+
+import heapq
+from collections import defaultdict
+
+
+def dijkstra(graph, source):
+    """Return the shortest distance from source to every reachable node.
+
+    graph is an adjacency dict: graph[u] = [(v, weight), ...] with non-negative weights.
+    """
+    dist = defaultdict(lambda: float("inf"))
+    dist[source] = 0
+    heap = [(0, source)]
+    while heap:0.04.904.988 I common_speculative_impl_draft_dflash: adding speculative implementation 'draft-dspark'
+0.04.904.993 I common_speculative_impl_draft_dflash: - n_max=3, n_min=0, p_min=0.00
+0.04.904.993 I common_speculative_impl_draft_dflash: - block_size=8, mask_token_id=0, n_extract=4
+0.04.905.115 I init: DFlash target features via device buffer
+
+        d, u = heapq.heappop(heap)
+        if d > dist[u]:
+            continue
+        for v, w in graph.get(u, []):
+            nd = d + w
+            if nd < dist[v]:
+                dist[v] = nd
+                heapq.
+
+0.27.433.552 I encoded  105 tokens in    8.601 seconds, speed:   12.208 t/s
+0.27.433.553 I decoded   81 tokens in   13.927 seconds, speed:    5.816 t/s
+0.27.433.554 I 
+0.27.433.555 I n_draft   = 3
+0.27.433.555 I n_predict = 81
+0.27.433.555 I n_drafted = 65
+0.27.433.556 I n_accept  = 58
+0.27.433.557 I accept    = 89.231%
+0.27.433.557 I 
+0.27.433.558 I draft:
+
+0.27.433.600 I 
+0.27.433.600 I target:
+
+0.27.433.604 I common_perf_print:    sampling time =      50.59 ms
+0.27.433.606 I common_perf_print:    samplers time =      14.76 ms /    81 tokens
+0.27.433.612 I common_perf_print:        load time =    2345.50 ms
+0.27.433.614 I common_perf_print: prompt eval time =   10756.54 ms /   191 tokens (   56.32 ms per token,    17.76 tokens per second)
+0.27.433.617 I common_perf_print:        eval time =     233.15 ms /     1 runs   (  233.15 ms per token,     4.29 tokens per second)
+0.27.433.618 I common_perf_print:       total time =   23162.67 ms /   192 tokens
+0.27.433.620 I common_perf_print: unaccounted time =   12122.38 ms /  52.3 %      (total - sampling - prompt eval - eval) / (total)
+0.27.433.620 I common_perf_print:    graphs reused =         20
+0.27.433.621 I common_perf_print:   graph reallocs =          0    /     0        (same size) / (changed size)
+
+
+loadavg_after 14.01 end 22:28:19

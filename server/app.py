@@ -36,6 +36,7 @@ class ServerConfig:
     request_log: Optional[str] = None       # JSONL path; None -> env INK_REQUEST_LOG; "" disables
     log_bodies: bool = False                # also log prompts/outputs (privacy: off by default)
     prefill_chunk: int = 256
+    spec: bool = True                       # use the backend's speculative steps when it has them (penalties always use plain decode)
 
 
 class ApiError(Exception):
@@ -109,7 +110,9 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
                "prompt_tokens": fin.prompt_tokens, "cached_tokens": fin.cached_tokens,
                "completion_tokens": fin.completion_tokens, "reasoning_tokens": fin.reasoning_tokens,
                "queue_ms": round(fin.queue_s * 1e3, 1), "prefill_ms": round(fin.prefill_s * 1e3, 1),
-               "decode_ms": round(fin.decode_s * 1e3, 1), "ttft_ms": round(fin.ttft_s * 1e3, 1),
+               "decode_ms": round(fin.decode_s * 1e3, 1), "engine_decode_ms": round(fin.decode_engine_s * 1e3, 1),
+               "sample_ms": round(fin.sample_s * 1e3, 1), "spec_steps": fin.spec_steps or None,
+               "ttft_ms": round(fin.ttft_s * 1e3, 1),
                "total_ms": round(fin.total_s * 1e3, 1),
                "decode_tps": round(fin.completion_tokens / fin.decode_s, 2) if fin.decode_s > 0 and fin.completion_tokens > 1 else None,
                "temperature": req.sampling.temperature, "top_p": req.sampling.top_p, "top_k": req.sampling.top_k,
@@ -120,7 +123,7 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             rec["response"] = {"content": m.content, "reasoning_content": m.reasoning_content, "tool_calls": m.tool_calls}
         reqlog.write(rec)
 
-    sched = Scheduler(backend, tok, max_queue=cfg.max_queue, prefill_chunk=cfg.prefill_chunk, on_finish=on_finish)
+    sched = Scheduler(backend, tok, max_queue=cfg.max_queue, prefill_chunk=cfg.prefill_chunk, on_finish=on_finish, spec=cfg.spec)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -173,11 +176,18 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
                 "completion_tokens_details": {"reasoning_tokens": fin.reasoning_tokens}}
 
     def timings_of(fin: Finish) -> Dict[str, Any]:
+        """Non-standard `timings` object; field names follow llama.cpp's (prompt_n = NEW prompt tokens, cache_n = reused)."""
         new = fin.prompt_tokens - fin.cached_tokens
-        return {"queue_ms": round(fin.queue_s * 1e3, 1), "prompt_n": new, "prompt_ms": round(fin.prefill_s * 1e3, 1),
-                "predicted_n": fin.completion_tokens, "predicted_ms": round(fin.decode_s * 1e3, 1),
-                "predicted_per_second": round(fin.completion_tokens / fin.decode_s, 2) if fin.decode_s > 0 else None,
-                "ttft_ms": round(fin.ttft_s * 1e3, 1)}
+        out = {"queue_ms": round(fin.queue_s * 1e3, 1), "cache_n": fin.cached_tokens, "prompt_n": new,
+               "prompt_ms": round(fin.prefill_s * 1e3, 1),
+               "prompt_per_second": round(new / fin.prefill_s, 2) if fin.prefill_s > 0 and new > 0 else None,
+               "predicted_n": fin.completion_tokens, "predicted_ms": round(fin.decode_s * 1e3, 1),
+               "predicted_per_second": round(fin.completion_tokens / fin.decode_s, 2) if fin.decode_s > 0 else None,
+               "engine_ms": round(fin.decode_engine_s * 1e3, 1), "sample_ms": round(fin.sample_s * 1e3, 1),
+               "ttft_ms": round(fin.ttft_s * 1e3, 1)}
+        if fin.spec_steps:
+            out.update(spec_steps=fin.spec_steps, spec_drafted=fin.spec_drafted, spec_accepted=fin.spec_accepted)
+        return out
 
     def make_gen(request: Request, body: Dict[str, Any], prompt_ids: List[int], max_tokens: int, mode: str, stream: bool,
                  endpoint: str, loop, q: "asyncio.Queue", **kw) -> GenRequest:
@@ -216,8 +226,12 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             return JSONResponse({"status": "error", "error": sched.load_error}, status_code=503)
         if not sched.ready.is_set():
             return JSONResponse({"status": "loading"}, status_code=503)
-        return {"status": "ok", "backend": backend.name, "slots": backend.n_slots, "active": sched.n_active(),
-                "queued": sched.n_waiting()}
+        return {"status": "ok", "backend": backend.name, "slots": backend.n_slots, "ctx": backend.max_ctx,
+                "active": sched.n_active(), "queued": sched.n_waiting()}
+
+    @app.get("/slots")
+    async def slots_ep():
+        return {"slots": sched.slot_snapshot(), "ctx": backend.max_ctx, "queued": sched.n_waiting(), "active": sched.n_active()}
 
     @app.get("/metrics")
     async def metrics_ep():
@@ -288,6 +302,9 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             out = dict(base, object="chat.completion",
                        choices=[{"index": 0, "message": msg, "finish_reason": fin.finish_reason, "logprobs": None}],
                        usage=usage_of(fin), timings=timings_of(fin))
+            if body.get("return_token_ids"):   # non-standard (vLLM-style): exact token-level comparisons in tests
+                out["prompt_token_ids"] = prompt_ids
+                out["choices"][0]["token_ids"] = fin.token_ids
             return JSONResponse(out)
 
         async def gen_sse():
@@ -379,10 +396,13 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
         if not stream:
             fin = await _wait_done(request, q, gen)
             reason = "stop" if fin.finish_reason == "tool_calls" else fin.finish_reason
-            return JSONResponse(dict(base, object="text_completion",
-                                     choices=[{"text": fin.message.content or "", "index": 0, "logprobs": None,
-                                               "finish_reason": reason}],
-                                     usage=usage_of(fin), timings=timings_of(fin)))
+            out = dict(base, object="text_completion",
+                       choices=[{"text": fin.message.content or "", "index": 0, "logprobs": None, "finish_reason": reason}],
+                       usage=usage_of(fin), timings=timings_of(fin))
+            if body.get("return_token_ids"):
+                out["prompt_token_ids"] = prompt_ids
+                out["choices"][0]["token_ids"] = fin.token_ids
+            return JSONResponse(out)
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
         async def gen_sse():

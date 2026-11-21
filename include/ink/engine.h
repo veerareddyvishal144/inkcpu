@@ -30,6 +30,7 @@ constexpr int kNExp = 128, kTopK = 8;
 constexpr int kCtrlRank = 64;
 constexpr int kVisits = 48;
 constexpr int kMaxSplit = 16;                     // max key splits of one attention group
+constexpr int kSwaRingBlocks = 32;                // SWA KV ring: 32 blocks = 2048 positions (a prefill chunk of n tokens needs >= 1023 + n)
 constexpr int kMaxBlocks = 5;                     // attention-residual block states kept (4 pushed + cur)
 // conv histories per visit, SoA [3][C] each, order: K (1024), V (1024), wo-out (2304), moe-out (2304)
 constexpr size_t kHistPerVisit = 3 * (2 * (size_t)kKVW + 2 * (size_t)kD);
@@ -85,8 +86,9 @@ struct LayerPacked {
 // Per-sequence state of one slot.
 struct SlotState {
     bool used = false;
-    int64_t pos = 0;                       // tokens in the slot
-    KvLayer kv[kVisits];                   // per visit (SWA: ring of 16 blocks; global: blocks grow up to max_ctx)
+    int64_t pos = 0;                       // tokens in the slot (a batch executor must advance it and, for the 8 global visits,
+                                           // keep kv[v].n_blocks >= (last position / 64 + 1) before it appends/attends)
+    KvLayer kv[kVisits];                   // per visit (SWA: ring of kSwaRingBlocks blocks; global: blocks grow up to max_ctx)
     size_t kv_map_bytes[kVisits] = {};     // mapped bytes per K / V tensor
     float* hist = nullptr;                 // kVisits * kHistPerVisit floats
 };
@@ -114,6 +116,7 @@ struct PhaseCounter;
 struct Tune {                              // env-overridable tunables (read at create)
     int chunk_proj = 32, chunk_wo = 32, chunk_down = 32, chunk_lm = 512, chunk_router = 8, chunk_ctrl = 64;
     int split_keys = 384;                  // attention key split granule: nsplit = clamp(n_keys / split_keys, 1, kMaxSplit)
+    int swa_blocks = kSwaRingBlocks;       // SWA ring size in 64-position blocks (env INK_SWA_BLOCKS, tests only; >= 16)
 };
 
 class Engine {
@@ -143,7 +146,8 @@ public:
     bool profiling() const { return prof_on; }
     void profile_reset();
     void profile_report(FILE* f) const;
-    double last_total_us = 0;
+    double last_total_us = 0;       // wall time of the last decode() (one token)
+    double last_forward_us = 0;     // wall time of the last forward() (all its tokens)
 
     // ---- debug trace (single-token tests): called by thread 0 after the named point of each visit ----
     // names: "Qcur","Kcur","Vcur","Rcur" (post clip), "attn_out" (post conv), "ffn_inp", "l_out"; il = llama slot of the visit

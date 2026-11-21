@@ -10,3 +10,6 @@ server/__pycache__/
 *.o
 *.a
 *.so
+build-*.log
+build-*.cfg.log
+docs/GO_RUN

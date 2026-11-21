@@ -1,0 +1,47 @@
+[load start: 8.66 6.49 5.52 26/1380 351151]
+== vector math (single thread, pinned CPU 0)
+  n=201024  tanh      avx512   1.606 ns/elem (0.62 Gelem/s, 322.9 us/call)   scalar libm  63.124 ns/elem   speedup 39.3x
+  n=201024  sigmoid   avx512   1.123 ns/elem (0.89 Gelem/s, 225.8 us/call)   scalar libm  11.391 ns/elem   speedup 10.1x
+  n=201024  exp       avx512   0.956 ns/elem (1.05 Gelem/s, 192.3 us/call)   scalar libm   8.182 ns/elem   speedup 8.6x
+  n=201024  softcap30 avx512   2.007 ns/elem (0.50 Gelem/s, 403.4 us/call)   scalar libm  47.947 ns/elem   speedup 23.9x
+  n=201024  situ      avx512   5.683 ns/elem (0.18 Gelem/s, 1142.4 us/call)   scalar libm 128.831 ns/elem   speedup 22.7x
+  n=9216    tanh      avx512   1.997 ns/elem (0.50 Gelem/s, 18.4 us/call)   scalar libm  56.021 ns/elem   speedup 28.1x
+  n=9216    sigmoid   avx512   1.318 ns/elem (0.76 Gelem/s, 12.2 us/call)   scalar libm  11.325 ns/elem   speedup 8.6x
+  n=9216    exp       avx512   0.773 ns/elem (1.29 Gelem/s, 7.1 us/call)   scalar libm  10.326 ns/elem   speedup 13.4x
+  n=9216    softcap30 avx512   2.120 ns/elem (0.47 Gelem/s, 19.5 us/call)   scalar libm  45.690 ns/elem   speedup 21.6x
+  n=9216    situ      avx512   5.558 ns/elem (0.18 Gelem/s, 51.2 us/call)   scalar libm 129.329 ns/elem   speedup 23.3x
+== norms, clips, conv, router, mix (single thread)
+  rmsnorm n=2304 (w)                    0.599 us/call
+  rmsnorm_q8_0 n=2304 (fused)           3.089 us/call
+  vsitu_q8_0 8 experts x 1152 (fused)   70.821 us/call
+  rmsnorm + quantize_q8_0 (2 passes)    3.139 us/call
+  l2clip Q 24x128 (chan scale)          2.188 us/call
+  l2clip K 8x128                        0.581 us/call
+  l2clip R 24x16 (scale, tau)           0.750 us/call
+  memcpy baseline 3072 floats           0.287 us/call
+  vnorm V 8x128                         0.409 us/call
+  sconv_step C=1024 static              2.181 us/call
+  sconv_step C=1024 dynamic taps        2.257 us/call
+  sconv_step C=2304 static              2.908 us/call
+  sconv_step C=2304 dynamic taps        3.486 us/call
+  depth_mix ns=5 nq=1 n=2304            9.888 us/call
+  depth_mix ns=5 nq=3 n=2304           24.230 us/call
+  depth_mix ns=5 nq=4 n=2304           27.679 us/call
+  ctrl_apply n=2304 (2 tanh)            9.716 us/call
+  vadd n=2304                           0.393 us/call
+  vmul_sigmoid n=3072                   3.080 us/call
+  router_topk 128 -> 8                  0.799 us/call
+  ref::router_topk (std::sort)          3.564 us/call
+  kv_append (8 heads, K transposed)     4.989 us/call
+== attention decode (1 query token, 24 q heads / 8 kv heads / d128, fp16 KV)
+  SWA ring 1024 keys, 1 thread (all 8 groups):    457.6 us/visit  (KV 4.2 MB -> 9.2 GB/s, L2/L3 resident)
+      x40 SWA visits per token = 18.31 ms single-thread
+  SWA ring, 16 threads, nsplit 1 (8 tasks):    332.3 us/visit (incl. spin-barrier)  x40 = 13.29 ms/token  (12.6 GB/s)
+  SWA ring, 16 threads, nsplit 2 (16 tasks):    108.3 us/visit (incl. spin-barrier)  x40 = 4.33 ms/token  (38.7 GB/s)
+  global ctx 8192    1 thread:     7077.4 us/visit  KV    33.6 MB ->   4.7 GB/s   | 16 threads (nsplit 2):    1520.3 us  ->  22.1 GB/s (24% of 92.5 GB/s)
+  global ctx 32768   1 thread:    37410.0 us/visit  KV   134.2 MB ->   3.6 GB/s   | 16 threads (nsplit 2):    7454.2 us  ->  18.0 GB/s (19% of 92.5 GB/s)
+  global ctx 131072  1 thread:   157252.1 us/visit  KV   536.9 MB ->   3.4 GB/s   | 16 threads (nsplit 2):   13519.0 us  ->  39.7 GB/s (43% of 92.5 GB/s)
+== attention prefill (SWA ring 2048 slots, pos0 3000, 512 tokens; global ctx 8192, 128 tokens), 1 thread, 8 groups
+  SWA prefill: 527.7 us/token (1.05x the decode-kernel cost per token 554.1 us)
+  global prefill (~8K keys/query): 4227.9 us/token  (23.6 GFLOP/s MAC-equivalent single thread)
+[load end: 12.22 7.41 5.85 17/1370 351427]

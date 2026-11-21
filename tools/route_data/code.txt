@@ -1,0 +1,63 @@
+#include "models.h"
+#include "../llama-memory-hybrid-iswa.h"
+
+void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
+    ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size);
+    ml.get_key(LLM_KV_SHORTCONV_L_CACHE,           hparams.n_shortconv_l_cache);
+
+    // relative-position bias, and the log-scaled positions of the full-attention layers
+    ml.get_key(LLM_KV_ATTENTION_RELATIVE_LENGTH, hparams.n_relative);
+    ml.get_key(LLM_KV_ATTENTION_RELATIVE_EXTENT, hparams.n_relative_extent);
+    ml.get_key(LLM_KV_ATTENTION_RELATIVE_CLIP,   hparams.f_relative_clip);
+    ml.get_key(LLM_KV_ATTENTION_LOG_SCALE_FLOOR, hparams.n_log_scale_floor);
+    ml.get_key(LLM_KV_ATTENTION_LOG_SCALE_ALPHA, hparams.f_log_scale_alpha);
+
+    // the embedding and output tensors are padded past the vocabulary
+    ml.get_key(LLM_KV_VOCAB_SIZE,          hparams.n_vocab_padded);
+    ml.get_key(LLM_KV_VOCAB_SIZE_UNPADDED, hparams.n_vocab_unpadded);
+
+    // MoE
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all);
+
+    ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta);
+    ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
+
+    hparams.f_final_logit_softcapping = 0.0f;
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING, hparams.f_final_logit_softcapping, false);
+
+    // sliding window
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,         hparams.n_swa);
+    ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl);
+
+    uint32_t n_pattern = 0;
+    ml.get_arr_n(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, n_pattern);
+
+    if (n_pattern != hparams.n_layer() || !hparams.n_relative || !hparams.n_relative_extent || !hparams.n_swa ||
+        !hparams.attn_res_block_size || !hparams.n_log_scale_floor || hparams.n_shortconv_l_cache < 2 ||
+        hparams.n_shortconv_l_cache > 64 || hparams.n_relative_extent > INT32_MAX || hparams.n_swa > INT32_MAX ||
+        !hparams.n_vocab_unpadded || hparams.n_vocab_unpadded > hparams.n_vocab_padded) {
+        throw std::runtime_error("inkling2: invalid dimensions, vocabulary, or layer pattern");
+    }
+
+    for (float value : {hparams.f_norm_rms_eps, hparams.f_qk_clip, hparams.f_relative_clip, hparams.situ_beta, hparams.situ_linear_beta}) {
+        if (!std::isfinite(value) || value <= 0.0f) {
+            throw std::runtime_error("inkling2: normalization, clipping and scaling parameters must be finite and positive");
+        }
+    }
+
+    if (!std::isfinite(hparams.f_log_scale_alpha) || hparams.f_log_scale_alpha < 0.0f) {
+        throw std::runtime_error("inkling2: invalid logarithmic scale");
+    }
+
+    hparams.swa_type                = LLAMA_SWA_TYPE_STANDARD;
+    hparams.expert_router_f32       = true;
+    hparams.expert_weights_norm_eps = 1e-20f;
+
+    // no RoPE, the relative-position bias carries the positions
+    hparams.rope_pattern.fill(false);
+
+    // the convolution state keeps K, V, the attention output and the FFN output of the widest layer
+    uint64_t n_channels_max =

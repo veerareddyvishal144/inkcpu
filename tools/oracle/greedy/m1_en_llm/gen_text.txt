@@ -1,0 +1,3 @@
+ That is the whole mechanism, and it is also the source of the problem.
+
+A model that generates text is not a model that verifies it. It produces a plausible continuation, and plausibility is not the same as correctness. A confident, fluent, well-structured answer can be wrong in a

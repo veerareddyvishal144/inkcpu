@@ -1,0 +1,1126 @@
+{
+ "mb": 1000000.0,
+ "gguf": "/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf",
+ "n_tensors": 744,
+ "tensor_bytes": 17617780736,
+ "total_read": {
+  "A": 4010823824.0,
+  "B": 3864280208.0,
+  "C": 3861915440.0
+ },
+ "expert_weight_read": {
+  "A": 1847328768.0,
+  "B": 1847328768.0,
+  "C": 1847328768.0
+ },
+ "expert_scale_read": {
+  "A": 2816.0,
+  "B": 2816.0,
+  "C": 2816.0
+ },
+ "non_expert_read": {
+  "A": 2163492240.0,
+  "B": 2016948624.0,
+  "C": 2014583856.0
+ },
+ "lm_head_bytes": {
+  "A": 492106752,
+  "B": 492106752,
+  "C": 489741984.0
+ },
+ "per_expert_bytes": {
+  "NVFP4": [
+   4478984
+  ],
+  "Q8_0": [
+   8460288
+  ]
+ },
+ "layer_expert_type": {
+  "0": "NVFP4",
+  "1": "NVFP4",
+  "2": "NVFP4",
+  "3": "NVFP4",
+  "4": "NVFP4",
+  "5": "NVFP4",
+  "6": "NVFP4",
+  "7": "NVFP4",
+  "8": "NVFP4",
+  "9": "NVFP4",
+  "10": "NVFP4",
+  "11": "NVFP4",
+  "12": "NVFP4",
+  "13": "NVFP4",
+  "14": "NVFP4",
+  "15": "NVFP4",
+  "16": "NVFP4",
+  "17": "NVFP4",
+  "18": "NVFP4",
+  "19": "NVFP4",
+  "20": "Q8_0",
+  "21": "Q8_0",
+  "22": "Q8_0",
+  "23": "Q8_0"
+ },
+ "visit_layer": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  6,
+  7,
+  8,
+  9,
+  10,
+  11,
+  12,
+  13,
+  14,
+  15,
+  16,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23
+ ],
+ "f32_total_bytes": 147544064,
+ "f32_not_bf16_exact": [
+  "output_res_query.weight",
+  "blk.0.exp_probs_b.bias",
+  "blk.0.ffn_down_exps.scale",
+  "blk.0.ffn_gate_up_exps.scale",
+  "blk.0.ffn_res_query.weight",
+  "blk.1.attn_res_query.weight",
+  "blk.1.exp_probs_b.bias",
+  "blk.1.ffn_down_exps.scale",
+  "blk.1.ffn_gate_up_exps.scale",
+  "blk.1.ffn_res_query.weight",
+  "blk.2.attn_res_query.weight",
+  "blk.2.exp_probs_b.bias",
+  "blk.2.ffn_down_exps.scale",
+  "blk.2.ffn_gate_up_exps.scale",
+  "blk.2.ffn_res_query.weight",
+  "blk.3.attn_res_query.weight",
+  "blk.3.exp_probs_b.bias",
+  "blk.3.ffn_down_exps.scale",
+  "blk.3.ffn_gate_up_exps.scale",
+  "blk.3.ffn_res_query.weight",
+  "blk.4.attn_res_query.weight",
+  "blk.4.exp_probs_b.bias",
+  "blk.4.ffn_down_exps.scale",
+  "blk.4.ffn_gate_up_exps.scale",
+  "blk.4.ffn_res_query.weight",
+  "blk.5.attn_res_query.weight",
+  "blk.5.exp_probs_b.bias",
+  "blk.5.ffn_down_exps.scale",
+  "blk.5.ffn_gate_up_exps.scale",
+  "blk.5.ffn_res_query.weight",
+  "blk.6.attn_res_query.weight",
+  "blk.6.exp_probs_b.bias",
+  "blk.6.ffn_down_exps.scale",
+  "blk.6.ffn_gate_up_exps.scale",
+  "blk.6.ffn_res_query.weight",
+  "blk.7.attn_res_query.weight",
+  "blk.7.exp_probs_b.bias",
+  "blk.7.ffn_down_exps.scale",
+  "blk.7.ffn_gate_up_exps.scale",
+  "blk.7.ffn_res_query.weight",
+  "blk.8.attn_res_query.weight",
+  "blk.8.exp_probs_b.bias",
+  "blk.8.ffn_down_exps.scale",
+  "blk.8.ffn_gate_up_exps.scale",
+  "blk.8.ffn_res_query.weight",
+  "blk.9.attn_res_query.weight",
+  "blk.9.exp_probs_b.bias",
+  "blk.9.ffn_down_exps.scale",
+  "blk.9.ffn_gate_up_exps.scale",
+  "blk.9.ffn_res_query.weight",
+  "blk.10.attn_res_query.weight",
+  "blk.10.exp_probs_b.bias",
+  "blk.10.ffn_down_exps.scale",
+  "blk.10.ffn_gate_up_exps.scale",
+  "blk.10.ffn_res_query.weight",
+  "blk.11.attn_res_query.weight",
+  "blk.11.exp_probs_b.bias",
+  "blk.11.ffn_down_exps.scale",
+  "blk.11.ffn_gate_up_exps.scale",
+  "blk.11.ffn_res_query.weight",
+  "blk.12.attn_res_query.weight",
+  "blk.12.exp_probs_b.bias",
+  "blk.12.ffn_down_exps.scale",
+  "blk.12.ffn_gate_up_exps.scale",
+  "blk.12.ffn_res_query.weight",
+  "blk.13.attn_res_query.weight",
+  "blk.13.exp_probs_b.bias",
+  "blk.13.ffn_down_exps.scale",
+  "blk.13.ffn_gate_up_exps.scale",
+  "blk.13.ffn_res_query.weight",
+  "blk.14.attn_res_query.weight",
+  "blk.14.exp_probs_b.bias",
+  "blk.14.ffn_down_exps.scale",
+  "blk.14.ffn_gate_up_exps.scale",
+  "blk.14.ffn_res_query.weight",
+  "blk.15.attn_res_query.weight",
+  "blk.15.exp_probs_b.bias",
+  "blk.15.ffn_down_exps.scale",
+  "blk.15.ffn_gate_up_exps.scale",
+  "blk.15.ffn_res_query.weight",
+  "blk.16.attn_res_query.weight",
+  "blk.16.exp_probs_b.bias",
+  "blk.16.ffn_down_exps.scale",
+  "blk.16.ffn_gate_up_exps.scale",
+  "blk.16.ffn_res_query.weight",
+  "blk.17.attn_res_query.weight",
+  "blk.17.exp_probs_b.bias",
+  "blk.17.ffn_down_exps.scale",
+  "blk.17.ffn_gate_up_exps.scale",
+  "blk.17.ffn_res_query.weight",
+  "blk.18.attn_res_query.weight",
+  "blk.18.exp_probs_b.bias",
+  "blk.18.ffn_down_exps.scale",
+  "blk.18.ffn_gate_up_exps.scale",
+  "blk.18.ffn_res_query.weight",
+  "blk.19.attn_res_query.weight",
+  "blk.19.exp_probs_b.bias",
+  "blk.19.ffn_down_exps.scale",
+  "blk.19.ffn_gate_up_exps.scale",
+  "blk.19.ffn_res_query.weight",
+  "blk.20.attn_res_query.weight",
+  "blk.20.exp_probs_b.bias",
+  "blk.20.ffn_res_query.weight",
+  "blk.21.attn_res_query.weight",
+  "blk.21.exp_probs_b.bias",
+  "blk.21.ffn_res_query.weight",
+  "blk.22.attn_res_query.weight",
+  "blk.22.exp_probs_b.bias",
+  "blk.22.ffn_res_query.weight",
+  "blk.23.attn_res_query.weight",
+  "blk.23.exp_probs_b.bias",
+  "blk.23.ffn_res_query.weight",
+  "blk.6.loop_msg_query.weight",
+  "blk.7.loop_msg_query.weight",
+  "blk.8.loop_msg_query.weight",
+  "blk.9.loop_msg_query.weight",
+  "blk.10.loop_msg_query.weight",
+  "blk.11.loop_msg_query.weight",
+  "blk.12.loop_msg_query.weight",
+  "blk.13.loop_msg_query.weight",
+  "blk.14.loop_msg_query.weight",
+  "blk.15.loop_msg_query.weight",
+  "blk.16.loop_msg_query.weight",
+  "blk.17.loop_msg_query.weight"
+ ],
+ "classes": [
+  {
+   "cls": "output.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 1,
+   "file_bytes": 492106752,
+   "visits": 1,
+   "read": {
+    "A": 492106752.0,
+    "B": 492106752.0,
+    "C": 489741984.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "output_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 1,
+   "file_bytes": 9216,
+   "visits": 1,
+   "read": {
+    "A": 9216.0,
+    "B": 4608.0,
+    "C": 4608.0
+   },
+   "bf16_exact": [
+    1,
+    1
+   ]
+  },
+  {
+   "cls": "output_res_query.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 1,
+   "file_bytes": 9216,
+   "visits": 1,
+   "read": {
+    "A": 9216.0,
+    "B": 9216.0,
+    "C": 9216.0
+   },
+   "bf16_exact": [
+    0,
+    1
+   ]
+  },
+  {
+   "cls": "token_embd.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 1,
+   "file_bytes": 492106752,
+   "visits": 1,
+   "read": {
+    "A": 2448.0,
+    "B": 2448.0,
+    "C": 2448.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "token_embd_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 1,
+   "file_bytes": 9216,
+   "visits": 1,
+   "read": {
+    "A": 9216.0,
+    "B": 4608.0,
+    "C": 4608.0
+   },
+   "bf16_exact": [
+    1,
+    1
+   ]
+  },
+  {
+   "cls": "attn_gate.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 180486144,
+   "visits": 48,
+   "read": {
+    "A": 360972288.0,
+    "B": 360972288.0,
+    "C": 360972288.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_k.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 60162048,
+   "visits": 48,
+   "read": {
+    "A": 120324096.0,
+    "B": 120324096.0,
+    "C": 120324096.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_k_conv.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 393216,
+   "visits": 48,
+   "read": {
+    "A": 786432.0,
+    "B": 393216.0,
+    "C": 393216.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "attn_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 20,
+   "file_bytes": 184320,
+   "visits": 40,
+   "read": {
+    "A": 368640.0,
+    "B": 184320.0,
+    "C": 184320.0
+   },
+   "bf16_exact": [
+    20,
+    20
+   ]
+  },
+  {
+   "cls": "attn_output.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 180486144,
+   "visits": 48,
+   "read": {
+    "A": 360972288.0,
+    "B": 360972288.0,
+    "C": 360972288.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_post_conv.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 884736,
+   "visits": 48,
+   "read": {
+    "A": 1769472.0,
+    "B": 884736.0,
+    "C": 884736.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "attn_q.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 180486144,
+   "visits": 48,
+   "read": {
+    "A": 360972288.0,
+    "B": 360972288.0,
+    "C": 360972288.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_q_clip.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 294912,
+   "visits": 48,
+   "read": {
+    "A": 589824.0,
+    "B": 294912.0,
+    "C": 294912.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "attn_rel.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 22560768,
+   "visits": 48,
+   "read": {
+    "A": 45121536.0,
+    "B": 45121536.0,
+    "C": 45121536.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_rel_bias.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 1572864,
+   "visits": 48,
+   "read": {
+    "A": 3145728.0,
+    "B": 1572864.0,
+    "C": 1572864.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "attn_rel_clip.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 36864,
+   "visits": 48,
+   "read": {
+    "A": 73728.0,
+    "B": 36864.0,
+    "C": 36864.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "attn_sink_proj.weight",
+   "types": [
+    "BF16"
+   ],
+   "n": 24,
+   "file_bytes": 2654208,
+   "visits": 48,
+   "read": {
+    "A": 5308416.0,
+    "B": 5308416.0,
+    "C": 5308416.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_v.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 24,
+   "file_bytes": 60162048,
+   "visits": 48,
+   "read": {
+    "A": 120324096.0,
+    "B": 120324096.0,
+    "C": 120324096.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_v_conv.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 393216,
+   "visits": 48,
+   "read": {
+    "A": 786432.0,
+    "B": 393216.0,
+    "C": 393216.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "exp_probs_b.bias",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 12288,
+   "visits": 48,
+   "read": {
+    "A": 24576.0,
+    "B": 24576.0,
+    "C": 24576.0
+   },
+   "bf16_exact": [
+    0,
+    24
+   ]
+  },
+  {
+   "cls": "ffn_down_exps.scale",
+   "types": [
+    "F32"
+   ],
+   "n": 20,
+   "file_bytes": 10240,
+   "visits": 44,
+   "read": {
+    "A": 1408.0,
+    "B": 1408.0,
+    "C": 1408.0
+   },
+   "bf16_exact": [
+    0,
+    20
+   ]
+  },
+  {
+   "cls": "ffn_down_exps.weight",
+   "types": [
+    "NVFP4"
+   ],
+   "n": 20,
+   "file_bytes": 3822059520,
+   "visits": 44,
+   "read": {
+    "A": 525533184.0,
+    "B": 525533184.0,
+    "C": 525533184.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "ffn_gate_inp.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 28311552,
+   "visits": 48,
+   "read": {
+    "A": 56623104.0,
+    "B": 28311552.0,
+    "C": 28311552.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "ffn_gate_up_exps.scale",
+   "types": [
+    "F32"
+   ],
+   "n": 20,
+   "file_bytes": 10240,
+   "visits": 44,
+   "read": {
+    "A": 1408.0,
+    "B": 1408.0,
+    "C": 1408.0
+   },
+   "bf16_exact": [
+    0,
+    20
+   ]
+  },
+  {
+   "cls": "ffn_gate_up_exps.weight",
+   "types": [
+    "NVFP4"
+   ],
+   "n": 20,
+   "file_bytes": 7644119040,
+   "visits": 44,
+   "read": {
+    "A": 1051066368.0,
+    "B": 1051066368.0,
+    "C": 1051066368.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "ffn_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 221184,
+   "visits": 48,
+   "read": {
+    "A": 442368.0,
+    "B": 221184.0,
+    "C": 221184.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "ffn_post_conv.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 884736,
+   "visits": 48,
+   "read": {
+    "A": 1769472.0,
+    "B": 884736.0,
+    "C": 884736.0
+   },
+   "bf16_exact": [
+    24,
+    24
+   ]
+  },
+  {
+   "cls": "ffn_res_query.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 24,
+   "file_bytes": 221184,
+   "visits": 48,
+   "read": {
+    "A": 442368.0,
+    "B": 442368.0,
+    "C": 442368.0
+   },
+   "bf16_exact": [
+    0,
+    24
+   ]
+  },
+  {
+   "cls": "attn_res_query.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 23,
+   "file_bytes": 285696,
+   "visits": 47,
+   "read": {
+    "A": 580608.0,
+    "B": 580608.0,
+    "C": 580608.0
+   },
+   "bf16_exact": [
+    0,
+    23
+   ]
+  },
+  {
+   "cls": "attn_k_conv_proj.weight",
+   "types": [
+    "BF16"
+   ],
+   "n": 4,
+   "file_bytes": 589824,
+   "visits": 8,
+   "read": {
+    "A": 1179648.0,
+    "B": 1179648.0,
+    "C": 1179648.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_k_inp_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 4,
+   "file_bytes": 36864,
+   "visits": 8,
+   "read": {
+    "A": 73728.0,
+    "B": 36864.0,
+    "C": 36864.0
+   },
+   "bf16_exact": [
+    4,
+    4
+   ]
+  },
+  {
+   "cls": "attn_q_inp_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 4,
+   "file_bytes": 36864,
+   "visits": 8,
+   "read": {
+    "A": 73728.0,
+    "B": 36864.0,
+    "C": 36864.0
+   },
+   "bf16_exact": [
+    4,
+    4
+   ]
+  },
+  {
+   "cls": "attn_v_conv_proj.weight",
+   "types": [
+    "BF16"
+   ],
+   "n": 4,
+   "file_bytes": 589824,
+   "visits": 8,
+   "read": {
+    "A": 1179648.0,
+    "B": 1179648.0,
+    "C": 1179648.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "attn_v_inp_norm.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 4,
+   "file_bytes": 36864,
+   "visits": 8,
+   "read": {
+    "A": 73728.0,
+    "B": 36864.0,
+    "C": 36864.0
+   },
+   "bf16_exact": [
+    4,
+    4
+   ]
+  },
+  {
+   "cls": "loop_q_ctrl_down.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 14155776,
+   "visits": 24,
+   "read": {
+    "A": 28311552.0,
+    "B": 14155776.0,
+    "C": 14155776.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_q_ctrl_forget.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_q_ctrl_gain.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_k_ctrl_down.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 14155776,
+   "visits": 24,
+   "read": {
+    "A": 28311552.0,
+    "B": 14155776.0,
+    "C": 14155776.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_k_ctrl_forget.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_k_ctrl_gain.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_ffn_ctrl_down.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 14155776,
+   "visits": 24,
+   "read": {
+    "A": 28311552.0,
+    "B": 14155776.0,
+    "C": 14155776.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_ffn_ctrl_forget.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_ffn_ctrl_gain.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_v_ctrl_down.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 14155776,
+   "visits": 24,
+   "read": {
+    "A": 28311552.0,
+    "B": 14155776.0,
+    "C": 14155776.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_v_ctrl_forget.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "loop_v_ctrl_gain.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 7077888,
+   "visits": 24,
+   "read": {
+    "A": 14155776.0,
+    "B": 7077888.0,
+    "C": 7077888.0
+   },
+   "bf16_exact": [
+    12,
+    12
+   ]
+  },
+  {
+   "cls": "ffn_down_exps.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 4,
+   "file_bytes": 1443889152,
+   "visits": 4,
+   "read": {
+    "A": 90243072.0,
+    "B": 90243072.0,
+    "C": 90243072.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "ffn_gate_up_exps.weight",
+   "types": [
+    "Q8_0"
+   ],
+   "n": 4,
+   "file_bytes": 2887778304,
+   "visits": 4,
+   "read": {
+    "A": 180486144.0,
+    "B": 180486144.0,
+    "C": 180486144.0
+   },
+   "bf16_exact": [
+    0,
+    0
+   ]
+  },
+  {
+   "cls": "loop_msg_query.weight",
+   "types": [
+    "F32"
+   ],
+   "n": 12,
+   "file_bytes": 442368,
+   "visits": 24,
+   "read": {
+    "A": 884736.0,
+    "B": 884736.0,
+    "C": 884736.0
+   },
+   "bf16_exact": [
+    0,
+    12
+   ]
+  }
+ ]
+}

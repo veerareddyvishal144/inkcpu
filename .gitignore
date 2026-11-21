@@ -1,0 +1,12 @@
+build/
+build-*/
+tools/build/
+tools/build-*/
+**/standalone/build*/
+server/assets/tokenizer.json
+server/__pycache__/
+**/__pycache__/
+.bench.lock
+*.o
+*.a
+*.so

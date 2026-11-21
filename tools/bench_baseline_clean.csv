@@ -1,0 +1,3 @@
+date,load1_before,load1_after,other_cpus_busy,llama_cpp_commit,test,threads,tokens_per_s,stddev,reps,command
+2026-11-21T21:39:34+00:00,1.46,6.22,0.2,2a28df0f9,decode,12,5.447752,0.048908,3,OMP_WAIT_POLICY=active OMP_PLACES=cores OMP_PROC_BIND=close /data/inkling-mini/llama.cpp/build-sys/bin/llama-bench -m /data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf -p 0 -n 64 -t 12 -r 3 -o csv
+2026-11-21T21:41:41+00:00,1.93,8.14,0.2,2a28df0f9,prefill,12,19.017503,0.135141,3,OMP_WAIT_POLICY=active OMP_PLACES=cores OMP_PROC_BIND=close /data/inkling-mini/llama.cpp/build-sys/bin/llama-bench -m /data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf -p 256 -n 0 -t 12 -r 3 -o csv

@@ -1,0 +1,1 @@
+Large language models are trained on vast amounts of text and learn the statistical patterns of language. When asked a question, they generate an answer one token at a time, each token depending on everything that came before it.

@@ -1,0 +1,20 @@
+# Module kernels_gemv (agent B1): thread pool, Q8_0 quantiser, GEMV kernels, tests and benchmarks.
+add_library(ink_kernels_gemv STATIC threadpool.cpp gemv.cpp gemv_ref.cpp)
+target_include_directories(ink_kernels_gemv PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(ink_kernels_gemv PUBLIC Threads::Threads)
+# the scalar references must reproduce the kernels bit-for-bit: no implicit mul+add contraction anywhere
+target_compile_options(ink_kernels_gemv PRIVATE -ffp-contract=off)
+
+set(INK_GEMV_TESTS ${CMAKE_SOURCE_DIR}/tests/kernels_gemv)
+foreach(t test_threadpool test_quantize test_gemv)
+  add_executable(${t} ${INK_GEMV_TESTS}/${t}.cpp)
+  target_include_directories(${t} PRIVATE ${INK_GEMV_TESTS})
+  target_compile_options(${t} PRIVATE -ffp-contract=off)
+  target_link_libraries(${t} ink_kernels_gemv ${CMAKE_DL_LIBS})
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
+foreach(b bench_pool bench_gemv)
+  add_executable(${b} ${INK_GEMV_TESTS}/${b}.cpp)
+  target_include_directories(${b} PRIVATE ${INK_GEMV_TESTS})
+  target_link_libraries(${b} ink_kernels_gemv)
+endforeach()

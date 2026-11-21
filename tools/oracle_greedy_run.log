@@ -1,0 +1,17 @@
+load before: 3.03 2.46 2.26  threads 8
+load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+oracle_greedy: prompt 13 tokens in 1.19 s; 64 tokens in 12.59 s = 5.08 tok/s (8 threads)
+load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+oracle_greedy: prompt 14 tokens in 1.22 s; 64 tokens in 11.55 s = 5.54 tok/s (8 threads)
+load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+oracle_greedy: prompt 43 tokens in 3.42 s; 64 tokens in 11.97 s = 5.34 tok/s (8 threads)
+load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+oracle_greedy: prompt 52 tokens in 4.07 s; 64 tokens in 11.58 s = 5.52 tok/s (8 threads)
+load: special_eos_id is not in special_eog_ids - the tokenizer config may be incorrect
+llama_kv_cache_iswa: using full-size SWA cache (ref: https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+oracle_greedy: prompt 14 tokens in 1.25 s; 64 tokens in 12.05 s = 5.31 tok/s (8 threads)
+load after: 7.16 3.82 2.75

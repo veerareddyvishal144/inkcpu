@@ -1,0 +1,3 @@
+<|content_thinking|>The user wants a two-sentence explanation of why the sky is blue. This is a classic physics/optics question. Let me think about the actual science:
+
+The sky is blue because of Rayleigh scattering. Sunlight contains all visible wavelengths (colors). As sunlight enters Earth's atmosphere

@@ -1,0 +1,14 @@
+{
+  "model": "/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf",
+  "llama_cpp_commit": "2a28df0f9",
+  "n_vocab_logits": 200058,
+  "n_tokens": 14,
+  "n_ctx": 86,
+  "threads": 8,
+  "input": "prompt (llama_tokenize add_special=true parse_special=true)",
+  "vocab_add_bos": false,
+  "vocab_add_eos": false,
+  "bos_id": -1,
+  "eos_id": 200006,
+  "override_kv": []
+}

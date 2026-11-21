@@ -1,0 +1,1 @@
+<|message_user|><|content_text|>Explain in two sentences why the sky is blue.<|end_message|><|message_model|>

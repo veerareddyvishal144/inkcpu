@@ -1,0 +1,15 @@
+get_filename_component(INK_ROOT ${CMAKE_CURRENT_LIST_DIR}/../.. ABSOLUTE)
+add_library(ink_kernels_misc STATIC
+  vecmath.cpp norms.cpp sconv.cpp router_mix.cpp attention.cpp reference.cpp)
+target_include_directories(ink_kernels_misc PUBLIC ${INK_ROOT}/include)
+target_link_libraries(ink_kernels_misc PUBLIC Threads::Threads)
+
+if(EXISTS ${INK_ROOT}/tests/kernels_misc/test_kernels_misc.cpp)
+  add_executable(test_kernels_misc ${INK_ROOT}/tests/kernels_misc/test_kernels_misc.cpp)
+  target_link_libraries(test_kernels_misc ink_kernels_misc)
+  add_test(NAME kernels_misc COMMAND test_kernels_misc)
+endif()
+if(EXISTS ${INK_ROOT}/tests/kernels_misc/bench_kernels_misc.cpp)
+  add_executable(bench_kernels_misc ${INK_ROOT}/tests/kernels_misc/bench_kernels_misc.cpp)
+  target_link_libraries(bench_kernels_misc ink_kernels_misc)
+endif()

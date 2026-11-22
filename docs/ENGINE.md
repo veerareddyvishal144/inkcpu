@@ -96,3 +96,10 @@ Gates (`docs/status/S4.md`): `test_engine crosscheck <other>` loads the two file
 6 oracle prompts (decode) and a 300-token prefill; `test_engine oracle` and `test_prefill quick` on the canonical file reproduce C1/P.
 The local llama.cpp checkouts (2a28df0f9 and llama-unsloth 0a9105d) do NOT load the canonical file: their `inkling2` arch is the
 non-looped dense model (`check_tensor_dims: tensor 'blk.24.attn_q.weight' not found`); `tools/oracle_*` therefore still need the interim file.
+
+### Verification of the canonical `inkling2` file (orchestrator, 2026-11-22 21:10-21:45 UTC, 3 SMT threads, production untouched)
+Freshly downloaded `/data/inkling-mini/models_fresh/Inkling-2-Mini-UD-Q4_K_XL.gguf` (17,629,759,456 B, `tools/get_model.sh`) vs the validated interim file:
+`test_engine crosscheck`: 6 oracle prompts + 300-token prefill, max |diff| 0, 0 differing logits (bit-identical). `test_engine oracle` on the new file: C1's table digit for digit.
+`test_prefill quick`: prefill == decode bit-identical, vs llama.cpp cosine 0.99983, argmax equal. `tests/engine/test_capi.py` PASS. `server/tests/test_ink_real.py` on the new file: 15/15
+(a-h, speculation i-l, rewind m-o; b re-run after restoring effort-0 semantics). Production now serves the canonical file (`INK_MODEL_DIR=/data/inkling-mini/models_fresh`), identical
+greedy output to the interim file. llama.cpp (2a28df0f9, PR 32218) cannot load the canonical file: oracle tooling keeps the interim copy in `models/`.

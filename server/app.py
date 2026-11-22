@@ -36,6 +36,7 @@ class ServerConfig:
     request_log: Optional[str] = None       # JSONL path; None -> env INK_REQUEST_LOG; "" disables
     log_bodies: bool = False                # also log prompts/outputs (privacy: off by default)
     prefill_chunk: int = 256
+    sse_keepalive_s: float = 10.0   # SSE comment line every N s while no event is pending (long prefills)
     default_reasoning_effort: Optional[str] = None   # used when a request carries no reasoning_effort (None = template default 0.9)
     spec: bool = True                       # use the backend's speculative steps when it has them (penalties always use plain decode)
 
@@ -349,7 +350,11 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             try:
                 yield chunk({"role": "assistant", "content": ""})
                 while True:
-                    item = await q.get()
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=cfg.sse_keepalive_s)
+                    except asyncio.TimeoutError:
+                        yield b": keepalive\n\n"   # SSE comment: keeps idle-timeout clients alive during a long prefill (minutes on CPU)
+                        continue
                     if item[0] == "ev":
                         for e in item[1]:
                             if e.kind == "reasoning":

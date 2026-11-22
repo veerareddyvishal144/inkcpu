@@ -36,6 +36,7 @@ class ServerConfig:
     request_log: Optional[str] = None       # JSONL path; None -> env INK_REQUEST_LOG; "" disables
     log_bodies: bool = False                # also log prompts/outputs (privacy: off by default)
     prefill_chunk: int = 256
+    default_reasoning_effort: Optional[str] = None   # used when a request carries no reasoning_effort (None = template default 0.9)
     spec: bool = True                       # use the backend's speculative steps when it has them (penalties always use plain decode)
 
 
@@ -287,6 +288,8 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
                 effort = body["reasoning"].get("effort")
             if effort is None and isinstance(body.get("chat_template_kwargs"), dict):
                 effort = body["chat_template_kwargs"].get("reasoning_effort")
+            if effort is None and cfg.default_reasoning_effort is not None:
+                effort = cfg.default_reasoning_effort   # server default (--default-reasoning-effort), e.g. "low" for editor clients that omit it
             text = ct.get_template().render_openai(body.get("messages"), tools, effort)
         except ct.TemplateError as e:
             raise ApiError(400, str(e), param="messages")

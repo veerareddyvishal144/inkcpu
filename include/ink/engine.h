@@ -98,6 +98,9 @@ struct SlotState {
     KvLayer kv[kVisits];                   // per visit (SWA: ring of kSwaRingBlocks blocks; global: blocks grow up to max_ctx)
     size_t kv_map_bytes[kVisits] = {};     // mapped bytes per K / V tensor
     float* hist = nullptr;                 // kVisits * kHistPerVisit floats
+    int64_t hwm = 0;                       // highest pos reached since the reset (a rewind / verify rollback does not lower it): ring cells of
+                                           // positions < hwm hold data; the restorability of a shallow checkpoint is judged against it (docs/REWIND.md)
+    struct CkptStore* ckpt = nullptr;      // slot checkpoints (engine_rewind.cpp), allocated on first use, dropped by slot_reset
 };
 
 enum ProfPhase {
@@ -116,6 +119,10 @@ struct EngineProfile {
 
 // CPU list used for n threads (see EngineOptions::cpus)
 std::vector<int> engine_default_cpus(int n);
+// checkpoint store helpers (engine_rewind.cpp): drop all checkpoints of a slot / release the store / bytes it holds
+void slot_ckpt_clear(SlotState& s);
+void slot_ckpt_free(SlotState& s);
+size_t slot_ckpt_bytes(const SlotState& s);
 
 struct Scratch;                            // decode scratch (engine_decode.cpp)
 struct PhaseCounter;
@@ -124,6 +131,8 @@ struct Tune {                              // env-overridable tunables (read at 
     int chunk_proj = 32, chunk_wo = 32, chunk_down = 32, chunk_lm = 512, chunk_router = 8, chunk_ctrl = 64;
     int split_keys = 384;                  // attention key split granule: nsplit = clamp(n_keys / split_keys, 1, kMaxSplit)
     int swa_blocks = kSwaRingBlocks;       // SWA ring size in 64-position blocks (env INK_SWA_BLOCKS, tests only; >= 16)
+    int ckpt_max = 8;                      // checkpoints kept per slot (env INK_CKPT_MAX; 0 = no checkpoints at all, rewind always fails)
+    int ckpt_deep = 2;                     // of which deep ones (with the SWA window copy, ~170 MiB each at 32 ring blocks; env INK_CKPT_DEEP)
 };
 
 class Engine {
@@ -139,7 +148,16 @@ public:
     void slot_free(int slot);
     void slot_reset(int slot);
     int64_t slot_pos(int slot) const;
-    bool slot_copy(int src, int dst);                // copies the whole sequence state (same engine)
+    bool slot_copy(int src, int dst);                // copies the whole sequence state (same engine; the destination's checkpoints are dropped)
+
+    // ---- checkpoints and rewind (agent S3, docs/REWIND.md). Checkpoints are taken automatically after every prefill chunk and at the end of
+    // every forward() of >= 2 tokens (shallow: pos + conv histories, 3.83 MB); decode() never checkpoints. deep = also copies the SWA window
+    // (restorable no matter how many tokens follow); a shallow one is restorable only while hwm - pos <= rewind_max_append (1025).
+    int slot_checkpoint(int slot, bool deep = false);          // 0 ok, -1 bad slot, -5 out of memory
+    int64_t slot_rewind(int slot, int64_t pos);                // rewinds to the nearest restorable checkpoint <= pos and returns it; -1 = none.
+                                                               // Afterwards decode/forward continue from there; checkpoints above it are dropped.
+    int slot_checkpoints(int slot, int64_t* out, int max) const;   // restorable positions, ascending; returns their count (writes min(count, max))
+    static constexpr int64_t rewind_max_append(int swa_blocks) { return (int64_t)swa_blocks * kKvBlock - (kSwaWindow - 1); }   // 1025 for 32 blocks
 
     // ---- decode: append ONE token; logits (n_vocab floats, softcap applied) or nullptr to skip the lm head. 0 = ok ----
     int decode(int slot, int32_t token, float* logits);

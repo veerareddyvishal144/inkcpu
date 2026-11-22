@@ -4,6 +4,7 @@ Skipped unless INK_GGUF and INK_LIB are set. Run (one engine process at a time, 
     INK_GGUF=/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf INK_LIB=/data/inkling-mini/engine/build-v/src/capi/libink.so \
     INK_CPUS=22,24,26,28,30 /data/engine/.venv/bin/python server/tests/test_ink_real.py
 The tests start ONE server subprocess (2 slots, ctx 8192, --max-queue 2, request log) and share it; names a..h fix the order.
+Tests m, n (agent S3: slot rewind / shared-prefix reuse, docs/REWIND.md) need a libink.so with ink_slot_rewind; ~8 min on 3 threads.
 Tests i..l need INK_DRAFTER (DSpark drafter GGUF) and a libink.so that exports ink_spec_*: they stop the plain server and start one
 with --drafter (one engine process per CPU set), e.g. INK_REAL_ONLY=i,j,k,l INK_DRAFTER=/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf.
 Numbers (TTFT, tok/s, RSS, idle CPU) are written to $INK_REAL_RESULTS (default: <tmp>/ink_real_results.json). Timings on the
@@ -666,8 +667,160 @@ def test_l_tool_call_turn_with_speculation_produces_a_valid_tool_call():
     rec("spec_tool_call", out)
 
 
+# ---------------------------------------------------------------------------------------------------------------- (m, n) S3: slot rewind
+def _big_system(n_lines=62):
+    words = ["apples", "bridges", "copper", "dolphins", "engines", "falcons", "granite", "harbors", "islands", "jasmine", "kettles", "lanterns"]
+    lines = ["You are a terse assistant. Follow every rule below exactly."]
+    for i in range(n_lines):
+        lines.append("Rule %d: when the user mentions %s, answer in at most %d words, prefer the word %s, and never mention %s." %
+                     (i + 1, words[i % 12], 5 + i % 7, words[(i * 5) % 12], words[(i * 7 + 3) % 12]))
+    return "\n".join(lines)
+
+
+def _local_ids(messages, effort):
+    """The prompt ids the server builds for /v1/chat/completions without tools (app.py): template + the no-think header for effort 0."""
+    from server import chat_template as ct
+    t = tok()
+    ids = t.encode(ct.get_template().render_openai(messages, None, effort), parse_special=True)
+    if effort == 0:
+        ids = ids + t.encode("<|message_model|><|content_text|>", parse_special=True)
+    return ids
+
+
+def _lcp(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _flush_slots(s):
+    """Fill both slots with unrelated short prompts so the next request has no prefix to reuse (cold prefill)."""
+    for i in range(2):
+        r = s.post("/v1/completions", {"prompt": "Unrelated prompt number %d. Count to three:" % i, "max_tokens": 3, "temperature": 0})
+        assert r.status_code == 200, r.text
+
+
+def test_m_shared_system_prefix_is_reused_by_rewind_and_the_output_equals_a_cold_run():
+    """Three conversations sharing a ~2k-token system prompt: the 2nd rewinds the 1st one's slot to a checkpoint <= the shared length
+    (cached_tokens within one prefill chunk of the LCP), the 3rd hits the checkpoint left at the divergence point exactly, and the
+    greedy output of a rewound request equals a cold run of the same request."""
+    s = server()
+    s.wait_idle()
+    sysmsg = _big_system()
+    qs = ["Q1: reply with the single word apple.", "Q2: reply with the single word banana.", "Q3: reply with the single word cherry."]
+    msgs = [[{"role": "system", "content": sysmsg}, {"role": "user", "content": q}] for q in qs]
+    ids = [_local_ids(m, 0) for m in msgs]
+    lcp12, lcp23 = _lcp(ids[0], ids[1]), _lcp(ids[1], ids[2])
+    assert lcp12 >= 2000 and lcp23 == lcp12, (lcp12, lcp23, len(ids[0]))
+
+    def ask(i):
+        r = s.post("/v1/chat/completions", {"messages": msgs[i], "temperature": 0, "reasoning_effort": 0, "max_tokens": 12})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    d1 = ask(0)
+    u1, t1 = d1["usage"], d1["timings"]
+    exact = u1["prompt_tokens"] == len(ids[0])           # local rendering == server rendering (template parity): exact LCP assertions
+    assert u1["prompt_tokens"] >= 2000, u1
+    d2 = ask(1)
+    u2, t2 = d2["usage"], d2["timings"]
+    c2 = u2["prompt_tokens_details"]["cached_tokens"]
+    assert c2 >= 1024 and t2["cache_n"] == c2 and t2["prompt_n"] == u2["prompt_tokens"] - c2, (c2, u2, t2)
+    if exact:
+        assert lcp12 - 256 <= c2 <= lcp12, (c2, lcp12)   # nearest chunk checkpoint (--prefill-chunk 256) below the LCP
+    d3 = ask(2)
+    u3, t3 = d3["usage"], d3["timings"]
+    c3 = u3["prompt_tokens_details"]["cached_tokens"]
+    assert c3 >= c2 and c3 >= 2000, (c3, c2)
+    if exact:
+        assert c3 == lcp23, (c3, lcp23)                   # the divergence point of request 2 left a checkpoint exactly at the LCP
+    _flush_slots(s)
+    d2c = ask(1)                                          # cold run of request 2
+    assert d2c["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, d2c["usage"]
+    assert d2c["choices"][0]["message"]["content"] == d2["choices"][0]["message"]["content"], (d2c["choices"][0]["message"], d2["choices"][0]["message"])
+    assert d2c["usage"]["completion_tokens"] == u2["completion_tokens"]
+    assert t2["prompt_ms"] < 0.5 * d2c["timings"]["prompt_ms"], (t2["prompt_ms"], d2c["timings"]["prompt_ms"])
+    rec("shared_prefix_rewind", {"prompt_tokens": u1["prompt_tokens"], "lcp": lcp12, "exact_template_parity": exact,
+                                 "req2_cached": c2, "req2_prefill_ms": t2["prompt_ms"], "req2_new_tokens": t2["prompt_n"],
+                                 "req3_cached": c3, "req3_prefill_ms": t3["prompt_ms"],
+                                 "cold_prefill_ms": d2c["timings"]["prompt_ms"], "first_cold_prefill_ms": t1["prompt_ms"],
+                                 "cold_prefill_tps": d2c["timings"]["prompt_per_second"]})
+
+
+def test_n_caret_pattern_rerendered_assistant_turn_rewinds_to_the_prompt_end():
+    """The Caret / Cursor case: turn 2 resends the conversation with the assistant message re-rendered WITHOUT its reasoning_content, so the
+    slot history is not a prefix of the new prompt. The server rewinds to the deep checkpoint at the end of turn 1's prompt:
+    cached_tokens == turn 1's prompt_tokens, only the re-rendered assistant turn + the new user turn are prefilled, output == cold run."""
+    s = server()
+    s.wait_idle()
+    msgs = [{"role": "system", "content": _big_system()}, {"role": "user", "content": "Explain in one sentence why the sky is blue."}]
+    body = {"messages": msgs, "temperature": 0, "reasoning_effort": "low", "max_tokens": 40}
+    r1 = s.post("/v1/chat/completions", body)
+    assert r1.status_code == 200, r1.text
+    d1 = r1.json()
+    m1, u1 = d1["choices"][0]["message"], d1["usage"]
+    assert u1["completion_tokens"] > 0
+    asst = {"role": "assistant", "content": m1.get("content") or ""}          # reasoning_content dropped (what Caret sends back)
+    follow = msgs + [asst, {"role": "user", "content": "Now one sentence about sunsets."}]
+    r2 = s.post("/v1/chat/completions", dict(body, messages=follow))
+    assert r2.status_code == 200, r2.text
+    d2 = r2.json()
+    u2, t2 = d2["usage"], d2["timings"]
+    c2 = u2["prompt_tokens_details"]["cached_tokens"]
+    lcp_local = _lcp(_local_ids(msgs, "low"), _local_ids(follow, "low"))   # how much of turn 1's prompt the re-rendered prompt really shares
+    if lcp_local >= u1["prompt_tokens"]:
+        assert c2 == u1["prompt_tokens"], (c2, u1["prompt_tokens"], lcp_local)   # the prompt-end checkpoint of turn 1, whatever was generated after it
+    else:   # the template renders the assistant turn with a header that differs from the generation prompt: the LCP is inside turn 1's prompt
+        assert lcp_local - 256 <= c2 <= lcp_local and c2 >= 1024, (c2, lcp_local, u1["prompt_tokens"])
+    assert t2["prompt_n"] == u2["prompt_tokens"] - c2 < 300, t2
+    _flush_slots(s)
+    r2c = s.post("/v1/chat/completions", dict(body, messages=follow))
+    d2c = r2c.json()
+    assert d2c["usage"]["prompt_tokens_details"]["cached_tokens"] == 0, d2c["usage"]
+    mc, mw = d2c["choices"][0]["message"], d2["choices"][0]["message"]
+    assert (mc.get("content"), mc.get("reasoning_content")) == (mw.get("content"), mw.get("reasoning_content")), (mc, mw)
+    assert t2["prompt_ms"] < 0.5 * d2c["timings"]["prompt_ms"], (t2["prompt_ms"], d2c["timings"]["prompt_ms"])
+    rec("caret_pattern", {"turn1_prompt_tokens": u1["prompt_tokens"], "turn1_completion_tokens": u1["completion_tokens"], "lcp_local": lcp_local,
+                          "turn2_prompt_tokens": u2["prompt_tokens"], "turn2_cached": c2, "turn2_new_tokens": t2["prompt_n"],
+                          "turn2_prefill_ms_with_rewind": t2["prompt_ms"], "turn2_prefill_ms_cold": d2c["timings"]["prompt_ms"],
+                          "turn2_ttft_ms_with_rewind": t2["ttft_ms"], "turn2_ttft_ms_cold": d2c["timings"]["ttft_ms"]})
+
+
+# ---------------------------------------------------------------------------------------------------------------- (o) S3: rewind + speculation
+def test_o_rewound_slot_reports_unsynced_speculation_and_still_decodes_the_plain_output():
+    """With the drafter loaded: a rewound slot has a stale drafter context, so ink_spec_synced is 0 and the speculative steps run plain
+    (spec_synced False, every step T = 1) while the output equals the non-speculative output; a reset slot is synced again."""
+    s = spec_server()
+    s.wait_idle()
+    sysmsg = _big_system()
+    def ask(q, **kw):
+        r = s.post("/v1/chat/completions", dict({"messages": [{"role": "system", "content": sysmsg}, {"role": "user", "content": q}],
+                                                 "temperature": 0, "reasoning_effort": 0, "max_tokens": 16}, **kw))
+        assert r.status_code == 200, r.text
+        return r.json()
+    d1 = ask("Q1: reply with the single word apple.", speculation=4)
+    t1 = d1["timings"]
+    assert d1["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and t1.get("spec_synced") is True, t1   # fresh slot: drafter in sync
+    d2 = ask("Q2: reply with the single word banana.", speculation=4)     # shares the system prompt: rewind -> drafter stale
+    u2, t2 = d2["usage"], d2["timings"]
+    assert u2["prompt_tokens_details"]["cached_tokens"] >= 1024, u2
+    assert t2.get("spec_synced") is False and t2["spec_steps"] >= 1 and set(t2["spec_t_hist"]) == {"1"} and t2["spec_drafted"] == 0, t2
+    d2p = ask("Q2: reply with the single word banana.", speculation="off")   # identical prompt: cached logits, plain decode on the same slot
+    assert d2p["choices"][0]["message"]["content"] == d2["choices"][0]["message"]["content"], (d2p["choices"][0]["message"], d2["choices"][0]["message"])
+    r3 = s.post("/v1/chat/completions", {"messages": [{"role": "user", "content": "Name a colour. One word."}], "temperature": 0,
+                                         "reasoning_effort": 0, "max_tokens": 8, "speculation": 4})   # no system prompt = no shared prefix: LRU reset -> drafter resynced
+    assert r3.status_code == 200, r3.text
+    d3 = r3.json()
+    assert d3["usage"]["prompt_tokens_details"]["cached_tokens"] == 0 and d3["timings"].get("spec_synced") is True, d3["timings"]
+    rec("rewind_spec", {"req2_cached": u2["prompt_tokens_details"]["cached_tokens"], "req2_spec_synced": t2["spec_synced"], "req2_t_hist": t2["spec_t_hist"],
+                        "req3_spec_synced": d3["timings"]["spec_synced"]})
+
+
 if __name__ == "__main__":
-    only = [x for x in os.environ.get("INK_REAL_ONLY", "").split(",") if x]       # e.g. INK_REAL_ONLY=g,h  (tests a..l)
+    only = [x for x in os.environ.get("INK_REAL_ONLY", "").split(",") if x]       # e.g. INK_REAL_ONLY=g,h  (tests a..o)
     if only:
         for k in [k for k in list(globals()) if k.startswith("test_") and k[5] not in only]:
             del globals()[k]

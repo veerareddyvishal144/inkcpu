@@ -109,6 +109,14 @@ class Backend:
         raise NotImplementedError("%s has no sampler" % self.name)
     spec_default_mode = 1               # mode applied to requests that do not name one (ink_spec_mode of the engine); 0 = plain
 
+    # ---- slot checkpoints + rewind (agent S3's ink_slot_rewind / ink_slot_checkpoint*, docs/REWIND.md). The scheduler uses them for
+    # longest-common-prefix reuse: a slot whose history shares >= prefix_reuse_min tokens with a new prompt is rewound to the nearest
+    # restorable checkpoint <= the shared length and only the rest of the prompt is prefilled.
+    supports_rewind = False
+    def rewind(self, slot: int, pos: int) -> int: return -1                      # position rewound to (nearest restorable checkpoint <= pos), -1 = none
+    def checkpoint(self, slot: int, deep: bool = False) -> None: ...             # explicit checkpoint at the slot's current position
+    def checkpoints(self, slot: int) -> List[int]: return []                     # restorable checkpoint positions, ascending
+
     def info(self) -> Dict[str, object]:
         return {"backend": self.name, "n_slots": self.n_slots, "max_ctx": self.max_ctx, "n_vocab": self.n_vocab}
 
@@ -121,15 +129,24 @@ class MockBackend(Backend):
     STOP = 200006
 
     def __init__(self, n_slots: int = 2, max_ctx: int = 8192, responder: Optional[Callable[[List[int]], List[int]]] = None,
-                 delay: float = 0.0, noise_std: float = 3.0, n_vocab: int = N_VOCAB):
+                 delay: float = 0.0, noise_std: float = 3.0, n_vocab: int = N_VOCAB, rewind: bool = True,
+                 rewind_bound: Optional[int] = 1025, ckpt_max: int = 8):
         super().__init__(n_slots, max_ctx, n_vocab)
         self.responder, self.delay, self.noise_std = responder, delay, noise_std
         self.hist: Dict[int, List[int]] = {}
         self.prompt_len: Dict[int, int] = {}
         self.hash: Dict[int, int] = {}
         self.free_ids = list(range(n_slots))
-        self.calls: List[tuple] = []        # (op, slot, n_tokens)
+        self.calls: List[tuple] = []        # (op, slot, n_tokens); rewinds are logged as ("rewind", slot, position)
         self._script_cache: Dict[int, List[int]] = {}
+        # checkpoints like the real engine: one after every prefill of >= 2 tokens, explicit ones on request; a shallow one is restorable
+        # while hwm - pos <= rewind_bound (None = always), a deep one always; at most ckpt_max per slot (dead / oldest evicted first)
+        self.supports_rewind = rewind
+        self.rewind_bound, self.ckpt_max = rewind_bound, ckpt_max
+        self.ckpts: Dict[int, List[List]] = {}          # slot -> [[pos, deep, seq]]
+        self.hwm: Dict[int, int] = {}
+        self.ckpt_calls: List[tuple] = []               # (slot, pos, deep) of explicit checkpoint() calls
+        self._seq = 0
 
     def slot_new(self) -> int:
         if not self.free_ids:
@@ -147,6 +164,51 @@ class MockBackend(Backend):
     def slot_reset(self, slot: int) -> None:
         self.calls.append(("slot_reset", slot, 0))
         self.hist[slot], self.prompt_len[slot], self.hash[slot] = [], 0, 1469598103934665603
+        self.ckpts[slot], self.hwm[slot] = [], 0
+
+    # ---- checkpoints + rewind (mirror of the engine's rules, docs/REWIND.md)
+    def _restorable(self, slot: int, c) -> bool:
+        return c[1] or self.rewind_bound is None or self.hwm[slot] - c[0] <= self.rewind_bound
+
+    def _ckpt_add(self, slot: int, pos: int, deep: bool) -> None:
+        if pos <= 0 or not self.supports_rewind:
+            return
+        self._seq += 1
+        lst = self.ckpts[slot]
+        for c in lst:
+            if c[0] == pos:
+                c[1], c[2] = c[1] or deep, self._seq
+                return
+        if len(lst) >= self.ckpt_max:
+            dead = [c for c in lst if not self._restorable(slot, c)]
+            lst.remove(min(dead or lst, key=lambda c: (c[1], c[2])))
+        lst.append([pos, deep, self._seq])
+
+    def checkpoint(self, slot: int, deep: bool = False) -> None:
+        self.ckpt_calls.append((slot, len(self.hist[slot]), deep))
+        self._ckpt_add(slot, len(self.hist[slot]), deep)
+
+    def checkpoints(self, slot: int) -> List[int]:
+        return sorted(c[0] for c in self.ckpts.get(slot, ()) if self._restorable(slot, c))
+
+    def rewind(self, slot: int, pos: int) -> int:
+        if not self.supports_rewind:
+            return -1
+        cands = [c for c in self.ckpts[slot] if c[0] <= pos and self._restorable(slot, c)]
+        if not cands:
+            return -1
+        best = max(cands, key=lambda c: c[0])
+        self.calls.append(("rewind", slot, best[0]))
+        old = self.hist[slot]
+        if best[0] != len(old):
+            self.hist[slot], self.hash[slot] = [], 1469598103934665603
+            self._feed(slot, old[:best[0]])
+            self.prompt_len[slot] = min(self.prompt_len[slot], best[0])
+            self._script_cache.pop(slot, None)
+        self.ckpts[slot] = [c for c in self.ckpts[slot] if c[0] <= best[0]]
+        self._seq += 1
+        best[2] = self._seq
+        return best[0]
 
     def slot_pos(self, slot: int) -> int:
         return len(self.hist.get(slot, ()))
@@ -178,9 +240,12 @@ class MockBackend(Backend):
             raise BackendError("context overflow")
         self.calls.append(("prefill" if is_prefill else "step", slot, len(tokens)))
         self._feed(slot, tokens)
+        self.hwm[slot] = max(self.hwm.get(slot, 0), len(self.hist[slot]))
         if is_prefill:  # everything fed by prefill() belongs to the prompt (origin of the scripted response)
             self.prompt_len[slot] = len(self.hist[slot])
             self._script_cache.pop(slot, None)
+            if len(tokens) >= 2:   # the engine checkpoints after every prefill chunk / forward of >= 2 tokens, never after a decode step
+                self._ckpt_add(slot, len(self.hist[slot]), False)
         return self._logits(slot)
 
     def prefill(self, slot: int, tokens: Sequence[int], want_logits: bool = True) -> np.ndarray:
@@ -383,6 +448,14 @@ class InkBackend(Backend):
         lib.ink_forward.restype = c_int
         lib.ink_forward.argtypes = [c_void_p, c_int, self._pi, c_int, self._pf]
         lib.ink_last_timing.argtypes = [c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+        self.supports_rewind = all(hasattr(lib, s) for s in self.REWIND_SYMBOLS)   # S3's additions; older libink.so builds lack them
+        if self.supports_rewind:
+            lib.ink_slot_checkpoint.restype = lib.ink_slot_checkpoint_deep.restype = c_int
+            lib.ink_slot_checkpoint.argtypes = lib.ink_slot_checkpoint_deep.argtypes = [c_void_p, c_int]
+            lib.ink_slot_rewind.restype = ctypes.c_int64
+            lib.ink_slot_rewind.argtypes = [c_void_p, c_int, ctypes.c_int64]
+            lib.ink_slot_checkpoints.restype = c_int
+            lib.ink_slot_checkpoints.argtypes = [c_void_p, c_int, ctypes.POINTER(ctypes.c_int64), c_int]
         self._lib = lib
         if self.timer_slack_us > 0:
             # The pool's idle workers poll with 20 us sleeps (ThreadPool, include/ink/threadpool.h): with the kernel's default 50 us
@@ -413,6 +486,7 @@ class InkBackend(Backend):
             d["version"] = (self._lib.ink_version() or b"").decode(errors="replace")
             d["load_seconds"] = round(self.load_seconds, 2)
         d["spec"] = dict(self.spec_info, supported=self.supports_spec, default_mode=self.spec_default_mode)
+        d["rewind"] = self.supports_rewind
         return d
 
     def close(self) -> None:
@@ -456,6 +530,28 @@ class InkBackend(Backend):
         tot, ker = ctypes.c_double(0), ctypes.c_double(0)
         self._lib.ink_last_timing(self._eng, ctypes.byref(tot), ctypes.byref(ker))
         return tot.value, ker.value
+
+    # ------------------------------------------------------------------ slot checkpoints + rewind (agent S3's C ABI, docs/REWIND.md)
+    REWIND_SYMBOLS = ("ink_slot_checkpoint", "ink_slot_checkpoint_deep", "ink_slot_rewind", "ink_slot_checkpoints")
+
+    def rewind(self, slot: int, pos: int) -> int:
+        if not self.supports_rewind:
+            return -1
+        return int(self._lib.ink_slot_rewind(self._eng, slot, int(pos)))
+
+    def checkpoint(self, slot: int, deep: bool = False) -> None:
+        if not self.supports_rewind:
+            return
+        rc = int((self._lib.ink_slot_checkpoint_deep if deep else self._lib.ink_slot_checkpoint)(self._eng, slot))
+        if rc != 0:
+            print("WARNING: ink_slot_checkpoint%s(slot %d) failed: rc %d" % ("_deep" if deep else "", slot, rc), flush=True)
+
+    def checkpoints(self, slot: int) -> List[int]:
+        if not self.supports_rewind:
+            return []
+        buf = (ctypes.c_int64 * 64)()
+        n = int(self._lib.ink_slot_checkpoints(self._eng, slot, buf, 64))
+        return [int(x) for x in buf[:min(n, 64)]]
 
     # ------------------------------------------------------------------ speculative decoding (agent S2's C ABI, include/ink/ink_abi.h)
     # Structs copied field for field from ink_abi.h (ink_sampling_params nested in ink_spec_request). The server probes the symbols at

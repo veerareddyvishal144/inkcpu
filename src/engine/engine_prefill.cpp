@@ -996,7 +996,9 @@ int prefill_impl(Engine& E, int slot, const int32_t* tokens, int n, float* logit
         }
         if (E.tap_sink) E.tap_sink(slot, S.pos, m, taps_buf);   // before S.pos advances: first_pos = S.pos
         S.pos += m;
+        if (S.hwm < S.pos) S.hwm = S.pos;
         off += m;
+        E.slot_checkpoint(slot);   // S3: automatic shallow checkpoint at every chunk end (the last one = the prompt boundary)
     }
     return 0;
 }
@@ -1090,6 +1092,7 @@ int engine_verify(Engine& E, int slot, const int32_t* tokens, int T, float* logi
     X.pend_T = T;
     X.pend_pos0 = S.pos;
     S.pos += T;
+    if (S.hwm < S.pos) S.hwm = S.pos;   // the rejected rows wrote ring cells too (S3: shallow checkpoints are judged against hwm)
     return 0;
 }
 

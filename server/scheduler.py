@@ -1,16 +1,24 @@
 """Engine thread, slot policy (append-only prefix reuse) and request scheduling.
 
-SLOT POLICY (append-only prefix reuse)
-  The engine can only append tokens to a slot (ink_forward) or reset it completely (ink_slot_reset); it cannot rewind.
-  So for every request we look at the idle slots and use the one whose FULL token history is a prefix of the new prompt
-  (longest history wins, then most recently used): only the tokens after that prefix are prefilled. If no slot qualifies
-  the request takes an empty slot, else the least recently used idle slot, which is reset (its cache is lost).
-  A prompt identical to a slot's history reuses the logits cached from the slot's last forward call (nothing is prefilled).
+SLOT POLICY (prefix reuse: full-prefix append, else longest-common-prefix rewind, else LRU reset)
+  1. Full prefix: among the idle slots, the one whose FULL token history is a prefix of the new prompt (longest history wins,
+     then most recently used): only the tokens after that prefix are prefilled. A prompt identical to a slot's history reuses
+     the logits cached from the slot's last forward call (nothing is prefilled).
+  2. Rewind (backends with supports_rewind, i.e. libink.so with ink_slot_rewind, docs/REWIND.md): otherwise the idle slot with
+     the longest common prefix (LCP, token level) with the prompt is rewound to the nearest restorable checkpoint P <= LCP
+     (the engine checkpoints after every prefill chunk and at every prompt end; a shallow checkpoint survives 1025 appended
+     tokens, a deep one - taken at prompt ends and at observed divergence points - survives anything), the slot history is cut
+     to its first P tokens and prompt[P:] is prefilled; cached_tokens = P. Only when LCP >= prefix_reuse_min (default 1024
+     tokens; smaller shared prefixes are cheaper to prefill than to risk a slot's cache for). The prefill chunk that reaches
+     the LCP ends exactly there and leaves a deep checkpoint, so a third conversation sharing the same prefix hits it exactly.
+     This is the Caret / Cursor case: the client re-renders the history differently from what the model generated (it drops
+     reasoning_content), so the LCP is the previous prompt length and only the re-rendered assistant turn + the new user turn
+     are prefilled.
+  3. Else the request takes an empty slot, else the least recently used idle slot, which is reset (its cache is lost).
   The slot history is exactly the list of tokens fed to the engine: the prompt, then every generated token except the last
-  sampled one (the stop token / the token that hit max_tokens is never fed). A chat turn that sends the previous assistant
-  message back therefore continues the slot, provided the re-rendered prompt starts with the old history token for token.
-  Caveat: the model's thinking is part of the history; a client that drops `reasoning_content` from the assistant message
-  changes the rendered prompt and gets a reset (prefill from scratch). Clients that send `reasoning_content` back hit the cache.
+  sampled one (the stop token / the token that hit max_tokens is never fed); the engine's slot position is cross-checked after
+  every rewind and speculative step. At the end of every generation the slot gets an explicit (shallow) checkpoint, at the end of
+  every prompt a deep one.
 
 SPECULATIVE STEPS (backends with supports_spec, e.g. MockSpecBackend today, agent S2's ink_spec_* later)
   The first token after the prefill is sampled here from the logits (it becomes the ANCHOR: emitted to the client, not yet
@@ -63,10 +71,26 @@ class SlotInfo:
     last_used: float = 0.0
 
 
+def lcp_len(a: List[int], b: List[int]) -> int:
+    """Length of the longest common prefix of two token lists."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0
+    if n > 64:
+        d = np.flatnonzero(np.asarray(a[:n], dtype=np.int64) != np.asarray(b[:n], dtype=np.int64))
+        return int(d[0]) if d.size else n
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 class SlotTable:
-    def __init__(self, backend: Backend):
+    def __init__(self, backend: Backend, prefix_reuse_min: int = 1024):
         self.backend = backend
+        self.prefix_reuse_min = prefix_reuse_min          # smallest LCP worth a rewind (0 disables rewinds)
         self.slots: Dict[int, SlotInfo] = {}
+        self.n_rewinds = 0
 
     def init(self) -> None:
         for _ in range(self.backend.n_slots):
@@ -75,8 +99,9 @@ class SlotTable:
                 break
             self.slots[sid] = SlotInfo(sid)
 
-    def acquire(self, prompt: List[int]) -> Optional[Tuple[SlotInfo, int]]:
-        """Pick a slot for `prompt`; returns (slot, n_reused_tokens) or None when every slot is busy."""
+    def acquire(self, prompt: List[int]) -> Optional[Tuple[SlotInfo, int, Optional[int]]]:
+        """Pick a slot for `prompt`; returns (slot, n_reused_tokens, divergence_mark) or None when every slot is busy.
+        divergence_mark = position where the prompt and the slot's previous history parted (a prefill chunk must end there), or None."""
         best: Optional[SlotInfo] = None
         n_prompt = len(prompt)
         for s in self.slots.values():
@@ -91,14 +116,50 @@ class SlotTable:
                 best = s
         if best is not None:
             best.busy = True
-            return best, len(best.tokens)
+            return best, len(best.tokens), None
+        got = self._acquire_by_rewind(prompt)
+        if got is not None:
+            return got
         idle = [s for s in self.slots.values() if not s.busy]
         if not idle:
             return None
         s = min(idle, key=lambda x: (len(x.tokens) > 0, x.last_used))  # empty slots first, then least recently used
         self.reset(s)
         s.busy = True
-        return s, 0
+        return s, 0, None
+
+    def _acquire_by_rewind(self, prompt: List[int]) -> Optional[Tuple[SlotInfo, int, Optional[int]]]:
+        """Longest-common-prefix reuse: rewind the idle slot sharing the most tokens with `prompt` (>= prefix_reuse_min) to a checkpoint."""
+        if not self.backend.supports_rewind or self.prefix_reuse_min <= 0:
+            return None
+        n_prompt = len(prompt)
+        cand: Optional[SlotInfo] = None
+        cand_lcp = 0
+        for s in self.slots.values():
+            if s.busy or not s.tokens:
+                continue
+            l = lcp_len(prompt, s.tokens)
+            if l > cand_lcp or (l == cand_lcp and cand is not None and s.last_used > cand.last_used):
+                cand, cand_lcp = s, l
+        if cand is None or cand_lcp < self.prefix_reuse_min:
+            return None
+        target = min(cand_lcp, n_prompt - 1)          # at least one prompt token must be processed to produce logits
+        p = self.backend.rewind(cand.id, target)
+        if p < 0:
+            return None                                 # no restorable checkpoint: the caller falls back to the LRU reset
+        if p > target or self.backend.slot_pos(cand.id) != p:
+            self.reset(cand)                            # must not happen; keep the history invariant rather than trust the slot
+            raise BackendError("rewind of slot %d to %d returned %d (engine position %d)" % (cand.id, target, p, self.backend.slot_pos(cand.id)))
+        del cand.tokens[p:]
+        cand.last_logits = None
+        cand.busy = True
+        self.n_rewinds += 1
+        mark: Optional[int] = None
+        if p == cand_lcp and cand_lcp < n_prompt:
+            self.backend.checkpoint(cand.id, deep=True)   # the divergence point itself is a checkpoint: make it survive any continuation
+        elif cand_lcp < n_prompt:
+            mark = cand_lcp                             # the prefill will end a chunk here and leave a deep checkpoint
+        return cand, p, mark
 
     def reset(self, s: SlotInfo) -> None:
         if s.tokens or s.last_logits is not None:
@@ -109,7 +170,9 @@ class SlotTable:
         if not healthy:
             self.backend.slot_reset(s.id)
             s.tokens, s.last_logits = [], None
-        s.busy = False
+        elif s.tokens and self.backend.supports_rewind:
+            self.backend.checkpoint(s.id)               # generation end: a follow-up that re-renders this turn differently rewinds to the prompt end,
+        s.busy = False                                  # one that shares everything but the last tokens rewinds to here
         s.last_used = time.monotonic()
 
 
@@ -160,9 +223,10 @@ class Finish:
 class Sequence:
     """One running generation (engine thread only)."""
 
-    def __init__(self, sched: "Scheduler", req: GenRequest, slot: SlotInfo, n_reused: int):
+    def __init__(self, sched: "Scheduler", req: GenRequest, slot: SlotInfo, n_reused: int, mark: Optional[int] = None):
         self.sched, self.req, self.slot = sched, req, slot
         self.n_reused = n_reused
+        self.mark = mark                                   # prefill chunk boundary forced at the divergence point (deep checkpoint there)
         self.pos = n_reused
         self.logits: Optional[np.ndarray] = slot.last_logits if n_reused == len(req.prompt_ids) else None
         self.phase = "decode" if self.logits is not None else "prefill"
@@ -206,12 +270,17 @@ class Sequence:
         be = self.sched.backend
         if self.phase == "prefill":
             t0 = time.monotonic()
-            chunk = self.req.prompt_ids[self.pos:self.pos + self.sched.prefill_chunk]
-            last = self.pos + len(chunk) >= len(self.req.prompt_ids)
+            end = min(self.pos + self.sched.prefill_chunk, len(self.req.prompt_ids))
+            if self.mark is not None and self.pos < self.mark < end:
+                end = self.mark
+            chunk = self.req.prompt_ids[self.pos:end]
+            last = end >= len(self.req.prompt_ids)
             logits = be.prefill(self.slot.id, chunk, want_logits=last)   # only the last chunk needs the lm head
             self.slot.tokens.extend(chunk)
             self.slot.last_logits = logits
-            self.pos += len(chunk)
+            self.pos = end
+            if be.supports_rewind and (last or end == self.mark):
+                be.checkpoint(self.slot.id, deep=True)    # prompt end / divergence point: restorable whatever follows (docs/REWIND.md)
             self.t_prefill += time.monotonic() - t0
             if last:
                 self.phase, self.logits = "decode", logits
@@ -353,9 +422,10 @@ class Sequence:
 
 class Scheduler:
     def __init__(self, backend: Backend, tokenizer: InkTokenizer, max_queue: int = 8, prefill_chunk: int = 256,
-                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None, spec: bool = True):
+                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None, spec: bool = True, prefix_reuse_min: int = 1024):
         self.backend, self.tokenizer = backend, tokenizer
         self.spec_enabled = spec
+        self.prefix_reuse_min = prefix_reuse_min
         self.max_queue, self.prefill_chunk = max_queue, max(1, prefill_chunk)
         self.on_finish = on_finish
         self.table: Optional[SlotTable] = None
@@ -394,6 +464,9 @@ class Scheduler:
         return [{"id": s.id, "n_tokens": len(s.tokens), "busy": s.busy, "idle_s": round(now - s.last_used, 1) if s.last_used else None,
                  "has_logits": s.last_logits is not None} for s in list(self.table.slots.values())]
 
+    def n_rewinds(self) -> int:
+        return self.table.n_rewinds if self.table is not None else 0
+
     def n_active(self) -> int:
         return self._n_running
 
@@ -414,7 +487,7 @@ class Scheduler:
     def _run(self) -> None:
         try:
             self.backend.start()
-            self.table = SlotTable(self.backend)
+            self.table = SlotTable(self.backend, self.prefix_reuse_min)
             self.table.init()
             if not self.table.slots:
                 raise RuntimeError("backend returned no slots")
@@ -471,8 +544,8 @@ class Scheduler:
                     return
                 self._pending.popleft()
                 self._n_running += 1
-            slot, n_reused = got
-            self._active.append(Sequence(self, req, slot, n_reused))
+            slot, n_reused, mark = got
+            self._active.append(Sequence(self, req, slot, n_reused, mark))
 
     def _finish(self, seq: Sequence) -> None:
         healthy = seq.error is None

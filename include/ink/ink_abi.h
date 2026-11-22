@@ -76,6 +76,22 @@ int  ink_spec_step(ink_engine*, int slot, const ink_spec_request*, ink_spec_resu
 // Samples one token from a logits row (ink_n_vocab floats, as written by ink_forward) with the sampler the spec step uses (first anchor); next_seed may be NULL.
 int32_t ink_sample(const ink_engine*, const float* logits, const ink_sampling_params*, uint64_t seed, uint64_t* next_seed);
 
+// ======================================================================= slot checkpoints and rewind (agent S3; docs/REWIND.md)
+// The engine takes a SHALLOW checkpoint (position + conv histories, 3.83 MB) automatically after every prefill chunk and at the end of every
+// ink_forward of >= 2 tokens; single-token forwards (decode steps) never checkpoint. A shallow checkpoint at position P stays restorable while
+// at most 1025 tokens were appended after it (SWA ring 2048 cells, window 1024: the cells of P-1023..P-1 are still intact), judged against the
+// highest position the slot ever reached since its reset. A DEEP checkpoint also copies the SWA window (<= 170 MiB) and is restorable until it
+// is evicted (ring of INK_CKPT_MAX = 8 checkpoints per slot, at most INK_CKPT_DEEP = 2 deep; the oldest / already dead ones go first).
+int     ink_slot_checkpoint(ink_engine*, int slot);        // explicit shallow checkpoint at ink_slot_pos (e.g. the end of a generation); 0 ok, -1 bad slot
+int     ink_slot_checkpoint_deep(ink_engine*, int slot);   // explicit deep checkpoint (e.g. the end of a prompt); 0 ok, -1 bad slot, -5 out of memory
+// Rewinds the slot to the nearest restorable checkpoint <= pos (pos may be any value, e.g. the longest common prefix of a new prompt with the slot's
+// history) and returns the position rewound to; afterwards the slot holds exactly its first `returned` tokens and ink_forward appends from there.
+// Returns -1 when no restorable checkpoint <= pos exists (the slot is unchanged). Checkpoints above the returned position are dropped. A slot that
+// speculated (ink_spec_*) loses drafter sync on a rewind to a lower position: ink_spec_synced returns 0 and steps run plain until the next reset.
+int64_t ink_slot_rewind(ink_engine*, int slot, int64_t pos);
+// Restorable checkpoint positions, ascending, into out[0..max); returns their total count (may exceed max).
+int     ink_slot_checkpoints(const ink_engine*, int slot, int64_t* out, int max);
+
 #ifdef __cplusplus
 }
 #endif

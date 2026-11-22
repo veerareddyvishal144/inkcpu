@@ -9,9 +9,9 @@ from server.sampling import SamplingParams
 from server.scheduler import GenRequest, QueueFull, Scheduler
 
 
-def _sched(n_slots=2, chunk=16, **kw):
+def _sched(n_slots=2, chunk=16, reuse_min=1024, **kw):
     be = MockBackend(n_slots=n_slots, max_ctx=4096, **kw)
-    s = Scheduler(be, tok(), max_queue=1, prefill_chunk=chunk)
+    s = Scheduler(be, tok(), max_queue=1, prefill_chunk=chunk, prefix_reuse_min=reuse_min)
     s.start()
     return be, s
 
@@ -127,6 +127,118 @@ def test_queue_full_raises_with_retry_after():
         for q in qs:                                       # accepted requests still finish
             while q.get(timeout=20)[0] != "done":
                 pass
+    finally:
+        s.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------- S3: LCP reuse by slot rewind (docs/REWIND.md)
+def _ops(be, since, op):
+    return [c for c in be.calls[since:] if c[0] == op]
+
+
+def _invariant(be, s):
+    for sl in s.table.slots.values():
+        assert be.slot_pos(sl.id) == len(sl.tokens) and be.hist[sl.id] == sl.tokens, (sl.id, be.slot_pos(sl.id), len(sl.tokens))
+
+
+def test_rewind_lcp_reuses_a_shared_prefix_and_leaves_a_checkpoint_at_the_divergence_point():
+    be, s = _sched(n_slots=1, reuse_min=32)
+    try:
+        base = list(range(1000, 1100))                        # 100 shared tokens; prefill chunks of 16 -> checkpoints 16, 32, .., 96, 103
+        f1 = _run(s, base + [1, 2, 3])
+        slot = s.table.slots[0]
+        assert f1.cached_tokens == 0 and slot.tokens[:103] == base + [1, 2, 3]
+        assert be.checkpoints(0)[-2:] == [103, len(slot.tokens)], be.checkpoints(0)   # prompt end (deep) + generation end (shallow)
+        assert (0, 103, True) in be.ckpt_calls and (0, len(slot.tokens), False) in be.ckpt_calls
+        mark = len(be.calls)
+        f2 = _run(s, base + [7, 8, 9, 10])                    # LCP 100: nearest checkpoint <= 100 is 96
+        assert f2.cached_tokens == 96, f2.cached_tokens
+        assert ("rewind", 0, 96) in be.calls[mark:] and not _ops(be, mark, "slot_reset")
+        assert [c[2] for c in _ops(be, mark, "prefill")] == [4, 4], be.calls[mark:]   # 96 -> 100 (the divergence point) -> 104
+        assert (0, 100, True) in be.ckpt_calls and (0, 104, True) in be.ckpt_calls      # deep at the divergence point and at the prompt end
+        assert slot.tokens[:104] == base + [7, 8, 9, 10]
+        _invariant(be, s)
+        be2, s2 = _sched(n_slots=1, reuse_min=32)             # the rewound run equals a cold run (the mock's logits are a function of the history)
+        try:
+            assert _run(s2, base + [7, 8, 9, 10]).token_ids == f2.token_ids
+        finally:
+            s2.shutdown()
+        mark = len(be.calls)
+        f3 = _run(s, base + [11, 12])                         # a third conversation with the same prefix hits the divergence checkpoint exactly
+        assert f3.cached_tokens == 100 and [c[2] for c in _ops(be, mark, "prefill")] == [2]
+        assert s.n_rewinds() == 2
+        _invariant(be, s)
+    finally:
+        s.shutdown()
+
+
+def test_rewind_below_the_threshold_or_refused_falls_back_to_the_lru_reset():
+    be, s = _sched(n_slots=1, reuse_min=64)
+    try:
+        base = list(range(1000, 1040))                        # 40 shared tokens < 64
+        _run(s, base + [1, 2, 3])
+        mark = len(be.calls)
+        f = _run(s, base + [5, 6, 7])
+        assert f.cached_tokens == 0 and _ops(be, mark, "slot_reset") and not _ops(be, mark, "rewind")
+        _invariant(be, s)
+    finally:
+        s.shutdown()
+    be, s = _sched(n_slots=1, reuse_min=32, rewind_bound=4)    # every shallow checkpoint <= 100 is dead (12 appended > 4), the deep one is at 103
+    try:
+        base = list(range(1000, 1100))
+        _run(s, base + [1, 2, 3])
+        mark = len(be.calls)
+        f = _run(s, base + [7, 8, 9, 10])
+        assert f.cached_tokens == 0 and _ops(be, mark, "slot_reset") and not _ops(be, mark, "rewind")
+        assert [c[2] for c in _ops(be, mark, "prefill")] == [16] * 6 + [8]
+        _invariant(be, s)
+    finally:
+        s.shutdown()
+
+
+def test_rewind_when_the_prompt_is_a_strict_prefix_of_the_history_processes_at_least_one_token():
+    be, s = _sched(n_slots=1, reuse_min=32)
+    try:
+        base = list(range(1000, 1100))
+        _run(s, base + [1, 2, 3])
+        mark = len(be.calls)
+        f = _run(s, base[:90])                                 # LCP 90 == prompt length: rewind target 89 -> checkpoint 80, prefill 10
+        assert f.cached_tokens == 80 and [c[2] for c in _ops(be, mark, "prefill")] == [10]
+        assert s.table.slots[0].tokens[:90] == base[:90]
+        _invariant(be, s)
+    finally:
+        s.shutdown()
+
+
+def test_rewind_picks_the_slot_with_the_longest_common_prefix_over_an_empty_slot():
+    be, s = _sched(n_slots=2, reuse_min=32)
+    try:
+        a, b = list(range(1000, 1100)), list(range(2000, 2060))
+        _run(s, a + [1, 2, 3])                                 # slot 0
+        mark = len(be.calls)
+        f = _run(s, a + [7, 8])                                # LCP 100 with slot 0 beats the empty slot 1
+        assert f.cached_tokens == 96 and _ops(be, mark, "rewind")[0][1] == 0 and not s.table.slots[1].tokens
+        _run(s, b + [1])                                       # unrelated: empty slot 1
+        assert s.table.slots[1].tokens[:61] == b + [1]
+        mark = len(be.calls)
+        f = _run(s, a[:70] + b[:40])                           # shares 70 with slot 0, nothing with slot 1 -> slot 0 (checkpoint 64)
+        assert f.cached_tokens == 64 and _ops(be, mark, "rewind")[0][1] == 0
+        mark = len(be.calls)
+        f = _run(s, b[:50] + [9])                              # shares 50 with slot 1 (>= 32) -> slot 1 (checkpoint 48)
+        assert f.cached_tokens == 48 and _ops(be, mark, "rewind")[0][1] == 1
+        _invariant(be, s)
+    finally:
+        s.shutdown()
+
+
+def test_rewind_disabled_backend_keeps_the_append_only_policy():
+    be, s = _sched(n_slots=1, reuse_min=32, rewind=False)
+    try:
+        base = list(range(1000, 1100))
+        _run(s, base + [1, 2, 3])
+        mark = len(be.calls)
+        f = _run(s, base + [7, 8, 9, 10])
+        assert f.cached_tokens == 0 and _ops(be, mark, "slot_reset") and not be.ckpt_calls
     finally:
         s.shutdown()
 

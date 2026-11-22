@@ -102,6 +102,12 @@ void ink_last_timing(const ink_engine* h, double* total_us, double* kernel_us) {
     if (kernel_us) *kernel_us = h ? h->kernel_us : 0;
 }
 
+// ======================================================================= slot checkpoints and rewind (agent S3, docs/REWIND.md)
+int ink_slot_checkpoint(ink_engine* h, int slot) { return h && h->e ? h->e->slot_checkpoint(slot, false) : -10; }
+int ink_slot_checkpoint_deep(ink_engine* h, int slot) { return h && h->e ? h->e->slot_checkpoint(slot, true) : -10; }
+int64_t ink_slot_rewind(ink_engine* h, int slot, int64_t pos) { return h && h->e ? h->e->slot_rewind(slot, pos) : -10; }
+int ink_slot_checkpoints(const ink_engine* h, int slot, int64_t* out, int max) { return h && h->e ? h->e->slot_checkpoints(slot, out, max) : 0; }
+
 // ======================================================================= speculative decoding
 #ifdef INK_HAVE_SPEC
 namespace {

@@ -36,6 +36,7 @@ class ServerConfig:
     request_log: Optional[str] = None       # JSONL path; None -> env INK_REQUEST_LOG; "" disables
     log_bodies: bool = False                # also log prompts/outputs (privacy: off by default)
     prefill_chunk: int = 256
+    prefix_reuse_min: int = 1024        # smallest shared prefix (tokens) worth rewinding a slot for (docs/REWIND.md); 0 = never rewind
     sse_keepalive_s: float = 10.0   # SSE comment line every N s while no event is pending (long prefills)
     default_reasoning_effort: Optional[str] = None   # used when a request carries no reasoning_effort (None = template default 0.9)
     spec: bool = True                       # use the backend's speculative steps when it has them (penalties always use plain decode)
@@ -141,7 +142,8 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             rec["response"] = {"content": m.content, "reasoning_content": m.reasoning_content, "tool_calls": m.tool_calls}
         reqlog.write(rec)
 
-    sched = Scheduler(backend, tok, max_queue=cfg.max_queue, prefill_chunk=cfg.prefill_chunk, on_finish=on_finish, spec=cfg.spec)
+    sched = Scheduler(backend, tok, max_queue=cfg.max_queue, prefill_chunk=cfg.prefill_chunk, on_finish=on_finish, spec=cfg.spec,
+                      prefix_reuse_min=cfg.prefix_reuse_min)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -259,7 +261,8 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
 
     @app.get("/slots")
     async def slots_ep():
-        return {"slots": sched.slot_snapshot(), "ctx": backend.max_ctx, "queued": sched.n_waiting(), "active": sched.n_active()}
+        return {"slots": sched.slot_snapshot(), "ctx": backend.max_ctx, "queued": sched.n_waiting(), "active": sched.n_active(),
+                "rewinds": sched.n_rewinds(), "rewind_supported": bool(getattr(backend, "supports_rewind", False))}
 
     @app.get("/metrics")
     async def metrics_ep():

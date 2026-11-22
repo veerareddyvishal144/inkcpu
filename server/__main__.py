@@ -19,6 +19,8 @@ def main(argv=None):
     ap.add_argument("--max-queue", type=int, default=8, help="waiting requests beyond busy slots before 429")
     ap.add_argument("--default-max-tokens", type=int, default=8192)
     ap.add_argument("--prefill-chunk", type=int, default=256)
+    ap.add_argument("--prefix-reuse-min", type=int, default=1024,
+                    help="rewind an idle slot to reuse a shared prompt prefix of at least this many tokens (libink with ink_slot_rewind; 0 = off)")
     ap.add_argument("--default-reasoning-effort", default=os.environ.get("INK_DEFAULT_EFFORT") or None, metavar="none|minimal|low|medium|high|0-0.99",
                     help="reasoning effort used when a request does not set one (default: the template's 0.9 = full thinking)")
     ap.add_argument("--served-name", default="inkling-2-mini")
@@ -65,7 +67,8 @@ def main(argv=None):
         be = backends.InkBackend(a.model, a.lib, a.threads, a.slots, a.ctx, timer_slack_us=a.timer_slack_us, drafter_path=a.drafter,
                                  spec_mode=spec_mode)
     cfg = ServerConfig(served_name=a.served_name, max_queue=a.max_queue, default_max_tokens=a.default_max_tokens,
-                       request_log=a.request_log, log_bodies=a.log_bodies, prefill_chunk=a.prefill_chunk, default_reasoning_effort=a.default_reasoning_effort, spec=not a.no_spec)
+                       request_log=a.request_log, log_bodies=a.log_bodies, prefill_chunk=a.prefill_chunk, default_reasoning_effort=a.default_reasoning_effort, spec=not a.no_spec,
+                       prefix_reuse_min=a.prefix_reuse_min)
     app = create_app(be, cfg)
     import threading
     import time

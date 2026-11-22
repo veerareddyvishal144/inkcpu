@@ -1,7 +1,7 @@
 # Module engine (agent C1): packed weights + decode executor, tests (tests/engine), bench (bench/).
 get_filename_component(INK_ROOT ${CMAKE_CURRENT_LIST_DIR}/../.. ABSOLUTE)
 # gguf.cpp / model.cpp are compiled in directly (not via ink_core) so libink does not need OpenMP
-add_library(ink_engine STATIC engine_load.cpp engine_decode.cpp ${INK_ROOT}/src/core/gguf.cpp ${INK_ROOT}/src/core/model.cpp)
+add_library(ink_engine STATIC engine_load.cpp engine_decode.cpp engine_rewind.cpp ${INK_ROOT}/src/core/gguf.cpp ${INK_ROOT}/src/core/model.cpp)
 target_include_directories(ink_engine PUBLIC ${INK_ROOT}/include PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 target_link_libraries(ink_engine PUBLIC ink_kernels_gemv ink_kernels_misc Threads::Threads)
 # no mul+add contraction: the expert combine and the scalar tails must round exactly like the reference
@@ -41,5 +41,12 @@ if(TARGET ink_kernels_gemm AND EXISTS ${INK_ROOT}/src/engine/engine_prefill.cpp)
   if(EXISTS ${INK_ROOT}/bench/bench_prefill.cpp)
     add_executable(bench_prefill ${INK_ROOT}/bench/bench_prefill.cpp)
     target_link_libraries(bench_prefill ink_engine)
+  endif()
+  # ---- agent S3: slot checkpoints + rewind gates (docs/REWIND.md); links ink_spec when present for the speculation interplay mode
+  if(EXISTS ${INK_ROOT}/tests/engine/test_rewind.cpp)
+    add_executable(test_rewind ${INK_ROOT}/tests/engine/test_rewind.cpp)
+    target_compile_definitions(test_rewind PRIVATE INK_SOURCE_DIR="${INK_ROOT}")
+    target_compile_options(test_rewind PRIVATE -ffp-contract=off)
+    target_link_libraries(test_rewind ink_engine)
   endif()
 endif()

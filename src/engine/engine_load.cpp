@@ -102,6 +102,8 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
     e->tune.chunk_ctrl = envi("INK_CHUNK_CTRL", e->tune.chunk_ctrl);
     e->tune.split_keys = envi("INK_SPLIT_KEYS", e->tune.split_keys);
     e->tune.swa_blocks = std::max(16, envi("INK_SWA_BLOCKS", e->tune.swa_blocks));
+    e->tune.ckpt_max = std::max(0, envi("INK_CKPT_MAX", e->tune.ckpt_max));          // S3: checkpoints per slot (docs/REWIND.md)
+    e->tune.ckpt_deep = std::max(0, std::min(e->tune.ckpt_max, envi("INK_CKPT_DEEP", e->tune.ckpt_deep)));
     g_gemv_prefetch_bytes = envi("INK_PF", g_gemv_prefetch_bytes);     // B1 tunables (experiments)
     g_gemv_prefetch_hint = envi("INK_PFH", g_gemv_prefetch_hint);
     e->prof.tsc_per_us = calibrate_tsc_per_us();
@@ -380,6 +382,8 @@ bool Engine::alloc_slot(SlotState& s, std::string* err) {
     s.hist = (float*)std::aligned_alloc(64, align_up(kVisits * kHistPerVisit * 4, 64));
     std::memset(s.hist, 0, kVisits * kHistPerVisit * 4);
     s.pos = 0;
+    s.hwm = 0;
+    s.ckpt = nullptr;
     s.used = false;
     return true;
 }
@@ -392,13 +396,15 @@ void Engine::free_slot(SlotState& s) {
     }
     std::free(s.hist);
     s.hist = nullptr;
+    slot_ckpt_free(s);
 }
 
-// blocks of a visit that may hold data: global = grown extent, ring = written blocks (all once the ring has wrapped)
+// blocks of a visit that may hold data: global = grown extent, ring = written blocks (all once the ring has wrapped); hwm covers what a
+// rewind left behind above pos
 static size_t used_blocks(const SlotState& s, int v) {
     const KvLayer& L = s.kv[v];
     if (!L.ring) return L.n_blocks;
-    return std::min<size_t>(L.n_blocks, (size_t)((s.pos + kKvBlock - 1) / kKvBlock));
+    return std::min<size_t>(L.n_blocks, (size_t)((std::max(s.pos, s.hwm) + kKvBlock - 1) / kKvBlock));
 }
 
 void Engine::slot_reset(int slot) {
@@ -413,6 +419,8 @@ void Engine::slot_reset(int slot) {
     }
     std::memset(s.hist, 0, kVisits * kHistPerVisit * 4);
     s.pos = 0;
+    s.hwm = 0;
+    slot_ckpt_clear(s);
 }
 
 int Engine::slot_new() {
@@ -449,6 +457,8 @@ bool Engine::slot_copy(int src, int dst) {
     }
     std::memcpy(b.hist, a.hist, kVisits * kHistPerVisit * 4);
     b.pos = a.pos;
+    b.hwm = std::max(a.hwm, a.pos);
+    slot_ckpt_clear(b);   // checkpoints are not copied (the copy starts with none)
     return true;
 }
 

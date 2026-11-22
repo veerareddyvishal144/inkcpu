@@ -522,6 +522,7 @@ int Engine::decode(int slot, int32_t token, float* logits) {
     run_token(S, token, logits);
     if (tap_sink) tap_sink(slot, S.pos, 1, scr_->taps);
     S.pos++;
+    if (S.hwm < S.pos) S.hwm = S.pos;
     return 0;
 }
 
@@ -553,6 +554,7 @@ int Engine::forward(int slot, const int32_t* tokens, int n, float* logits_last) 
         us += last_total_us;
     }
     last_forward_us = us;
+    if (n >= 2) slot_checkpoint(slot);   // prompt boundary (the prefill path checkpoints every chunk); single decode steps never checkpoint
     return 0;
 }
 

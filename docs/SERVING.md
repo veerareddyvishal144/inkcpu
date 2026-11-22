@@ -258,3 +258,17 @@ request (Caret/Cursor chat titles, Tab) returned an empty body. Two server chang
 Measured on a Caret agent turn: 7,215-token prompt (system prompt + 32 tool schemas), 0 cached tokens -> prefill 120.6 s at 12 threads
 (60 tok/s), 59 output tokens in 5 s; total 125.6 s. The context was raised to 32k (`--ctx 32768`), threads to 16 and the prefill chunk
 to 512 for this deployment; follow-up turns reuse the slot's prefix cache (`cached_tokens` in `usage`) if the client resends the same prefix.
+
+## 13. Slot rewind and shared-prefix reuse (agent S3, 2026-11-22; details in docs/REWIND.md)
+
+The engine now checkpoints every slot after each prefill chunk and at each prompt end (3.83 MB conv-history snapshots; the KV needs no copy while
+at most 1025 tokens follow, see REWIND.md section 3) and can rewind a slot to a checkpoint (`ink_slot_rewind`). The server uses it when no slot's
+history is a full prefix of the new prompt: the idle slot sharing the longest common prefix (>= `--prefix-reuse-min`, default 1024 tokens) is
+rewound to the nearest restorable checkpoint <= the shared length and only the rest of the prompt is prefilled (`cached_tokens` reports the
+reused length). Prompt ends get a "deep" checkpoint (adds a 170 MiB copy of the SWA window, so it survives a generation of any length), the point
+where two conversations were seen to diverge gets one too, every generation end a shallow one. Effect on the Caret pattern (the client resends
+the ~7,200-token prefix and re-renders the assistant turn without `reasoning_content`): the follow-up turn rewinds to the previous prompt end and
+prefills only the re-rendered assistant turn + the new user message instead of the whole conversation; two threads with the same system prompt +
+tool schemas share the prefix as well. Memory: <= ~370 MB per slot of checkpoint buffers (allocated on first use). Logits after a rewind are
+bit-identical to a fresh slot fed the same tokens (tests/engine/test_rewind.cpp, test_ink_real.py m/n). Requires a libink.so with the
+`ink_slot_*` checkpoint symbols (build-s3 or later); older builds keep the append-only policy. Measurements: REWIND.md section 7.

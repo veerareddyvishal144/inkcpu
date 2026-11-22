@@ -5,6 +5,8 @@
 //   determinism            gate (d): bit-identical logits across repeats and thread counts 8/12/16
 //   slots [ring_dir]       gate (e): reset/continue, interleaved slots, ring wrap (ring_dir: tokens.i32 + logits_last.f32 of >1024 tokens)
 //   trace [ntok]           per-visit comparison of Q/K/V/R/attn_out/ffn_inp/l_out against the scalar reference
+//   crosscheck <gguf>      (S4) INK_GGUF vs <gguf>, loaded one after the other: logits of the 6 oracle prompts (decode) and a
+//                          300-token prefill must be bit-identical (same weights in the inkling2_loop and inkling2 layouts)
 // env: INK_GGUF (model path), INK_THREADS (default 12), INK_REFCACHE (dir for cached RefModel logits)
 #include <sys/stat.h>
 
@@ -20,6 +22,9 @@
 #include <vector>
 
 #include "ink/engine.h"
+#ifdef INK_HAVE_PREFILL
+#include "ink/engine_prefill.h"
+#endif
 #include "ref_forward.h"
 
 using namespace ink;
@@ -453,6 +458,92 @@ int mode_trace(int argc, char** argv) {
     return 0;
 }
 
+// ------------------------------------------------------------------------------------------------ crosscheck (S4)
+// Two GGUFs holding the same weights in different layouts must give bit-identical logits: any difference is a mapping bug.
+// Engines are loaded one at a time (17 GB each). The 300-token prompt goes through engine_prefill (the batched executor).
+int mode_crosscheck(int argc, char** argv) {
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: test_engine crosscheck <other_gguf>   (INK_GGUF = the reference file)\n");
+        return 2;
+    }
+    const std::string other = argv[2];
+    struct P {
+        std::string name;
+        std::vector<int32_t> toks;
+        bool prefill;
+    };
+    std::vector<P> ps;
+    for (const char* nm : {"s1_en_capital", "s2_code_add", "s3_en_story", "c1_chat_user", "m1_en_llm", "m2_code_c"})
+        ps.push_back({nm, read_file<int32_t>(kRoot + "/tools/oracle/" + nm + "/tokens.i32"), false});
+    {   // real text (the ring data), as test_prefill's wiki300
+        auto t = read_file<int32_t>(kRoot + "/build-c1b/data/ring/tokens.i32");
+        if (t.empty()) t = read_file<int32_t>(kRoot + "/build-c1b/data/nll1/tokens.i32");
+        std::vector<int32_t> w;
+        for (size_t i = 0; w.size() < 300 && !t.empty(); ++i) w.push_back(t[i % t.size()]);
+        ps.push_back({"wiki300-prefill", w, true});
+    }
+    auto run_all = [&](const std::string& path) {
+        std::vector<std::vector<float>> out;
+        EngineOptions o;
+        o.n_threads = env_threads();
+        o.n_slots = 1;
+        o.max_ctx = 4096;
+        std::string err;
+        auto t0 = std::chrono::steady_clock::now();
+        auto e = Engine::create(path, o, &err);
+        if (!e) {
+            std::fprintf(stderr, "engine create failed for %s: %s\n", path.c_str(), err.c_str());
+            std::exit(2);
+        }
+        std::printf("loaded %s\n  arch %s, %d physical layers, %zu visits, %.2f GB packed, %.1f s\n", path.c_str(), e->cfg.arch.c_str(), e->cfg.n_layer,
+                    e->plan.size(), e->weight_bytes / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        const int slot = e->slot_new();
+        for (auto& p : ps) {
+            if (p.toks.empty()) {
+                out.push_back({});
+                continue;
+            }
+#ifdef INK_HAVE_PREFILL
+            if (p.prefill) {
+                std::vector<float> lg(e->n_vocab());
+                e->slot_reset(slot);
+                if (engine_prefill(*e, slot, p.toks.data(), (int)p.toks.size(), lg.data())) {
+                    std::fprintf(stderr, "prefill failed\n");
+                    std::exit(3);
+                }
+                out.push_back(lg);
+                continue;
+            }
+#endif
+            out.push_back(run_prompt(*e, slot, p.toks));
+        }
+        return out;   // the engine is destroyed here, before the other file is loaded
+    };
+    auto a = run_all(gguf_path());
+    auto b = run_all(other);
+    int fails = 0;
+    std::printf("%-16s %5s %8s %8s %12s %10s\n", "prompt", "ntok", "argmax A", "argmax B", "max|A-B|", "differing");
+    for (size_t i = 0; i < ps.size(); ++i) {
+        if (a[i].empty() || b[i].empty() || a[i].size() != b[i].size()) {
+            std::printf("%-16s data missing  FAIL\n", ps[i].name.c_str());
+            ++fails;
+            continue;
+        }
+        double md = 0;
+        size_t nd = 0;
+        for (size_t k = 0; k < a[i].size(); ++k) {
+            md = std::max(md, (double)std::fabs(a[i][k] - b[i][k]));
+            if (a[i][k] != b[i][k]) ++nd;
+        }
+        const bool ok = md == 0 && nd == 0;
+        std::printf("%-16s %5zu %8d %8d %12.3e %10zu  %s\n", ps[i].name.c_str(), ps[i].toks.size(), argmax(a[i].data(), a[i].size()), argmax(b[i].data(), b[i].size()),
+                    md, nd, ok ? "PASS" : "FAIL");
+        if (!ok) ++fails;
+    }
+    std::printf("crosscheck %s\n", fails ? "FAIL" : "PASS (bit-identical)");
+    return fails != 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -468,6 +559,7 @@ int main(int argc, char** argv) {
     if (m == "determinism") return mode_determinism();
     if (m == "slots") return mode_slots(argc, argv);
     if (m == "trace") return mode_trace(argc, argv);
+    if (m == "crosscheck") return mode_crosscheck(argc, argv);
     std::fprintf(stderr, "unknown mode %s\n", m.c_str());
     return 2;
 }

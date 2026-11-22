@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ctypes smoke test of libink.so (include/ink/ink_abi.h): load, slots, prefill via ink_forward n>1, decode, slot semantics.
-#   /data/engine/.venv/bin/python tests/engine/test_capi.py [path/to/libink.so]
+#   /data/engine/.venv/bin/python tests/engine/test_capi.py [path/to/libink.so]   (env: INK_GGUF model path, INK_THREADS, INK_CPUS)
 import ctypes, sys, os, time
 import numpy as np
 root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,7 +18,8 @@ lib.ink_last_timing.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)
 lib.ink_free.argtypes = [ctypes.c_void_p]
 print("version:", lib.ink_version().decode())
 t0 = time.time()
-h = lib.ink_load(b"/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf", 12, 2, 2048)
+gguf = os.environ.get("INK_GGUF", "/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf")   # S4: either GGUF layout
+h = lib.ink_load(gguf.encode(), int(os.environ.get("INK_THREADS", "12")), 2, 2048)
 assert h, lib.ink_last_error()
 print("loaded in %.1f s" % (time.time() - t0))
 nv = lib.ink_n_vocab(h)

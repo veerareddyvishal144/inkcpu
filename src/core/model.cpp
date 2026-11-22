@@ -1,6 +1,9 @@
 #include "ink/model.h"
 
 #include <cstdio>
+#include <cstring>
+
+#include "ink/ggml_types.h"
 
 namespace ink {
 
@@ -47,28 +50,45 @@ struct Ctx {
 bool ModelConfig::from_gguf(const GgufFile& g, ModelConfig* out, std::string* err) {
     ModelConfig c;
     if (!g.get_string("general.architecture", &c.arch)) { if (err) *err = "missing general.architecture"; return false; }
-    if (c.arch != "inkling2_loop") { if (err) *err = "unsupported architecture '" + c.arch + "' (need inkling2_loop)"; return false; }
+    const bool canon = c.arch == "inkling2";
+    if (c.arch != "inkling2_loop" && !canon) {
+        if (err) *err = "unsupported architecture '" + c.arch + "' (need inkling2_loop or inkling2)";
+        return false;
+    }
     Ctx x{g, c.arch + ".", err};
-    c.n_layer = x.geti("block_count");
+    // Layer count and loop geometry. Interim layout: block_count = physical layers, loop.{start,end,count}. Canonical layout:
+    // block_count = visits (48), num_loops, loop.core_{start,end}; physical layers = visits - (num_loops-1)*(core_end-core_start).
+    if (canon) {
+        c.n_visits = x.geti("block_count");
+        c.loop_count = x.geti("num_loops");
+        c.loop_start = x.geti("loop.core_start");
+        c.loop_end = x.geti("loop.core_end");
+        c.n_layer = c.n_visits - (c.loop_count - 1) * (c.loop_end - c.loop_start);
+    } else {
+        c.n_layer = x.geti("block_count");
+        c.loop_start = x.geti("loop.start");
+        c.loop_end = x.geti("loop.end");
+        c.loop_count = x.geti("loop.count");
+        g.get_bool(x.p + "loop.varying", &c.loop_varying);
+        c.n_visits = c.n_layer + (c.loop_count - 1) * (c.loop_end - c.loop_start);
+    }
+    const int n_arr = canon ? c.n_visits : c.n_layer;   // length of the per-layer (interim) / per-visit (canonical) arrays
     c.n_embd = x.geti("embedding_length");
     c.n_ff_exp = x.geti("expert_feed_forward_length");
-    c.n_head = x.geti_uniform("attention.head_count", c.n_layer);
-    c.n_head_kv = x.geti_uniform("attention.head_count_kv", c.n_layer);
+    c.n_head = x.geti_uniform("attention.head_count", n_arr);
+    c.n_head_kv = x.geti_uniform("attention.head_count_kv", n_arr);
     c.head_dim = x.geti("attention.key_length");
     if (x.geti("attention.value_length") != c.head_dim) x.fail("key_length != value_length");
     c.rms_eps = x.getf("attention.layer_norm_rms_epsilon");
     c.n_expert = x.geti("expert_count");
     c.n_expert_used = x.geti("expert_used_count");
     g.get_f32(x.p + "expert_weights_scale", &c.expert_weights_scale);
-    c.loop_start = x.geti("loop.start");
-    c.loop_end = x.geti("loop.end");
-    c.loop_count = x.geti("loop.count");
     c.loop_gate_rank = x.geti("loop.gate_rank");
-    g.get_bool(x.p + "loop.varying", &c.loop_varying);
     c.n_vocab_padded = x.geti("vocab_size");
     c.n_vocab = x.geti("vocab_size_unpadded");
     c.sliding_window = x.geti("attention.sliding_window");
-    if (!g.get_arr_bool(x.p + "attention.sliding_window_pattern", &c.is_swa)) x.fail("missing attention.sliding_window_pattern");
+    std::vector<bool> swa_arr;
+    if (!g.get_arr_bool(x.p + "attention.sliding_window_pattern", &swa_arr)) x.fail("missing attention.sliding_window_pattern");
     c.n_conv = x.geti("shortconv.l_cache");
     c.situ_beta = x.getf("activation.situ_beta");
     c.situ_linear_beta = x.getf("activation.situ_linear_beta");
@@ -85,10 +105,20 @@ bool ModelConfig::from_gguf(const GgufFile& g, ModelConfig* out, std::string* er
     if (!x.ok) return false;
 
     auto bad = [&](const std::string& m) { if (err) *err = "inconsistent config: " + m; return false; };
-    if ((int)c.is_swa.size() != c.n_layer) return bad("sliding_window_pattern length != block_count");
-    if (c.n_head % c.n_head_kv) return bad("n_head not a multiple of n_head_kv");
     if (c.loop_varying) return bad("variable loops (loop.varying) are not supported");
     if (c.loop_count < 2 || c.loop_start <= 0 || c.loop_start >= c.loop_end || c.loop_end > c.n_layer) return bad("loop range");
+    if ((int)swa_arr.size() != n_arr) return bad("sliding_window_pattern length != block_count");
+    if (canon) {
+        // per-visit arrays are in llama.cpp cache-slot order: physical layers 0..n_layer-1 first, then the extra core passes
+        // (slot n_layer + (pass-1)*core + (phys-start)); keep the physical part and check that the repeats agree with it
+        c.is_swa.assign(swa_arr.begin(), swa_arr.begin() + c.n_layer);
+        const int core = c.loop_end - c.loop_start;
+        for (int v = c.n_layer; v < c.n_visits; ++v)
+            if (swa_arr[v] != c.is_swa[c.loop_start + (v - c.n_layer) % core]) return bad("per-visit sliding_window_pattern does not repeat the core layers");
+    } else {
+        c.is_swa = swa_arr;
+    }
+    if (c.n_head % c.n_head_kv) return bad("n_head not a multiple of n_head_kv");
     if (c.loop_start % c.attn_res_block_size || c.loop_end % c.attn_res_block_size) return bad("loop range not block aligned");
     if (c.n_vocab > c.n_vocab_padded) return bad("vocab_size_unpadded > vocab_size");
     if (c.n_conv < 2 || c.n_conv > 64) return bad("shortconv.l_cache");
@@ -210,10 +240,40 @@ bool load_weights(const GgufFile& g, const ModelConfig& c, Weights* out, std::st
         l.ffn_gate_up_scale = L.get(b + "ffn_gate_up_exps.scale", false, 1, c.n_expert);
         l.ffn_down_scale = L.get(b + "ffn_down_exps.scale", false, 1, c.n_expert);
         if (l.in_core) {
-            l.loop_msg_query = L.get(b + "loop_msg_query.weight", true, 2, D, 4);
-            static const char* names[4] = {"q", "k", "v", "ffn"};
+            if (g.tensor(b + "loop_msg_query.weight")) {   // interim layout: per-layer [D, 4] block, rows Q, K, V, FFN
+                l.loop_msg_query = L.get(b + "loop_msg_query.weight", true, 2, D, 4);
+            } else {
+                // canonical layout: two global tensors [D, 2*core] indexed by i = layer - loop_start:
+                //   Q = loop_res_query[2i], FFN = loop_res_query[2i+1], K = loop_kv_res_query[2i], V = loop_kv_res_query[2i+1]
+                // (verified bit-exact against the interim file's blk.L.loop_msg_query). Assemble the same [D, 4] block in owned memory.
+                const int64_t ncore = c.loop_end - c.loop_start;
+                const TensorRef rq = L.get("loop_res_query.weight", true, 2, D, 2 * ncore);
+                const TensorRef kq = L.get("loop_kv_res_query.weight", true, 2, D, 2 * ncore);
+                if (rq.valid() && kq.valid()) {
+                    if (rq.type != T_F32 || kq.type != T_F32) {
+                        L.fail("loop_res_query / loop_kv_res_query must be F32");
+                    } else {
+                        auto buf = std::make_shared<std::vector<float>>((size_t)4 * D);
+                        const int64_t i2 = 2 * (i - c.loop_start);
+                        std::memcpy(buf->data() + 0 * D, rq.row(i2), (size_t)D * 4);       // Q
+                        std::memcpy(buf->data() + 1 * D, kq.row(i2), (size_t)D * 4);       // K
+                        std::memcpy(buf->data() + 2 * D, kq.row(i2 + 1), (size_t)D * 4);   // V
+                        std::memcpy(buf->data() + 3 * D, rq.row(i2 + 1), (size_t)D * 4);   // FFN
+                        l.loop_msg_query.data = (const uint8_t*)buf->data();
+                        l.loop_msg_query.type = T_F32;
+                        l.loop_msg_query.n_dims = 2;
+                        l.loop_msg_query.ne[0] = D;
+                        l.loop_msg_query.ne[1] = 4;
+                        l.loop_msg_query.nbytes = (size_t)4 * D * 4;
+                        w.owned_f32.push_back(buf);
+                    }
+                }
+            }
+            // controllers: interim blk.L.loop_{q,k,v,ffn}_ctrl_{down,gain,forget}, canonical blk.L.loop_{attn,k,v,mlp}_{down,gain,forget}
+            static const char* interim[4] = {"loop_q_ctrl_", "loop_k_ctrl_", "loop_v_ctrl_", "loop_ffn_ctrl_"};
+            static const char* canonical[4] = {"loop_attn_", "loop_k_", "loop_v_", "loop_mlp_"};
             for (int j = 0; j < 4; ++j) {
-                const std::string n = b + "loop_" + names[j] + "_ctrl_";
+                const std::string n = g.tensor(b + interim[j] + "down.weight") ? b + interim[j] : b + canonical[j];
                 l.ctrl[j].down = L.get(n + "down.weight", true, 2, 2 * (int64_t)D, c.loop_gate_rank);
                 l.ctrl[j].gain = L.get(n + "gain.weight", true, 2, c.loop_gate_rank, D);
                 l.ctrl[j].forget = L.get(n + "forget.weight", true, 2, c.loop_gate_rank, D);

@@ -8,7 +8,7 @@ extern "C" {
 
 typedef struct ink_engine ink_engine;
 
-// Load a GGUF (arch inkling2_loop). n_threads = worker threads (physical cores recommended, 12-16).
+// Load a GGUF (arch inkling2_loop or inkling2, see docs/ENGINE.md "GGUF layouts"). n_threads = worker threads (physical cores recommended, 12-16).
 // n_slots = number of independent sequence slots, max_ctx = max tokens per slot. Returns NULL on failure (see ink_last_error).
 ink_engine* ink_load(const char* gguf_path, int n_threads, int n_slots, int max_ctx);
 void        ink_free(ink_engine*);

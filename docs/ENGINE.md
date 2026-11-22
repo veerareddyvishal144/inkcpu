@@ -76,3 +76,23 @@ identical to plain decode token for token and state for state (S2), OpenAI-compa
 4. Sampled `auto` mode is not reproducible per seed across requests (policy state persists); fixed widths are. Fast-attention verify above 767 keys is rounding-level different from decode
    (`INK_SPEC_EXACT=1` for bit-exactness, cost unmeasured).
 5. Contexts beyond ~2.7k tokens and tau > 1 (positions >= 8191) are untested against llama.cpp.
+
+## 2026-11-22 GGUF layouts: `inkling2_loop` and `inkling2` (S4)
+Unsloth re-uploaded `Inkling-2-Mini-UD-Q4_K_XL.gguf` in llama.cpp's canonical `inkling2` layout. The weights are byte-identical to the
+interim `inkling2_loop` file the engine was validated on (588/588 common tensors + 144/144 renamed controller tensors + the message queries,
+checked with gguf-py); only names and metadata differ. The engine now loads both (`ModelConfig::from_gguf`, `load_weights` in
+`src/core/model.cpp`); nothing downstream (engine, prefill, RefModel, drafter) sees a difference. Mapping rules:
+
+| | `inkling2_loop` (interim, 744 tensors) | `inkling2` (canonical, 734 tensors) |
+|---|---|---|
+| `block_count` | 24 = physical layers | 48 = visits; physical = 48 - (num_loops-1)*(core_end-core_start) = 24 |
+| loop KVs | `loop.start` 6, `loop.end` 18, `loop.count` 3, `loop.varying` false, `loop.gate_rank` 64 | `loop.core_start` 6, `loop.core_end` 18, `num_loops` 3, `loop.gate_rank` 64 (no `varying`) |
+| per-layer arrays (`head_count`, `head_count_kv`, `sliding_window_pattern`) | length 24, per physical layer | length 48, per visit in llama.cpp cache-slot order: physical layers 0..23 first, then the extra core passes (slot 24+(pass-1)*12+(phys-6)); the engine keeps entries 0..23 and checks that the repeats agree |
+| controllers (core layers 6..17) | `blk.L.loop_{q,k,v,ffn}_ctrl_{down,gain,forget}` | `blk.L.loop_{attn,k,v,mlp}_{down,gain,forget}` (the loader tries the interim name first) |
+| message queries | `blk.L.loop_msg_query.weight` [2304, 4], rows Q, K, V, FFN | global `loop_res_query.weight` [2304, 24] and `loop_kv_res_query.weight` [2304, 24]; for layer L, i = L-6: Q = res[2i], FFN = res[2i+1], K = kv_res[2i], V = kv_res[2i+1]. `load_weights` assembles the per-layer [2304, 4] block (Q, K, V, FFN) into memory owned by `Weights::owned_f32` |
+| everything else | identical names, shapes and bytes | |
+
+Gates (`docs/status/S4.md`): `test_engine crosscheck <other>` loads the two files one after the other and requires bit-identical logits on the
+6 oracle prompts (decode) and a 300-token prefill; `test_engine oracle` and `test_prefill quick` on the canonical file reproduce C1/P.
+The local llama.cpp checkouts (2a28df0f9 and llama-unsloth 0a9105d) do NOT load the canonical file: their `inkling2` arch is the
+non-looped dense model (`check_tensor_dims: tensor 'blk.24.attn_q.weight' not found`); `tools/oracle_*` therefore still need the interim file.

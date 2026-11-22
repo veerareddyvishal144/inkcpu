@@ -1,9 +1,16 @@
-// ModelConfig / Weights / visit plan for arch `inkling2_loop` (Inkling 2 Mini). Owner: agent A (core).
-// Everything numeric comes from the GGUF KV table except the few rules that llama.cpp hard-codes (listed in
-// ModelConfig::hard_coded below and in docs/MODEL.md). Weights are pointers into the GgufFile mmap (no copies).
+// ModelConfig / Weights / visit plan for Inkling 2 Mini. Owner: agent A (core); S4 added the second GGUF layout.
+// Two GGUF layouts of the same weights are accepted (docs/ENGINE.md "GGUF layouts"):
+//   arch `inkling2_loop` (interim): block_count = 24 physical layers, loop.{start,end,count}, blk.L.loop_msg_query + loop_*_ctrl_*
+//   arch `inkling2` (llama.cpp canonical): block_count = 48 visits, num_loops, loop.core_{start,end}, per-visit arrays in
+//     llama.cpp cache-slot order (physical layers first, then the extra core passes), global loop_res_query / loop_kv_res_query
+// Both are parsed into the same ModelConfig / Weights (physical layers, per-layer [D,4] message queries), so nothing downstream
+// sees the difference. Everything numeric comes from the GGUF KV table except the few rules that llama.cpp hard-codes (listed in
+// ModelConfig::hard_coded below and in docs/MODEL.md). Weights are pointers into the GgufFile mmap (no copies), except the
+// message-query blocks synthesised for the canonical layout (owned by Weights::owned_f32).
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -78,12 +85,17 @@ struct Weights {
     TensorRef output_norm;           // F32 [n_embd]
     TensorRef output_res_query;      // F32 [n_embd]
     std::vector<LayerWeights> layers;   // physical layers 0..n_layer-1
+    // storage behind the TensorRefs that do not point into the mmap (canonical layout: per-layer loop_msg_query blocks assembled
+    // from loop_res_query / loop_kv_res_query); shared so copies of Weights keep the pointers valid
+    std::vector<std::shared_ptr<std::vector<float>>> owned_f32;
 };
 
 struct ModelConfig {
-    std::string arch;
+    std::string arch;                           // "inkling2_loop" (interim layout) or "inkling2" (canonical layout)
+    bool canonical_layout() const { return arch == "inkling2"; }
     // KV-derived (prefix = arch + ".")
-    int   n_layer = 0, n_embd = 0, n_ff_exp = 0;
+    int   n_layer = 0, n_embd = 0, n_ff_exp = 0;   // n_layer = PHYSICAL layers (24) in both layouts
+    int   n_visits = 0;                         // layer visits per token (48) = canonical block_count = n_slots()
     int   n_head = 0, n_head_kv = 0, head_dim = 0;
     float rms_eps = 0;
     int   n_expert = 0, n_expert_used = 0;

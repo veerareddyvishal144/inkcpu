@@ -2,7 +2,9 @@
 # Fetch the model files the engine needs (skips files already present; resumes partial downloads).
 #   tools/get_model.sh [--check]      --check: only print what would be downloaded (remote sizes), no transfer
 # Files (Hugging Face, Unsloth's GGUF repo):
-#   Inkling-2-Mini-UD-Q4_K_XL.gguf   ~17.6 GB  target weights (the only quant the engine's kernels are built for)
+#   Inkling-2-Mini-UD-Q4_K_XL.gguf   ~17.6 GB  target weights (the only quant the engine's kernels are built for). Upstream re-uploaded it
+#                                     2026-11-22 in llama.cpp's canonical `inkling2` layout (48-visit block_count, loop_res_query); the engine
+#                                     loads both that and the interim `inkling2_loop` layout (docs/ENGINE.md "GGUF layouts")
 #   dspark-Inkling-2-Mini-Q8_0.gguf   402 MB  DSpark drafter (speculative decoding; optional: without it run serve.sh with INK_SPEC=off)
 # Optional: HF_TOKEN for authenticated (faster, rate-limit-free) downloads; INK_MODEL_DIR (default /data/inkling-mini/models).
 set -euo pipefail

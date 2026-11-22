@@ -26,7 +26,7 @@ ninja -C build ink test_engine test_prefill bench_decode bench_prefill bench_spe
 Flags are `-O3 -march=skylake-avx512` (no VNNI/BF16/AMX: this host faults on them).
 
 ## Get the model
-`tools/get_model.sh` downloads the two GGUFs (17.6 GB target + 402 MB drafter) from Hugging Face into `/data/inkling-mini/models` (resumable, skips present files, `HF_TOKEN` optional); `tools/serve.sh start` calls it automatically when they are missing (`INK_NO_DOWNLOAD=1` to forbid). The tokenizer/template files are fetched by the server on first run.
+`tools/get_model.sh` downloads the two GGUFs (17.6 GB target + 402 MB drafter) from Hugging Face into `/data/inkling-mini/models` (resumable, skips present files, `HF_TOKEN` optional); `tools/serve.sh start` calls it automatically when they are missing (`INK_NO_DOWNLOAD=1` to forbid). The tokenizer/template files are fetched by the server on first run. The engine loads both GGUF layouts Unsloth has published: the interim `inkling2_loop` (what we validated against llama.cpp) and the canonical `inkling2` (what the repo serves now); the weights are byte-identical and `test_engine crosscheck <other.gguf>` proves bit-identical logits between the two (`docs/ENGINE.md`, GGUF layouts). llama.cpp itself cannot load the canonical file at the time of writing, so the oracle tools keep using the interim one.
 
 ## Run
 ```

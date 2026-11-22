@@ -1,2 +1,92 @@
 === final bench start 2026-11-22T01:17:34Z loadavg 2.25 6.50 9.30 build=build-orch
 --- decode
+loaded in 1.1 s, 16.97 GB packed; loadavg at start 2.25
+
+   ctx  threads     tok/s    ms/tok     all reps loadavg(before/after)
+# prefill 16 tokens via decode path: 1.1 s
+    16       12     13.86      72.1   13.72 13.86 13.57  2.25/4.48  split_keys=384
+    16       16     14.32      69.8   14.12 14.32 14.32  4.48/7.03  split_keys=384
+# prefill 1000 tokens via decode path: 66.2 s
+  1000       12     13.24      75.5   13.14 13.19 13.24  13.15/12.89  split_keys=384
+  1000       16     14.04      71.2   13.51 13.67 14.04  12.89/13.58  split_keys=384
+=== decode done 2026-11-22T01:19:42Z loadavg 13.58 9.50 10.05
+--- prefill
+bench_prefill: chunk 256, attention prefill kernel, reps 3; load at start 13.58
+threads  prompt  best s    tok/s     all reps (tok/s)         load before/after
+12       16      0.435     36.7      36.0 36.3 36.7           12.65/12.65
+12       64      1.135     56.4      56.4 55.7 55.5           12.65/12.60
+12       256     3.770     67.9      67.9 67.5 65.8           12.60/12.51
+12       1024    15.608    65.6      64.6 65.6 65.5           12.51/12.31
+16       16      0.372     43.0      38.3 43.0 42.2           12.31/12.61
+16       64      0.917     69.8      68.4 69.8 58.5           12.61/12.61
+16       256     3.096     82.7      82.7 81.7 82.2           12.61/13.13
+16       1024    12.566    81.5      79.6 81.5 81.3           13.13/14.87
+=== prefill done 2026-11-22T01:21:40Z loadavg 14.87 10.98 10.51
+--- spec (12 threads, greedy, 120 new tokens, all 8 prompts)
+bench_spec: n=120 modes=plain,4,8,auto exact=-1 temp=0.00 threads=12 load 14.87 drafter=/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf
+drafter loaded in 0.1 s
+
+code_completion (p = 106), load 14.87
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     13.74   0.00       -        73         0         0       0.0  1:120   (prefill 1.8 s, gen 8.7 s)
+  4         14.40   3.08  81/117         0        22       191       1.0  4:39  mismatches 0/120  (prefill 1.8 s, gen 8.3 s)
+  8         13.16   4.39  95/196         0        30       302       1.5  8:28  mismatches 0/123  (prefill 1.7 s, gen 9.3 s)
+  auto      13.53   2.50    6/12        73        22       196       1.0  1:110 4:4  mismatches 0/120  (prefill 1.7 s, gen 8.9 s)
+
+tool_call (p = 153), load 13.47
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     13.79   0.00       -        73         0         0       0.0  1:120   (prefill 2.5 s, gen 8.7 s)
+  4          9.64   2.07  62/174         0        23       191       1.1  4:58  mismatches 0/120  (prefill 2.4 s, gen 12.4 s)
+  8          8.13   2.55  73/329         0        29       283       1.3  8:47  mismatches 0/120  (prefill 2.4 s, gen 14.8 s)
+  auto      13.77   2.33     4/9        71        23       191       1.2  1:113 4:3  mismatches 0/120  (prefill 2.4 s, gen 8.7 s)
+
+chat_code (p = 44), load 12.62
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     14.17   0.00       -        71         0         0       0.0  1:120   (prefill 0.9 s, gen 8.5 s)
+  4         14.19   2.98  81/123         0        21       187       1.0  4:41  mismatches 0/122  (prefill 0.9 s, gen 8.6 s)
+  8         11.75   3.81  90/224         0        30       293       1.6  8:32  mismatches 0/122  (prefill 0.9 s, gen 10.4 s)
+  auto      14.04   3.25   45/76        69        24       212       1.1  1:55 4:16 8:4  mismatches 0/120  (prefill 0.9 s, gen 8.5 s)
+
+reasoning (p = 80), load 12.32
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     13.67   0.00       -        73         0         0       0.0  1:120   (prefill 1.4 s, gen 8.8 s)
+  4         12.08   2.52  73/144         0        22       186       1.2  4:48  mismatches 0/121  (prefill 1.4 s, gen 10.0 s)
+  8          9.57   2.95  80/287         0        29       277       1.5  8:41  mismatches 0/121  (prefill 1.4 s, gen 12.6 s)
+  auto      14.00   2.00     3/9        70        21       180       1.2  1:114 4:3  mismatches 0/120  (prefill 1.4 s, gen 8.6 s)
+
+chat_answer (p = 34), load 12.27
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     14.18   0.00       -        71         0         0       0.0  1:120   (prefill 0.8 s, gen 8.5 s)
+  4         10.18   2.10  64/174         0        22       183       1.3  4:58  mismatches 0/122  (prefill 0.7 s, gen 12.0 s)
+  8          7.11   2.24  68/385         0        30       283       1.6  8:55  mismatches 0/123  (prefill 0.7 s, gen 17.3 s)
+  auto      13.85   2.00     3/9        71        21       177       1.5  1:114 4:3  mismatches 0/120  (prefill 0.7 s, gen 8.7 s)
+
+prose_continuation (p = 74), load 12.19
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     13.99   0.00       -        71         0         0       0.0  1:120   (prefill 1.3 s, gen 8.6 s)
+  4          7.22   1.50  40/240         0        22       184       1.4  4:80  mismatches 0/120  (prefill 1.3 s, gen 16.6 s)
+  8          4.70   1.50  40/560         0        30       288       1.4  8:80  mismatches 0/120  (prefill 1.3 s, gen 25.5 s)
+  auto      13.76   1.00     0/6        71        21       168       1.3  1:118 4:2  mismatches 0/120  (prefill 1.2 s, gen 8.7 s)
+
+chat_email (p = 36), load 12.21
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     14.05   0.00       -        71         0         0       0.0  1:120   (prefill 0.8 s, gen 8.5 s)
+  4         11.12   2.37  71/156         0        22       190       1.3  4:52  mismatches 0/123  (prefill 0.7 s, gen 11.1 s)
+  8          8.26   2.65  76/322         0        30       290       1.6  8:46  mismatches 0/122  (prefill 0.8 s, gen 14.8 s)
+  auto      13.48   1.00     0/6        72        22       191       1.4  1:118 4:2  mismatches 0/120  (prefill 0.8 s, gen 8.9 s)
+
+long_context_qa (p = 715), load 12.20
+  mode      tok/s      L  accept  plain ms  draft ms verify ms accept ms  T hist / mismatches vs plain
+  plain     13.60   0.00       -        74         0         0       0.0  1:120   (prefill 10.9 s, gen 8.8 s)
+  4         11.34   2.49  73/147         0        23       196       1.3  4:49  mismatches 0/122  (prefill 10.8 s, gen 10.8 s)
+  8          8.40   2.80  79/308         0        30       301       1.6  8:44  mismatches 0/123  (prefill 11.0 s, gen 14.6 s)
+  auto      13.37   3.00   20/30        75        23       199       1.2  1:90 4:10  mismatches 0/120  (prefill 10.9 s, gen 9.0 s)
+
+pooled over 8 prompts (n = 120 each), load 12.04:
+  mode      tok/s      L  accept mismatches
+  plain     13.90   0.00       - 0
+  4         10.80   2.39 545/1275 0
+  8          8.16   2.86 601/2611 0
+  auto      13.72   2.14  81/157 0
+=== spec done 2026-11-22T01:28:50Z loadavg 12.04 11.84 11.11
+DONE

@@ -95,6 +95,21 @@ def stops_from_body(body: Dict[str, Any]) -> List[str]:
     return [x for x in s if x]
 
 
+
+def _no_think(effort) -> bool:
+    """True for reasoning_effort "none" / 0 / "0" / 0.0: answer directly, no thinking segment."""
+    if effort is None:
+        return False
+    if isinstance(effort, str):
+        if effort.strip().lower() == "none":
+            return True
+        try:
+            return float(effort) == 0.0
+        except ValueError:
+            return False
+    return isinstance(effort, (int, float)) and not isinstance(effort, bool) and float(effort) == 0.0
+
+
 def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: Optional[InkTokenizer] = None) -> FastAPI:
     cfg = cfg or ServerConfig()
     api_key = cfg.api_key if cfg.api_key is not None else os.environ.get("INK_API_KEY", "")
@@ -298,6 +313,12 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
         if forced:  # forced function call: prefill the call header, the model continues with the arguments
             prefix = '<|message_model|>%s<|content_invoke_tool_json|>{"name":%s,"args":' % (forced, json.dumps(forced))
             prefix_ids = tok.encode(prefix, parse_special=True)
+            prompt_ids = prompt_ids + prefix_ids
+        elif _no_think(effort) and not tools:
+            # reasoning_effort "none" (or 0): skip the thinking message entirely by prefilling the answer header. The model's own
+            # effort 0 still thinks for ~150 tokens, which eats small budgets (editor titles, Tab). Only without tools: a forced text
+            # header would stop the model from opening with a tool call.
+            prefix_ids = tok.encode("<|message_model|><|content_text|>", parse_special=True)
             prompt_ids = prompt_ids + prefix_ids
         max_tokens = clamp_max_tokens(body, len(prompt_ids), cfg.default_max_tokens)
         loop = asyncio.get_running_loop()

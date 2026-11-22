@@ -244,3 +244,17 @@ acceptance 80-86 %) and still gained nothing, because a T=4 verify costs 3.8 pla
 token counts exactly (46, 36), step 3 diverged (1456 vs 1351 tokens) once the context passed ~1000 tokens: the fast verify kernel is bit-exact only below
 768 keys (S2), so beyond that a greedy argmax can flip. For strict plain == speculative identity at any length start the server with `INK_SPEC_EXACT=1`
 (decode-kernel attention in the verify; its cost on this host is not measured).
+
+
+## 12. Reasoning effort defaults for editor clients (orchestrator, 2026-11-22)
+
+The model always opens with a thinking message unless told otherwise; its own effort 0 still thinks for ~150 tokens, so a 40-token
+request (Caret/Cursor chat titles, Tab) returned an empty body. Two server changes:
+- `--default-reasoning-effort <v>` (env `INK_DEFAULT_EFFORT`): effort applied when the request carries no `reasoning_effort`
+  (editors send one only when their Thinking toggle is on). `tools/serve.sh` sets `none`.
+- `reasoning_effort: "none"` (or 0) without tools now prefills `<|message_model|><|content_text|>` so no thinking segment is generated
+  at all (title request: 1.1 s, 0 reasoning tokens). With tools declared the prefix is not used (it would stop the model from opening
+  with a tool call) and effort 0 = short thinking (~40 tokens) applies instead.
+Measured on a Caret agent turn: 7,215-token prompt (system prompt + 32 tool schemas), 0 cached tokens -> prefill 120.6 s at 12 threads
+(60 tok/s), 59 output tokens in 5 s; total 125.6 s. The context was raised to 32k (`--ctx 32768`), threads to 16 and the prefill chunk
+to 512 for this deployment; follow-up turns reuse the slot's prefix cache (`cached_tokens` in `usage`) if the client resends the same prefix.

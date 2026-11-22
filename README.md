@@ -36,7 +36,7 @@ curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
     -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"Say hi."}],"max_tokens":64,"temperature":0}'
 ```
 One pool thread per physical core (`INK_CPUS` = even CPU ids on this box; core 0 is slow). Two engine processes must never share CPUs (spin barriers convoy).
-Steady RSS ~17 GB (+0.4 GB drafter), peak ~34 GB during load. `docs/SERVING.md` has limits, TTFT, slot/KV memory and the agent-task results.
+Steady RSS ~17 GB (+0.4 GB drafter), peak ~34 GB during load. `tools/serve.sh start|stop|status|logs` runs it as a managed localhost-only process (SSH tunnel from a laptop: `ssh -N -L 8000:127.0.0.1:8000 <vm>`); `--default-reasoning-effort none` answers without thinking when a client sends no `reasoning_effort` (editor titles/Tab). `docs/SERVING.md` has limits, TTFT, slot/KV memory and the agent-task results.
 
 ## Validate
 ```

@@ -16,6 +16,10 @@ alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 case "${1:-status}" in
   start)
     if alive; then echo "already running (pid $(cat "$PIDF"))"; exit 0; fi
+    if [ ! -s "$MODEL" ] || { [ "${INK_SPEC:-auto}" != "off" ] && [ ! -s "$DRAFTER" ]; }; then
+      if [ "${INK_NO_DOWNLOAD:-0}" = "1" ]; then echo "model files missing and INK_NO_DOWNLOAD=1 (see tools/get_model.sh)"; exit 1; fi
+      echo "model files missing: downloading with tools/get_model.sh (17.6 GB + 0.4 GB, resumable)"; tools/get_model.sh || exit 1
+    fi
     echo "starting on 127.0.0.1:$PORT, $THREADS threads on CPUs $INK_CPUS, log $LOG"
     nohup setsid "$PY" -m server --backend ink --model "$MODEL" --lib "$LIB" --drafter "$DRAFTER" --spec "${INK_SPEC:-auto}" \
         --threads "$THREADS" --slots "${INK_SLOTS:-2}" --ctx "${INK_CTX:-65536}" --prefill-chunk "${INK_PREFILL_CHUNK:-512}" --default-reasoning-effort "${INK_DEFAULT_EFFORT:-none}" --host 127.0.0.1 --port "$PORT" \

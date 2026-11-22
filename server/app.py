@@ -99,17 +99,9 @@ def stops_from_body(body: Dict[str, Any]) -> List[str]:
 
 
 def _no_think(effort) -> bool:
-    """True for reasoning_effort "none" / 0 / "0" / 0.0: answer directly, no thinking segment."""
-    if effort is None:
-        return False
-    if isinstance(effort, str):
-        if effort.strip().lower() == "none":
-            return True
-        try:
-            return float(effort) == 0.0
-        except ValueError:
-            return False
-    return isinstance(effort, (int, float)) and not isinstance(effort, bool) and float(effort) == 0.0
+    """True only for reasoning_effort "none": answer directly, no thinking segment. Numeric 0 keeps the template's own
+    semantics (effort level 0 = the model's shortest thinking, still ~100+ tokens), so clients and tests that send 0 get reasoning."""
+    return isinstance(effort, str) and effort.strip().lower() == "none"
 
 
 def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: Optional[InkTokenizer] = None) -> FastAPI:

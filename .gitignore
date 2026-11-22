@@ -13,3 +13,4 @@ server/__pycache__/
 build-*.log
 build-*.cfg.log
 docs/GO_RUN
+run/

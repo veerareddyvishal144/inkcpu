@@ -20,7 +20,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 from . import chat_template as ct
-from .backends import Backend
+from .backends import Backend, InkBackend
 from .metrics import Metrics, RequestLog
 from .sampling import SamplingParams
 from .scheduler import Finish, GenRequest, QueueFull, Scheduler
@@ -112,6 +112,7 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
                "queue_ms": round(fin.queue_s * 1e3, 1), "prefill_ms": round(fin.prefill_s * 1e3, 1),
                "decode_ms": round(fin.decode_s * 1e3, 1), "engine_decode_ms": round(fin.decode_engine_s * 1e3, 1),
                "sample_ms": round(fin.sample_s * 1e3, 1), "spec_steps": fin.spec_steps or None,
+               "spec_drafted": fin.spec_drafted or None, "spec_accepted": fin.spec_accepted or None, "spec_mode": fin.spec_mode,
                "ttft_ms": round(fin.ttft_s * 1e3, 1),
                "total_ms": round(fin.total_s * 1e3, 1),
                "decode_tps": round(fin.completion_tokens / fin.decode_s, 2) if fin.decode_s > 0 and fin.completion_tokens > 1 else None,
@@ -184,9 +185,13 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
                "predicted_n": fin.completion_tokens, "predicted_ms": round(fin.decode_s * 1e3, 1),
                "predicted_per_second": round(fin.completion_tokens / fin.decode_s, 2) if fin.decode_s > 0 else None,
                "engine_ms": round(fin.decode_engine_s * 1e3, 1), "sample_ms": round(fin.sample_s * 1e3, 1),
-               "ttft_ms": round(fin.ttft_s * 1e3, 1)}
+               "ttft_ms": round(fin.ttft_s * 1e3, 1), "total_ms": round(fin.total_s * 1e3, 1)}
         if fin.spec_steps:
-            out.update(spec_steps=fin.spec_steps, spec_drafted=fin.spec_drafted, spec_accepted=fin.spec_accepted)
+            out.update(spec_steps=fin.spec_steps, spec_drafted=fin.spec_drafted, spec_accepted=fin.spec_accepted,
+                       spec_tokens_per_step=round(fin.spec_emitted / fin.spec_steps, 3),
+                       spec_accept_rate=round(fin.spec_accepted / fin.spec_drafted, 3) if fin.spec_drafted else None,
+                       spec_mode=fin.spec_mode, spec_synced=fin.spec_synced,
+                       spec_t_hist={str(k): v for k, v in sorted(fin.spec_t_hist.items())})
         return out
 
     def make_gen(request: Request, body: Dict[str, Any], prompt_ids: List[int], max_tokens: int, mode: str, stream: bool,
@@ -199,13 +204,19 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
             except RuntimeError:
                 pass
         sp = sampling_from_body(body)
+        try:
+            spec_mode = InkBackend.parse_spec_mode(body.get("speculation"))     # non-standard: "auto" | "off" | 2..8 (verify width)
+        except ValueError as e:
+            raise ApiError(400, str(e), param="speculation")
+        if body.get("logit_bias"):                                             # not applied by any path today; never speculate on it
+            spec_mode = 0
         meta = {"endpoint": endpoint, "model": body.get("model") or cfg.served_name, "stream": stream,
                 "client": request.client.host if request.client else None, "n_tools": len(body.get("tools") or [])}
         if cfg.log_bodies:
             meta["body"] = body
         return GenRequest(id=("chatcmpl-" if mode == "chat" else "cmpl-") + uuid.uuid4().hex[:24], prompt_ids=prompt_ids,
                           sampling=sp, max_tokens=max_tokens, sink=sink, mode=mode, stop=stops_from_body(body),
-                          meta=meta, **kw)
+                          meta=meta, spec_mode=spec_mode, **kw)
 
     def clamp_max_tokens(body: Dict[str, Any], n_prompt: int, default: int) -> int:
         mt = body.get("max_completion_tokens", body.get("max_tokens"))

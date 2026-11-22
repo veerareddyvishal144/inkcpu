@@ -17,7 +17,10 @@ SPECULATIVE STEPS (backends with supports_spec, e.g. MockSpecBackend today, agen
   processed by the engine). Every following scheduler step hands the anchor to backend.spec_step(), which samples inside the
   engine and returns >= 1 emitted tokens plus `fed`, the tokens the engine really appended to the slot. The last emitted token is
   the next anchor. Tokens after a stop token / a stop string / the max_tokens limit are dropped; the slot history is `fed`
-  (engine truth, cross-checked with slot_pos), never the emitted list. Requests with penalties use the plain path.
+  (engine truth, cross-checked with slot_pos), never the emitted list. Requests with penalties / logit_bias use the plain path, and so
+  does any request whose effective mode is 0 (`speculation: "off"`, or the engine default is off and the request names none).
+  Sampled requests: the first anchor comes from backend.sample(logits, seed) and every step returns `next_seed` for the following
+  one, so a request is one deterministic chain inside the engine (reproducible per seed).
 
 THREADING
   ONE engine thread owns the backend (load, prefill, step, slot calls; the C ABI is single-thread). It round-robins between
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import collections
 import math
+import os
 import threading
 import time
 import traceback
@@ -38,7 +42,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .backends import Backend, BackendError, SpecRequest
+from .backends import Backend, BackendError, SpecRequest, derive_fed
 from .parser import Event, ParsedMessage, StopMatcher, StreamParser
 from .sampling import Sampler, SamplingParams
 from .tokenizer import InkTokenizer
@@ -121,6 +125,7 @@ class GenRequest:
     parser_prefix_ids: List[int] = field(default_factory=list)  # forced tokens already inside prompt_ids, fed to the parser
     skip_special: bool = True                            # raw mode: hide special tokens in the text
     stop_after_tool: bool = False                        # forced tool_choice: the turn ends when the forced call is closed
+    spec_mode: Optional[int] = None                      # `speculation` request field: None = server default, 0 off, 1 auto, 2..8 fixed width
     cancel: threading.Event = field(default_factory=threading.Event)
     created: float = field(default_factory=time.monotonic)
     meta: Dict[str, Any] = field(default_factory=dict)
@@ -146,6 +151,10 @@ class Finish:
     spec_steps: int = 0                 # speculative steps (0 = plain decode)
     spec_drafted: int = 0
     spec_accepted: int = 0
+    spec_emitted: int = 0               # tokens emitted by speculative steps (the first anchor is sampled outside a step)
+    spec_mode: Optional[int] = None     # mode passed to the engine (-1 = engine default) when the speculative path was used
+    spec_synced: Optional[bool] = None  # ink_spec_synced of the slot at the first speculative step (None: plain path)
+    spec_t_hist: Dict[int, int] = field(default_factory=dict)   # verify width -> number of steps
 
 
 class Sequence:
@@ -174,8 +183,15 @@ class Sequence:
         self.t_engine_dec = 0.0
         self.token_ids: List[int] = []
         self.anchor: Optional[int] = None                 # emitted but not yet processed by the engine (speculative path)
-        self.use_spec = bool(sched.spec_enabled and sched.backend.supports_spec and not req.sampling.has_penalties)
-        self.spec_steps = self.spec_drafted = self.spec_accepted = 0
+        be = sched.backend
+        eff = req.spec_mode if req.spec_mode is not None else getattr(be, "spec_default_mode", 1)
+        self.spec_mode = req.spec_mode if req.spec_mode is not None else -1       # -1: let the engine apply its default
+        self.use_spec = bool(sched.spec_enabled and be.supports_spec and not req.sampling.has_penalties and eff != 0)
+        self.spec_steps = self.spec_drafted = self.spec_accepted = self.spec_emitted = 0
+        self.spec_synced: Optional[bool] = None
+        self.spec_t_hist: Dict[int, int] = {}
+        seed = req.sampling.seed
+        self.spec_seed = (int(seed) if seed is not None else int.from_bytes(os.urandom(8), "little")) & 0xFFFFFFFFFFFFFFFF
         self._content: List[str] = []
         self._reasoning: List[str] = []
         if self.parser is not None and req.parser_prefix_ids:  # forced tokens (e.g. tool_choice) are part of the output
@@ -204,7 +220,10 @@ class Sequence:
         try:
             if self.anchor is None:                       # a token is sampled from the logits (plain decode / first token)
                 ts = time.perf_counter()
-                tok = self.sampler.sample(self.logits)
+                if self.use_spec:                         # the engine's sampler (ink_sample): first link of the request's seed chain
+                    tok, self.spec_seed = be.sample(self.logits, self._spec_request(), self.spec_seed)
+                else:
+                    tok = self.sampler.sample(self.logits)
                 self.sampler.accept(tok)
                 self.t_sample += time.perf_counter() - ts
                 if self.t_first is None:
@@ -224,15 +243,23 @@ class Sequence:
         finally:
             self.t_decode += time.monotonic() - t0
 
-    def _spec_step(self, be: Backend) -> bool:
-        sp, slot = self.req.sampling, self.slot
+    def _spec_request(self) -> SpecRequest:
+        sp = self.req.sampling
         remaining = self.req.max_tokens - self.n_completion          # >= 1: _on_token ends the request at max_tokens
-        sreq = SpecRequest(temperature=sp.temperature, top_k=sp.top_k, top_p=sp.top_p, min_p=sp.min_p, seed=sp.seed,
-                           stop_ids=tuple(self.sched.tokenizer.stop_ids), max_emit=max(1, remaining))
+        return SpecRequest(temperature=sp.temperature, top_k=sp.top_k, top_p=sp.top_p, min_p=sp.min_p, seed=self.spec_seed,
+                           stop_ids=tuple(self.sched.tokenizer.stop_ids), max_emit=max(1, min(8, remaining)), mode=self.spec_mode)
+
+    def _spec_step(self, be: Backend) -> bool:
+        slot = self.slot
+        sreq = self._spec_request()
+        if self.spec_synced is None and hasattr(be, "spec_synced"):
+            self.spec_synced = bool(be.spec_synced(slot.id))         # diagnostics: an unsynced slot runs plain steps until it is reset
         te = time.perf_counter()
         res = be.spec_step(slot.id, self.anchor, sreq)
         self.t_engine_dec += time.perf_counter() - te
-        slot.tokens.extend(res.fed)                                   # the slot history is what the engine really processed
+        self.spec_seed = int(res.next_seed) & 0xFFFFFFFFFFFFFFFF
+        fed = res.fed if res.fed is not None else derive_fed(self.anchor, res.tokens, sreq.stop_ids)
+        slot.tokens.extend(fed)                                       # the slot history is what the engine really processed
         slot.last_logits = res.logits
         if be.slot_pos(slot.id) != len(slot.tokens):
             raise BackendError("slot %d history out of sync: engine holds %d tokens, server expects %d"
@@ -242,6 +269,8 @@ class Sequence:
         self.spec_steps += 1
         self.spec_drafted += res.drafted
         self.spec_accepted += res.accepted
+        self.spec_emitted += len(res.tokens)
+        self.spec_t_hist[res.t_used] = self.spec_t_hist.get(res.t_used, 0) + 1
         for tok in res.tokens:
             self.sampler.accept(tok)
             if self._on_token(tok):
@@ -318,7 +347,8 @@ class Sequence:
         return Finish(fr, pm, len(self.req.prompt_ids), self.n_completion, self.n_reused, self.reasoning_tokens,
                       self.t_start - self.req.created, self.t_prefill, self.t_decode, now - self.req.created, t_first,
                       list(pm.errors) + ([self.error] if self.error else []), self.t_engine_dec, self.t_sample,
-                      list(self.token_ids), self.spec_steps, self.spec_drafted, self.spec_accepted)
+                      list(self.token_ids), self.spec_steps, self.spec_drafted, self.spec_accepted, self.spec_emitted,
+                      self.spec_mode if self.spec_steps else None, self.spec_synced, dict(self.spec_t_hist))
 
 
 class Scheduler:

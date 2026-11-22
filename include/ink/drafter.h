@@ -37,6 +37,9 @@ struct DrafterProfile {         // accumulated by draft(); times in milliseconds
     uint64_t calls[P_COUNT] = {};
     uint64_t drafts = 0, drafted_tokens = 0;
     double total_ms = 0;        // wall time of the pool run inside draft()
+    // S1 addition 2026-11-22: analytical traffic (weights + KV + fold streamed, MB = 1e6 B) and MACs (1e9) per phase, so the report shows GB/s and GMAC/s
+    double mb[P_COUNT] = {};
+    double gmac[P_COUNT] = {};
     static const char* name(int p);
 };
 

@@ -34,7 +34,18 @@ int engine_prefill(Engine& e, int slot, const int32_t* tokens, int n, float* log
 // Same, but logits_all receives n_vocab floats for EVERY token (row t at logits_all + t * n_vocab; perplexity tooling). 200 MB per 256 tokens.
 int engine_prefill_all(Engine& e, int slot, const int32_t* tokens, int n, float* logits_all);
 
+// ---- speculative-decoding verify (docs/SPEC_DESIGN.md). T <= kVerifyMaxRows rows [anchor, d_1 .. d_{T-1}] at positions p .. p+T-1 through the batched executor (own small scratch,
+// separate from the prefill chunk scratch). logits_all = [T][n_vocab] (required), taps = [T][kEngineTapFloats] or nullptr. Attention: exact != 0 (or exact < 0 and env INK_SPEC_EXACT=1)
+// runs the decode attention kernels per row (logits bit-identical to Engine::decode at ANY length); otherwise the fast kernel (bit-identical up to 767 visible keys, rounding-level
+// different above, one KV read for all rows). The slot is left at p + T with the conv-input record kept; the caller MUST then call engine_verify_commit(keep) with keep = the number of
+// rows that stay (1..T): the slot state becomes exactly "the first `keep` rows were processed" (S.pos = p + keep, conv histories rebuilt from the record, KV rows beyond are dead).
+// Returns 0, or negative: -1 bad slot, -2 context full, -3 bad token, -4 bad T, -6 SWA ring too small, -8 previous verify not committed, -9 no logits buffer.
+int engine_verify(Engine& e, int slot, const int32_t* tokens, int T, float* logits_all, float* taps, int exact = -1);
+int engine_verify_commit(Engine& e, int slot, int keep);   // 0, or -7 (no pending verify for this slot), -4 (bad keep)
+
 // Per-phase profile (thread 0 rdtsc between barriers; enabled when e.prof_on or env INK_PF_PROFILE=1).
+void engine_verify_profile_reset(Engine& e);
+void engine_verify_profile_report(Engine& e, FILE* f);
 void engine_prefill_profile_reset(Engine& e);
 void engine_prefill_profile_report(Engine& e, FILE* f);
 // Releases the scratch of an engine (optional: normally lives as long as the process).

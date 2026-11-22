@@ -17,6 +17,7 @@
 #include <ctime>
 #include <memory>
 #include <mutex>
+#include <map>
 #include <unordered_map>
 
 #include "ink/engine_prefill.h"
@@ -110,6 +111,13 @@ struct PfScratch {
     };
     CpuAcc cpu[kMaxTh];
     int n_used_experts = 0;                   // experts with >= 1 pair in the current visit (profile bytes)
+    int kind = 0;                             // 0 = prefill scratch (chunk rows), 1 = verify scratch (<= kVerifyMaxRows rows)
+    float* taps_mem = nullptr;                // prefill tap-sink buffer [taps_rows][kEngineTapFloats] (allocated on demand when a sink is set)
+    size_t taps_rows = 0;
+    float* rec_mem = nullptr;                 // verify: conv-input record [48 visits][rows + 3][6656] (allocated on first verify)
+    size_t rec_floats = 0;
+    int pend_slot = -1, pend_T = 0;           // verify awaiting engine_verify_commit
+    int64_t pend_pos0 = 0;
     MoeRoute route;
     std::vector<MoeItem> items_gu, items_dn;
     std::vector<PItem> items_proj[2];         // [0] SWA layers, [1] global layers
@@ -117,6 +125,8 @@ struct PfScratch {
     ~PfScratch() {
         if (arena) free_weight_buffer(arena);
         std::free(ctr);
+        std::free(taps_mem);
+        std::free(rec_mem);
     }
 };
 
@@ -192,7 +202,7 @@ void carve(PfScratch& X, Carver& A, int cap) {
 
 // ------------------------------------------------------------------------------------------------ registry / tunables
 std::mutex g_mu;
-std::unordered_map<const Engine*, std::unique_ptr<PfScratch>> g_scr;
+std::map<std::pair<const Engine*, int>, std::unique_ptr<PfScratch>> g_scr;
 
 int env_int(const char* n, int d) {
     const char* v = std::getenv(n);
@@ -213,17 +223,18 @@ PrefillTune make_tune() {
     return t;
 }
 
-PfScratch* find_scratch(const Engine& e) {
+PfScratch* find_scratch(const Engine& e, int kind = 0) {
     std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_scr.find(&e);
+    auto it = g_scr.find({&e, kind});
     return it == g_scr.end() ? nullptr : it->second.get();
 }
 
-PfScratch& get_scratch(const Engine& e, int cap) {
+PfScratch& get_scratch(const Engine& e, int cap, int kind = 0) {
     std::lock_guard<std::mutex> lk(g_mu);
-    auto& up = g_scr[&e];
+    auto& up = g_scr[{&e, kind}];
     if (!up) up.reset(new PfScratch());
     PfScratch& X = *up;
+    X.kind = kind;
     if (X.cap < cap || !X.arena) {
         if (X.arena) free_weight_buffer(X.arena);
         Carver probe{0};
@@ -256,6 +267,10 @@ struct PCtx {
     const int32_t* tokens;
     float* logits;       // logits of the last token (n_vocab floats) or nullptr
     float* logits_all;   // [n][n_vocab] or nullptr
+    float* taps;         // [n][kEngineTapFloats] DSpark taps of the chunk rows, or nullptr
+    float* rec;          // verify only: conv-input record of this call ([visit][rows + 3][6656]), or nullptr
+    size_t rec_visit;    // floats per visit in `rec`
+    bool verify;         // small-n verify mode: attention items (kv group x token) and a separate quantise phase
     bool prof;
     uint64_t last;
 };
@@ -356,6 +371,19 @@ inline void gemm_lp_tg(int type, const void* w, size_t rs, const float* x, size_
     }
 }
 
+inline int tap_index(int visit_index) {   // 0..2 for the visits whose entering stream is a DSpark tap, else -1
+    for (int k = 0; k < 3; ++k)
+        if (visit_index == kTapVisit[k]) return k;
+    return -1;
+}
+
+// verify: record the inputs of one short conv for the channel range [c0, c1): rec = [rows + 3][C]; rows 0..2 = the history BEFORE this call, rows 3.. = the
+// n inputs (so the history after k rows is rec rows [k, k + 3), contiguous = the SoA hist layout). Must run before sconv_seq updates the history.
+inline void rec_conv(float* rec, const float* hist, const float* x, size_t n, size_t C, size_t c0, size_t c1) {
+    for (size_t i = 0; i < 3; ++i) std::memcpy(rec + i * C + c0, hist + i * C + c0, (c1 - c0) * sizeof(float));
+    for (size_t t = 0; t < n; ++t) std::memcpy(rec + (3 + t) * C + c0, x + t * C + c0, (c1 - c0) * sizeof(float));
+}
+
 inline float* off_floats(float* base, int64_t nf) { return (float*)((uintptr_t)base + (uintptr_t)(nf * (int64_t)sizeof(float))); }
 
 // ------------------------------------------------------------------------------------------------ loop controllers (batched)
@@ -414,6 +442,15 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     KvLayer& kv = S.kv[vis.index];
     const bool nv = L.expert_type == T_NVFP4;
     const int efmt = nv ? GEMM_FMT_NVFP4 : GEMM_FMT_Q8;
+    const int tapk = c.taps ? tap_index(vis.index) : -1;
+    float *rec_k = nullptr, *rec_v = nullptr, *rec_a = nullptr, *rec_f = nullptr;   // verify: conv-input records of this visit
+    if (c.rec) {
+        const size_t R = (size_t)n + 3;
+        rec_k = c.rec + (size_t)vis.index * c.rec_visit;
+        rec_v = rec_k + R * kKVW;
+        rec_a = rec_v + R * kKVW;
+        rec_f = rec_a + R * kD;
+    }
 
     // ---------------------------------------------------------------- A: attention-input mix, [gate input of the controllers | norms + Q8_0 + bf16 + pack]
     const float* in_raw[3] = {cur, cur, cur};
@@ -441,6 +478,7 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     };
     dyn_range(c, t, n, tok, [&](int64_t b, int64_t e) {
         for (int64_t tt = b; tt < e; ++tt) {
+            if (tapk >= 0) std::memcpy(c.taps + (size_t)tt * kEngineTapFloats + (size_t)tapk * kD, cur + tt * kD, kD * sizeof(float));   // DSpark tap (cur is read-only here)
             if (msgs) {
                 const float* ms[2] = {X.bank_b + tt * kD, X.bank_out + tt * kD};
                 float* mo[4] = {X.msgs[0] + tt * kD, X.msgs[1] + tt * kD, X.msgs[2] + tt * kD, X.msgs[3] + tt * kD};
@@ -517,6 +555,10 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     {
         dyn_items(c, t, kNKvHeads, [&](int64_t g) {
             const size_t c0 = (size_t)g * kHeadDim, c1 = c0 + kHeadDim;
+            if (rec_k) {
+                rec_conv(rec_k, h_k, X.kp, (size_t)n, kKVW, c0, c1);
+                rec_conv(rec_v, h_v, X.vp, (size_t)n, kKVW, c0, c1);
+            }
             sconv_seq(X.kp, h_k, L.kconv, X.kc, (size_t)n, kKVW, c0, c1, swa ? nullptr : X.kdyn, kHeadDim);
             sconv_seq(X.vp, h_v, L.vconv, X.vc, (size_t)n, kKVW, c0, c1, swa ? nullptr : X.vdyn, kHeadDim);
             for (int tt = 0; tt < n; ++tt) {
@@ -534,7 +576,35 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     }
 
     // ---------------------------------------------------------------- C2: attention per token range (all 8 groups), Q8_0 quantise + pack of the output
-    {
+    if (c.verify) {
+        // small n (<= 8 rows): one item per (kv group [, row]) so that all threads work; quantise + pack in a token-parallel phase afterwards
+        const bool dk = c.tu.attn_decode_kernels != 0;
+        const AttnPrefill P{X.q, X.rel, X.sink, X.gate, swa ? nullptr : X.tau, c.pos0, n};
+        const int split_keys = std::max(1, E.tune.split_keys);
+        const int per_g = dk ? n : 1;
+        dyn_items(c, t, (int64_t)kNKvHeads * per_g, [&](int64_t i) {
+            const int g = (int)(i / per_g);
+            if (!dk) {
+                attn_prefill_group(kv, L.rel_table, P, g, 0, n, X.ao);
+            } else {
+                const int tt = (int)(i % per_g);
+                const int64_t pos = c.pos0 + tt;
+                const int64_t n_keys = swa ? std::min<int64_t>(pos + 1, kSwaWindow) : pos + 1;
+                const int nsplit = (int)std::min<int64_t>(kMaxSplit, std::max<int64_t>(1, n_keys / split_keys));
+                const AttnQuery aq{X.q + (size_t)tt * kQW, X.rel + (size_t)tt * kRelW, X.sink + (size_t)tt * kNQHeads, X.gate + (size_t)tt * kQW,
+                                   pos, swa ? 1.0f : X.tau[tt]};
+                AttnPartial parts[kMaxSplit];
+                for (int s2 = 0; s2 < nsplit; ++s2) attn_decode_task(kv, L.rel_table, aq, g, s2, nsplit, &parts[s2]);
+                attn_decode_finish(aq, g, parts, nsplit, X.ao + (size_t)tt * kQW);
+            }
+        });
+        PBAR(PF_ATTN, 0, 0);
+        dyn_range(c, t, n, 1, [&](int64_t b, int64_t e) {
+            for (int64_t tt = b; tt < e; ++tt) quantize_q8_0(X.ao + (size_t)tt * kQW, X.aoq + (size_t)tt * kQWB, kQW, Q8Mode::X86);
+            gemm_pack_act(GEMM_FMT_Q8, X.aoq, (int)b, (int)e, n, kQW, X.act_wo);
+        });
+        PBAR(PF_ATTN, 0, 0);
+    } else {
         const int TQ = std::max(1, c.tu.attn_tq);
         const int nitems = (n + TQ - 1) / TQ;
         const AttnPrefill P{X.q, X.rel, X.sink, X.gate, swa ? nullptr : X.tau, c.pos0, n};
@@ -571,6 +641,7 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
         dyn_range(c, t, kD, chunk, [&](int64_t b, int64_t e) {
             gemm_q8_0((const char*)L.wo.w + (size_t)b * L.wo.rs, L.wo.rs, awo, 0, n, kQW, X.wo_out + b, kD, (int)(e - b));
             float* y = block_start ? nxt : X.attn_out;
+            if (rec_a) rec_conv(rec_a, h_a, X.wo_out, (size_t)n, kD, (size_t)b, (size_t)e);
             sconv_seq(X.wo_out, h_a, L.aconv, y, (size_t)n, kD, (size_t)b, (size_t)e);
             if (!block_start)
                 for (int tt = 0; tt < n; ++tt) vadd(cur + (size_t)tt * kD + b, X.attn_out + (size_t)tt * kD + b, nxt + (size_t)tt * kD + b, (size_t)(e - b));
@@ -716,6 +787,7 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
                     _mm512_storeu_ps(mo + c0, acc);
                 }
             }
+            if (rec_f) rec_conv(rec_f, h_f, X.moe_out, (size_t)n, kD, (size_t)b, (size_t)e);
             sconv_seq(X.moe_out, h_f, L.fconv, X.moe_conv, (size_t)n, kD, (size_t)b, (size_t)e);
             for (int tt = 0; tt < n; ++tt)
                 vadd(nxt + (size_t)tt * kD + b, X.moe_conv + (size_t)tt * kD + b, nxt + (size_t)tt * kD + b, (size_t)(e - b));
@@ -770,10 +842,11 @@ void chunk_body(PCtx& c, PTh& t) {
         visit(c, t, vis, cur, nxt, nb);
     }
     const bool all = c.logits_all != nullptr;
-    if (!c.logits && !all) return;
+    const bool want_taps = c.taps != nullptr;
+    if (!c.logits && !all && !want_taps) return;
     const int nv = cfg.n_vocab;
     const Mat& H = E.lm_head;
-    const int t_first = all ? 0 : n - 1;   // tokens that need logits: [t_first, n)
+    const int t_first = (all || want_taps) ? 0 : n - 1;   // rows that need the final normalised hidden state: [t_first, n)
     dyn_range(c, t, n - t_first, 1, [&](int64_t b, int64_t) {
         const int64_t tt = t_first + b;
         const float* st[8];
@@ -783,11 +856,15 @@ void chunk_body(PCtx& c, PTh& t) {
         float* mo[1] = {X.fin_mix + tt * kD};
         depth_mix(st, ns, E.out_res_query, 1, mo, kD, kMixScale);
         rmsnorm(X.fin_mix + tt * kD, E.out_norm, X.fin_x + tt * kD, kD, cfg.rms_eps);
-        quantize_q8_0(X.fin_x + tt * kD, X.fin_q + (size_t)tt * kQB, kD, Q8Mode::X86);
-        if (all) gemm_pack_act(GEMM_FMT_Q8, X.fin_q, (int)tt, (int)tt + 1, n, kD, X.act_fin);
+        if (want_taps) std::memcpy(c.taps + (size_t)tt * kEngineTapFloats + 3 * (size_t)kD, X.fin_x + tt * kD, kD * sizeof(float));
+        if (all || (c.logits && tt == n - 1)) {
+            quantize_q8_0(X.fin_x + tt * kD, X.fin_q + (size_t)tt * kQB, kD, Q8Mode::X86);
+            if (all) gemm_pack_act(GEMM_FMT_Q8, X.fin_q, (int)tt, (int)tt + 1, n, kD, X.act_fin);
+        }
     });
     PBAR(PF_FINAL, 0, 0);
     if (!all) {
+        if (!c.logits) return;   // taps only (non-final prefill chunk): no lm head
         dyn_guided(c, t, H.rows, 512, 64, [&](int64_t b, int64_t e) {
             gemv_q8_0((const char*)H.w + (size_t)b * H.rs, H.rs, X.fin_q + (size_t)(n - 1) * kQB, kD, c.logits + b, (int)(e - b));
             vsoftcap(c.logits + b, c.logits + b, (size_t)(e - b), cfg.final_logit_softcap);
@@ -844,6 +921,14 @@ int chunk_limit(const Engine& E, const SlotState& S, int want) {
     return (int)std::max<int64_t>(1, std::min<int64_t>(want, ring - (kSwaWindow - 1)));
 }
 
+void pin_calling_thread(const Engine& E) {   // the calling thread acts as tid 0: pin it
+    const std::vector<int> cpus = E.opt.cpus.empty() ? engine_default_cpus(E.opt.n_threads) : E.opt.cpus;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpus[0], &set);
+    pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
 int prefill_impl(Engine& E, int slot, const int32_t* tokens, int n, float* logits_last, float* logits_all) {
     if (n < 1) return -4;
     if (slot < 0 || slot >= (int)E.slots.size() || !E.slots[slot].used) return -1;
@@ -857,12 +942,15 @@ int prefill_impl(Engine& E, int slot, const int32_t* tokens, int n, float* logit
     PfScratch& X = get_scratch(E, want_chunk);
     if (gt.gemm_group > 0) g_gemm_group = gt.gemm_group;
     build_proj_items(E, gt, X.items_proj);
-    {   // the calling thread acts as tid 0: pin it
-        const std::vector<int> cpus = E.opt.cpus.empty() ? engine_default_cpus(E.opt.n_threads) : E.opt.cpus;
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(cpus[0], &set);
-        pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+    pin_calling_thread(E);
+    float* taps_buf = nullptr;   // tap sink: rows of the current chunk
+    if (E.tap_sink) {
+        if (X.taps_rows < (size_t)X.cap) {
+            std::free(X.taps_mem);
+            X.taps_mem = (float*)std::aligned_alloc(64, ((size_t)X.cap * kEngineTapFloats * sizeof(float) + 63) / 64 * 64);
+            X.taps_rows = (size_t)X.cap;
+        }
+        taps_buf = X.taps_mem;
     }
     const int nv = E.cfg.n_vocab;
     for (int off = 0; off < n;) {
@@ -879,10 +967,14 @@ int prefill_impl(Engine& E, int slot, const int32_t* tokens, int n, float* logit
         c.tokens = tokens + off;
         c.logits = (last && !logits_all) ? logits_last : nullptr;
         c.logits_all = logits_all ? logits_all + (size_t)off * nv : nullptr;
+        c.taps = taps_buf;
+        c.rec = nullptr;
+        c.rec_visit = 0;
+        c.verify = false;
         c.prof = E.prof_on || env_int("INK_PF_PROFILE", 0) != 0;
         c.last = 0;
         for (int v = 0; v < kVisits; ++v)
-            if (!S.kv[v].ring) S.kv[v].n_blocks = (uint32_t)((S.pos + m - 1) / kKvBlock + 1);
+            if (!S.kv[v].ring) S.kv[v].n_blocks = std::max<uint32_t>(S.kv[v].n_blocks, (uint32_t)((S.pos + m - 1) / kKvBlock + 1));
         for (int tt = 0; tt < m; ++tt) X.tau[tt] = tau_of(E.cfg, S.pos + tt);
         const auto t0 = std::chrono::steady_clock::now();
         E.pool->run([&](int tid, int nth) {
@@ -902,11 +994,19 @@ int prefill_impl(Engine& E, int slot, const int32_t* tokens, int n, float* logit
             X.prof.chunks++;
             X.prof.total_ticks += (uint64_t)(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() * E.prof.tsc_per_us);
         }
+        if (E.tap_sink) E.tap_sink(slot, S.pos, m, taps_buf);   // before S.pos advances: first_pos = S.pos
         S.pos += m;
         off += m;
     }
     return 0;
 }
+
+bool verify_exact_default() {
+    static const bool v = env_int("INK_SPEC_EXACT", 0) != 0;
+    return v;
+}
+
+void profile_report_impl(Engine& e, FILE* f, int kind);
 
 }  // namespace
 
@@ -923,12 +1023,104 @@ int engine_prefill_all(Engine& e, int slot, const int32_t* tokens, int n, float*
     return prefill_impl(e, slot, tokens, n, nullptr, logits_all);
 }
 
-void engine_prefill_profile_reset(Engine& e) {
-    if (PfScratch* X = find_scratch(e)) X->prof = PfProfile();
+// ------------------------------------------------------------------------------------------------ speculative verify
+// T rows [anchor, d_1 .. d_{T-1}] at positions p .. p+T-1 through the batched executor with the verify scratch (8 rows, a few MB), logits of EVERY row and (optionally) the
+// 4 taps of every row. The slot is left at p + T with the conv-input record kept; engine_verify_commit(keep) then moves it to exactly "the first `keep` rows were processed".
+int engine_verify(Engine& E, int slot, const int32_t* tokens, int T, float* logits_all, float* taps, int exact) {
+    if (T < 1 || T > kVerifyMaxRows) return -4;
+    if (slot < 0 || slot >= (int)E.slots.size() || !E.slots[slot].used) return -1;
+    SlotState& S = E.slots[slot];
+    if (S.pos + T > E.opt.max_ctx) return -2;
+    for (int i = 0; i < T; ++i)
+        if (tokens[i] < 0 || tokens[i] >= E.cfg.n_vocab_padded) return -3;
+    if (E.pool->size() > kMaxTh) return -5;
+    if (!logits_all) return -9;
+    if (chunk_limit(E, S, T) < T) return -6;   // SWA ring too small for an atomic T-row step (only with INK_SWA_BLOCKS < 16)
+    PfScratch& X = get_scratch(E, kVerifyMaxRows, 1);
+    if (X.pend_slot >= 0) return -8;           // previous verify not committed
+    PrefillTune gt = prefill_tune();
+    gt.attn_decode_kernels = (exact < 0 ? verify_exact_default() : exact != 0) ? 1 : 0;
+    build_proj_items(E, gt, X.items_proj);
+    pin_calling_thread(E);
+    const size_t rec_visit = (size_t)(T + 3) * (2 * kKVW + 2 * kD);
+    if (X.rec_floats < (size_t)kVisits * (kVerifyMaxRows + 3) * (2 * kKVW + 2 * kD)) {
+        std::free(X.rec_mem);
+        X.rec_floats = (size_t)kVisits * (kVerifyMaxRows + 3) * (2 * kKVW + 2 * kD);
+        X.rec_mem = (float*)std::aligned_alloc(64, (X.rec_floats * sizeof(float) + 63) / 64 * 64);
+    }
+    PCtx c;
+    c.E = &E;
+    c.X = &X;
+    c.S = &S;
+    c.pool = E.pool.get();
+    c.tu = gt;
+    c.pos0 = S.pos;
+    c.n = T;
+    c.tokens = tokens;
+    c.logits = nullptr;
+    c.logits_all = logits_all;
+    c.taps = taps;
+    c.rec = X.rec_mem;
+    c.rec_visit = rec_visit;
+    c.verify = true;
+    c.prof = E.prof_on || env_int("INK_PF_PROFILE", 0) != 0;
+    c.last = 0;
+    for (int v = 0; v < kVisits; ++v)
+        if (!S.kv[v].ring) S.kv[v].n_blocks = std::max<uint32_t>(S.kv[v].n_blocks, (uint32_t)((S.pos + T - 1) / kKvBlock + 1));
+    for (int tt = 0; tt < T; ++tt) X.tau[tt] = tau_of(E.cfg, S.pos + tt);
+    const auto t0 = std::chrono::steady_clock::now();
+    E.pool->run([&](int tid, int nth) {
+        PTh t{tid, nth, 0};
+        chunk_body(c, t);
+        if (tid == 0) X.used_phases = t.phase;
+    });
+    if (X.used_phases >= kMaxPh) std::abort();
+    for (int i = 0; i < X.used_phases; ++i) X.ctr[i].v.store(0, std::memory_order_relaxed);
+    if (c.prof) {
+        for (int th = 0; th < E.pool->size(); ++th)
+            for (int p = 0; p < PF_COUNT; ++p) {
+                X.prof.cpu_ns[p] += X.cpu[th].ns[p];
+                X.cpu[th].ns[p] = 0;
+            }
+        X.prof.tokens += (uint64_t)T;
+        X.prof.chunks++;
+        X.prof.total_ticks += (uint64_t)(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() * E.prof.tsc_per_us);
+    }
+    X.pend_slot = slot;
+    X.pend_T = T;
+    X.pend_pos0 = S.pos;
+    S.pos += T;
+    return 0;
 }
 
-void engine_prefill_profile_report(Engine& e, FILE* f) {
-    PfScratch* X = find_scratch(e);
+int engine_verify_commit(Engine& E, int slot, int keep) {
+    PfScratch* X = find_scratch(E, 1);
+    if (!X || X->pend_slot < 0 || X->pend_slot != slot) return -7;
+    const int T = X->pend_T;
+    if (keep < 1 || keep > T) return -4;
+    SlotState& S = E.slots[slot];
+    if (keep < T) {   // history after `keep` rows = rows [keep, keep + 3) of each record (rows 0..2 = the history before the verify)
+        const size_t R = (size_t)T + 3, rec_visit = R * (2 * kKVW + 2 * kD);
+        for (int v = 0; v < kVisits; ++v) {
+            float* hist = S.hist + (size_t)v * kHistPerVisit;
+            const float* rk = X->rec_mem + (size_t)v * rec_visit;
+            const float* rv = rk + R * kKVW;
+            const float* ra = rv + R * kKVW;
+            const float* rf = ra + R * kD;
+            std::memcpy(hist, rk + (size_t)keep * kKVW, 3 * kKVW * sizeof(float));
+            std::memcpy(hist + 3 * kKVW, rv + (size_t)keep * kKVW, 3 * kKVW * sizeof(float));
+            std::memcpy(hist + 6 * kKVW, ra + (size_t)keep * kD, 3 * kD * sizeof(float));
+            std::memcpy(hist + 6 * kKVW + 3 * kD, rf + (size_t)keep * kD, 3 * kD * sizeof(float));
+        }
+    }
+    S.pos = X->pend_pos0 + keep;   // KV rows beyond are junk: global rows > pos are never read, SWA ring cells they overwrote were out of every later window
+    X->pend_slot = -1;
+    return 0;
+}
+
+namespace {
+void profile_report_impl(Engine& e, FILE* f, int kind) {
+    PfScratch* X = find_scratch(e, kind);
     if (!X || !X->prof.tokens) {
         std::fprintf(f, "prefill profile: nothing recorded (set INK_PF_PROFILE=1)\n");
         return;
@@ -937,8 +1129,8 @@ void engine_prefill_profile_report(Engine& e, FILE* f) {
     const double tpu = e.prof.tsc_per_us;
     double sum = 0;
     for (int p = 0; p < PF_COUNT; ++p) sum += (double)P.ticks[p];
-    std::fprintf(f, "prefill profile over %llu tokens in %llu chunks (thread 0 rdtsc, phase = time between barrier completions; includes straggler wait)\n",
-                 (unsigned long long)P.tokens, (unsigned long long)P.chunks);
+    std::fprintf(f, "%s profile over %llu tokens in %llu chunks (thread 0 rdtsc, phase = time between barrier completions; includes straggler wait)\n",
+                 kind ? "verify" : "prefill", (unsigned long long)P.tokens, (unsigned long long)P.chunks);
     const int nth = e.pool->size();
     double cpu_sum = 0;
     for (int p = 0; p < PF_COUNT; ++p) cpu_sum += P.cpu_ns[p];
@@ -958,10 +1150,21 @@ void engine_prefill_profile_report(Engine& e, FILE* f) {
     std::fprintf(f, "busy-time bound: mean busy CPU time per thread %.3f ms/token over %d threads = %.1f tok/s if no thread were ever preempted/waiting (barrier cost excluded)\n",
                  cpu_sum / 1e6 / nth / nt, nth, 1e9 / (cpu_sum / nth / nt));
 }
+}  // namespace
+
+void engine_prefill_profile_reset(Engine& e) {
+    if (PfScratch* X = find_scratch(e, 0)) X->prof = PfProfile();
+}
+void engine_prefill_profile_report(Engine& e, FILE* f) { profile_report_impl(e, f, 0); }
+void engine_verify_profile_reset(Engine& e) {
+    if (PfScratch* X = find_scratch(e, 1)) X->prof = PfProfile();
+}
+void engine_verify_profile_report(Engine& e, FILE* f) { profile_report_impl(e, f, 1); }
 
 void engine_prefill_release(Engine& e) {
     std::lock_guard<std::mutex> lk(g_mu);
-    g_scr.erase(&e);
+    g_scr.erase({&e, 0});
+    g_scr.erase({&e, 1});
 }
 
 }  // namespace ink

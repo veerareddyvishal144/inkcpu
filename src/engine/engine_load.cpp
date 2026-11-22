@@ -315,6 +315,10 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
             const size_t i = next.fetch_add(1, std::memory_order_relaxed);
             if (i >= pieces.size()) break;
             std::memcpy(pieces[i].dst, pieces[i].src, pieces[i].n);
+            // drop the copied source pages right away (whole pages inside the piece; the edges go with the file-wide call below), so the mapping and the arena never
+            // coexist in full: peak RSS ~ arena + one piece per thread instead of 2x the weights (docs/requests.md, V item 2)
+            const uintptr_t a = ((uintptr_t)pieces[i].src + 4095) & ~(uintptr_t)4095, b = ((uintptr_t)pieces[i].src + pieces[i].n) & ~(uintptr_t)4095;
+            if (b > a) madvise((void*)a, (size_t)(b - a), MADV_DONTNEED);
         }
     });
     // the page cache keeps the file; drop this process's page-table references to it (only token_embd rows are read later)

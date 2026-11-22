@@ -49,6 +49,7 @@ struct Scratch {
     alignas(64) float fin_mix[kD];
     alignas(64) float fin_x[kD];
     alignas(64) block_q8_0 fin_q[kD / 32];
+    alignas(64) float taps[kEngineTapFloats];   // taps of the last token (written only when a tap sink / tap capture is requested)
     int used_phases = 0;                      // dynamic-scheduling counters used by the previous token (reset only those)
 };
 

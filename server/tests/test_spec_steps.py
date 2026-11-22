@@ -5,11 +5,13 @@ import threading
 
 import httpx
 
+import os
+
 import helpers
 from helpers import LiveServer, tok
 
 from server.app import ServerConfig, create_app
-from server.backends import BackendError, MockBackend, MockSpecBackend, StepResult
+from server.backends import BackendError, MockBackend, MockSpecBackend, StepResult, derive_fed
 from server.sampling import SamplingParams
 from server.scheduler import GenRequest, Scheduler
 
@@ -144,6 +146,33 @@ def test_requests_with_penalties_never_use_the_speculative_path():
         s.shutdown()
 
 
+def test_derive_fed_follows_the_spec_contract():
+    assert derive_fed(5, [6], (9,)) == [5]                    # one token emitted: only the anchor was processed (plain decode)
+    assert derive_fed(5, [6, 7, 8], (9,)) == [5, 6, 7]        # the last emitted token is the next anchor, not fed
+    assert derive_fed(5, [6, 9], (9,)) == [5, 6]              # stop token: never fed
+    assert derive_fed(5, [9], (9,)) == [5]
+    assert derive_fed(5, [6, 9, 7, 8], (9,)) == [5, 6]        # tokens after the stop token are not fed either
+
+
+class _NoFed(MockSpecBackend):
+    """An ABI that reports only the emitted tokens (like ink_spec_step's result): the server derives the fed list itself."""
+    def spec_step(self, slot, anchor, req):
+        r = super().spec_step(slot, anchor, req)
+        return StepResult(r.tokens[:len(r.tokens) - self.overshoot] if self.overshoot else r.tokens, None, None, r.drafted, r.accepted)
+
+
+def test_backend_without_a_fed_list_is_handled_with_derive_fed():
+    ref, ref_hist = _plain()
+    be = _NoFed(n_slots=1, max_ctx=4096, responder=lambda p: SCRIPT, emit_pattern=(1, 4, 2, 3))
+    s = _sched(be)
+    try:
+        it = _run(s)
+        assert it[0] == "done" and it[1].token_ids == ref.token_ids and _histories(s)[0] == ref_hist
+        assert be.slot_pos(0) == len(ref_hist)
+    finally:
+        s.shutdown()
+
+
 class _Liar(MockSpecBackend):
     def spec_step(self, slot, anchor, req):
         r = super().spec_step(slot, anchor, req)
@@ -197,3 +226,48 @@ def test_http_chat_with_a_multitoken_backend_matches_plain_decode():
 
 if __name__ == "__main__":
     raise SystemExit(helpers.run_module(globals()))
+
+
+def test_ink_spec_abi_probe_and_result_conversion():
+    """The ctypes side of include/ink/ink_abi.h's spec section: struct sizes of the C layout (x86-64), a library without the symbols is
+    reported and leaves supports_spec False, a library with them binds; a result struct converts to a StepResult whose `fed` is the
+    engine's list (anchor + accepted tokens) and inconsistent results are errors."""
+    import ctypes
+    import glob
+    from server.backends import InkBackend, BackendError
+    assert ctypes.sizeof(InkBackend.SamplingParamsC) == 16 and ctypes.sizeof(InkBackend.SpecRequestC) == 48 and ctypes.sizeof(InkBackend.SpecResultC) == 136
+    assert [f[0] for f in InkBackend.SpecRequestC._fields_] == ["anchor", "mode", "sp", "seed", "stop_ids", "n_stop", "max_emit"]
+    assert [f[0] for f in InkBackend.SpecResultC._fields_] == ["tokens", "n_tokens", "stopped", "fed", "n_fed", "T", "drafted", "accepted", "rc",
+                                                                "draft_us", "verify_us", "accept_us", "total_us", "next_seed"]
+    assert InkBackend._bind_spec(ctypes.CDLL(None)) == "library has no ink_spec_load"
+    libs = [p for p in InkBackend.candidate_paths() if os.path.exists(p)] + glob.glob(os.path.join(helpers.ENGINE, "build*", "src", "capi", "libink.so"))
+    for p in libs[:3]:
+        lib = ctypes.CDLL(p)
+        assert (InkBackend._bind_spec(lib) is None) == hasattr(lib, "ink_spec_step"), p
+    for v, want in ((None, None), ("auto", 1), ("off", 0), ("OFF", 0), (4, 4), ("8", 8), (True, 1), (False, 0)):
+        assert InkBackend.parse_spec_mode(v) == want, v
+    for bad in ("fast", 9, 1.5, -1, [4]):
+        try:
+            InkBackend.parse_spec_mode(bad)
+            assert False, bad
+        except ValueError:
+            pass
+    r = InkBackend.SpecResultC()
+    for i, t in enumerate((11, 12, 13, 200006)):
+        r.tokens[i] = t
+    for i, t in enumerate((5, 11, 12, 13)):
+        r.fed[i] = t
+    r.n_tokens, r.n_fed, r.stopped, r.drafted, r.accepted, r.T, r.next_seed = 4, 4, 1, 7, 3, 8, 99
+    st = InkBackend._result_to_step(r, 5)
+    assert st.tokens == [11, 12, 13, 200006] and st.fed == [5, 11, 12, 13] and st.accepted == 3 and st.t_used == 8 and st.stopped and st.next_seed == 99
+    assert st.fed == derive_fed(5, st.tokens, [200006])
+    r.n_tokens, r.n_fed, r.stopped = 3, 3, 0                   # no stop: the last emitted token is the next anchor (not fed)
+    st = InkBackend._result_to_step(r, 5)
+    assert st.tokens == [11, 12, 13] and st.fed == [5, 11, 12] == derive_fed(5, st.tokens, [200006]) and not st.stopped
+    for n_fed, fed0 in ((5, 5), (3, 6)):                       # n_fed > n_tokens / fed[0] != anchor
+        r.n_fed, r.fed[0] = n_fed, fed0
+        try:
+            InkBackend._result_to_step(r, 5)
+            assert False, "inconsistent result must be an error"
+        except BackendError:
+            pass

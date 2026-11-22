@@ -34,6 +34,13 @@ constexpr int kSwaRingBlocks = 32;                // SWA KV ring: 32 blocks = 20
 constexpr int kMaxBlocks = 5;                     // attention-residual block states kept (4 pushed + cur)
 // conv histories per visit, SoA [3][C] each, order: K (1024), V (1024), wo-out (2304), moe-out (2304)
 constexpr size_t kHistPerVisit = 3 * (2 * (size_t)kKVW + 2 * (size_t)kD);
+// ---- DSpark taps (docs/DSPARK.md 4.1, docs/SPEC_DESIGN.md): per processed row 4 vectors of 2304 floats, layout [tap][2304], F32:
+// tap 0/1/2 = the residual stream `cur` ENTERING visit 5 / 23 / 41 (running partial sum of the current attention-residual block, before any depth mix),
+// tap 3 = the final normalised hidden state (output depth mix + output_norm), the input of the lm_head quantiser.
+constexpr int kEngineTaps = 4;
+constexpr int kEngineTapFloats = kEngineTaps * kD;
+constexpr int kTapVisit[3] = {5, 23, 41};
+constexpr int kVerifyMaxRows = 8;                 // widest verify step (T = anchor + 7 drafts)
 
 struct EngineOptions {
     int n_threads = 12;
@@ -174,6 +181,14 @@ public:
     EngineProfile prof;
     bool prof_on = false;
     TraceFn trace;
+
+    // ---- tap sink (speculative decoding). Null = off: the executors then do no tap work at all (a pointer test).
+    // Called after every token processed by decode() (rows = 1) and after every chunk of a batched prefill (rows <= chunk); `taps` = [rows][kEngineTapFloats],
+    // valid only during the call; first_pos = position of the first row (the slot position BEFORE the call). Never called by engine_verify (the caller
+    // commits the rows it keeps).
+    using TapSink = std::function<void(int slot, int64_t first_pos, int rows, const float* taps)>;
+    TapSink tap_sink;
+    const float* last_taps() const;                  // taps of the last decode() token (valid when tap_sink was set)
 
 private:
     Engine() = default;

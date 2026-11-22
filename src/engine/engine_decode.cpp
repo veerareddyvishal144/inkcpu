@@ -35,6 +35,7 @@ struct Ctx {
     float tau;
     int32_t token;
     float* logits;
+    float* taps;        // [kEngineTapFloats] or nullptr: DSpark taps of this token (decode executor: written by tid 0)
     bool prof;
     uint64_t last;
 };
@@ -158,6 +159,9 @@ void visit(Ctx& c, Th& t, const Visit& vis, int& ci, int& nb) {
     const bool block_start = (vis.phys % cfg.attn_res_block_size) == 0;
 
     // ---------------------------------------------------------------- A: attention-input mix, norms (serial on tid 0)
+    if (c.taps && tid == 0)   // DSpark tap: the stream entering visit 5 / 23 / 41 (read-only here; `cur` is not written before phase E)
+        for (int k = 0; k < 3; ++k)
+            if (vis.index == kTapVisit[k]) std::memcpy(c.taps + (size_t)k * kD, cur, kD * sizeof(float));
     const float* in_raw[3] = {cur, cur, cur};
     if (L.attn_res_query)
         for (int j = 0; j < 3; ++j) in_raw[j] = X.mix[swa ? 0 : j];
@@ -442,7 +446,7 @@ void token_body(Ctx& c, Th& t) {
         }
         visit(c, t, vis, ci, nb);
     }
-    if (!c.logits) return;
+    if (!c.logits && !c.taps) return;
     {
         float* cur = X.cur[ci];
         if (tid == 0) {
@@ -453,8 +457,10 @@ void token_body(Ctx& c, Th& t) {
             float* mo[1] = {X.fin_mix};
             depth_mix(st, ns, E.out_res_query, 1, mo, kD, kMixScale);
             rmsnorm(X.fin_mix, E.out_norm, X.fin_x, kD, cfg.rms_eps);
-            quantize_q8_0(X.fin_x, X.fin_q, kD, Q8Mode::X86);
+            if (c.taps) std::memcpy(c.taps + 3 * (size_t)kD, X.fin_x, kD * sizeof(float));
+            if (c.logits) quantize_q8_0(X.fin_x, X.fin_q, kD, Q8Mode::X86);
         }
+        if (!c.logits) return;   // taps only: the lm head is skipped (uniform over threads)
         BAR(PH_FINAL, 0);
         const Mat& H = E.lm_head;
         dyn(c, t, H.rows, E.tune.chunk_lm, std::max(16, E.tune.chunk_lm / 8), [&](int64_t b, int64_t e) {
@@ -486,6 +492,7 @@ void Engine::run_token(SlotState& S, int32_t token, float* logits) {
     c.pos = S.pos;
     c.token = token;
     c.logits = logits;
+    c.taps = tap_sink ? scr_->taps : nullptr;
     c.prof = prof_on;
     c.last = 0;
     {   // tau = 1 + alpha * log(max(1, (pos+1)/floor)) with the float operation order of the ggml graph
@@ -495,7 +502,7 @@ void Engine::run_token(SlotState& S, int32_t token, float* logits) {
         c.tau = std::log(tt) * cfg.log_scale_alpha + 1.0f;
     }
     for (int v = 0; v < kVisits; ++v)
-        if (!S.kv[v].ring) S.kv[v].n_blocks = (uint32_t)(S.pos / kKvBlock + 1);
+        if (!S.kv[v].ring) S.kv[v].n_blocks = std::max<uint32_t>(S.kv[v].n_blocks, (uint32_t)(S.pos / kKvBlock + 1));   // grow-only: junk rows of a rolled-back verify stay tracked
     const int used = scr_->used_phases > 0 ? std::min(scr_->used_phases, kMaxPhases) : kMaxPhases;
     for (int i = 0; i < used; ++i) ctr_[i].v.store(0, std::memory_order_relaxed);
     pool->run([&](int tid, int nth) {
@@ -513,9 +520,12 @@ int Engine::decode(int slot, int32_t token, float* logits) {
     if (S.pos >= opt.max_ctx) return -2;
     if (token < 0 || token >= cfg.n_vocab_padded) return -3;
     run_token(S, token, logits);
+    if (tap_sink) tap_sink(slot, S.pos, 1, scr_->taps);
     S.pos++;
     return 0;
 }
+
+const float* Engine::last_taps() const { return scr_->taps; }
 
 int Engine::forward(int slot, const int32_t* tokens, int n, float* logits_last) {
     if (n < 1) return -4;

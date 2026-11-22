@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ink/drafter.h"
@@ -106,8 +107,19 @@ struct StateData {
     bool have_rnn = false;
 };
 
+struct ChunkRes {                     // per chain chunk (CH_ROWS vocabulary rows): greedy: best value / index; sampled: chunk max (of logit/T), sum of exp(x - max)
+    float val;
+    int32_t idx;
+    float sum;
+    float pad;
+};
+// Inverse-CDF draw from the chunked unnormalised probabilities (qrow[v] = exp(x_v - chunk max)); deterministic in (seed, j). Returns the token; M / Z = global max / normaliser.
+int32_t sample_select(const ChunkRes* cres, int nchunks, const float* qrow, int nv, uint64_t seed, int j, double* M_out, double* Z_out);
+
 struct Debug {                        // captured by thread 0 of the next draft() when on (tests)
     bool on = false;
+    bool force_on = false;            // teacher forcing: the chain feeds back force[j-1] instead of its own choice
+    int32_t force[8] = {};
     std::vector<float> x[NL];         // X[8][D] after each layer
     std::vector<float> hid;           // hidf[8][D]
     std::vector<float> lat;           // [7][256] latents of the chain

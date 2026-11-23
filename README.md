@@ -1,52 +1,86 @@
-# inkcpu: a CPU-only inference engine for Inkling 2 Mini
+# inkcpu
 
-One model (Thinking Machines' Inkling 2 Mini, 26.4B looped MoE, Unsloth `Q4_K_XL` GGUF), one machine class (x86 with AVX-512 F/BW/DQ/VL, no GPU),
-built to beat a tuned llama.cpp on the same box. Everything is measured against stock llama.cpp on the same GGUF on the same host; the claim is
-"N x faster than tuned llama.cpp on this CPU", nothing broader. Results: `docs/ENGINE.md` (decision log + final numbers).
+Run **Inkling 2 Mini** (Thinking Machines' 26B mixture-of-experts model) on an ordinary x86 server with **no GPU** — 2.5–3.7× faster than llama.cpp on the same machine, with an OpenAI-compatible API you can point your editor or agent at.
 
-## What is here
-| path | what |
-|---|---|
-| `include/ink/`, `src/core/` | GGUF reader, model config, scalar reference forward (`docs/MODEL.md`) |
-| `src/kernels_gemv/`, `src/kernels_gemm/`, `src/kernels_misc/` | AVX-512 kernels: Q8_0 / NVFP4 / BF16 matvec + GEMM (bit-identical to the matvec), attention with learned relative bias, short convs, norms, router (`docs/KERNELS_*.md`) |
-| `src/engine/` | decode executor (one thread-pool run per token, `docs/ENGINE_DESIGN.md`) and batched prefill (`docs/PREFILL_DESIGN.md`); hugepage weight arena |
-| `src/drafter/` | DSpark block drafter for speculative decoding (`docs/DRAFTER.md`, spec in `docs/DSPARK.md`) |
-| `src/spec/` | verify + exact rollback, rejection sampler, adaptive width policy (`docs/SPEC_DESIGN.md`) |
-| `src/capi/` | `libink.so`, the C ABI (`include/ink/ink_abi.h`: `ink_load`, `ink_forward`, `ink_spec_*`, `ink_sample`) |
-| `server/` | OpenAI-compatible server (FastAPI, ctypes over `libink.so`): chat/completions, tools, streaming, slot cache, speculation (`server/README.md`, `docs/SERVING.md`) |
-| `tests/`, `bench/`, `tools/` | gates against llama.cpp oracles, benchmarks, oracle generators, DSpark acceptance study |
-| `docs/status/` | per-agent build logs; `docs/CONTRACT.md` / `docs/SPEC_CONTRACT.md` are the rules the agents worked under |
+One model, one CPU class, built from scratch: GGUF reader, AVX-512 kernels, a decode executor with one thread-pool run per token, batched prefill, DSpark speculative decoding, slot checkpoint/rewind for prompt reuse, and a FastAPI server. Everything is measured against stock llama.cpp on the same GGUF and the same host.
 
-## Build
+## How fast
+
+Xeon Platinum 8171M (16 cores, AVX-512, no VNNI/AMX), 125 GB RAM, no GPU. Same GGUF (Unsloth `Q4_K_XL`, 17.6 GB), idle host, 3 runs.
+
+| | tuned llama.cpp | **inkcpu** | speed-up |
+|---|---|---|---|
+| Generation (decode), 12 threads | 5.5 tok/s | **13.9 tok/s** | 2.5× |
+| Generation, 16 threads | 4.7 tok/s | **14.3 tok/s** | 3.0× |
+| Prompt processing (prefill), 256 tokens, 16 threads | 22 tok/s | **83 tok/s** | 3.7× |
+| Coding-agent task through the API (same 7-test task) | 643 s | **207–291 s** | ~2.5× |
+| Follow-up turn in an editor thread (7k-token re-rendered prompt) | full re-process | **1.8 s** (prefix rewind) | 68× |
+| Memory | 17.6 GB | 17 GB resident (34 GB peak while loading) | |
+
+Outputs match llama.cpp: identical greedy text on the test prompts, next-token log-likelihood within 0.005 nats on 2,400-token real text. Details, per-phase profiles and what limits the speed: [`docs/ENGINE.md`](docs/ENGINE.md).
+
+What a CPU still can't hide: every *new* prompt token costs ~12–15 ms, so a 10k-token tool result takes ~2 minutes to read. Repeated prefixes (system prompts, conversation history) are nearly free thanks to the slot cache and rewind.
+
+## Requirements
+
+- Linux x86-64 with **AVX-512 F/BW/DQ/VL** (Skylake-SP / Cascade Lake or newer; AMD Zen 4 also qualifies). No GPU needed.
+- 40 GB RAM free to load (17 GB steady), 20 GB disk for the model files.
+- GCC 11+, CMake 3.20+, Ninja; Python 3.10+.
+
+## Install
+
+```bash
+git clone https://github.com/veerareddyvishal144/inkcpu.git && cd inkcpu
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build ink
+python3 -m venv .venv && .venv/bin/pip install -r server/requirements.txt
 ```
-export PATH=/usr/bin:/bin:$PATH      # system gcc + binutils (Homebrew's toolchain mislinks libgomp)
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-ninja -C build ink test_engine test_prefill bench_decode bench_prefill bench_spec
-```
-Flags are `-O3 -march=skylake-avx512` (no VNNI/BF16/AMX: this host faults on them).
-
-## Get the model
-`tools/get_model.sh` downloads the two GGUFs (17.6 GB target + 402 MB drafter) from Hugging Face into `/data/inkling-mini/models` (resumable, skips present files, `HF_TOKEN` optional); `tools/serve.sh start` calls it automatically when they are missing (`INK_NO_DOWNLOAD=1` to forbid). The tokenizer/template files are fetched by the server on first run. The engine loads both GGUF layouts Unsloth has published: the interim `inkling2_loop` (what we validated against llama.cpp) and the canonical `inkling2` (what the repo serves now); the weights are byte-identical and `test_engine crosscheck <other.gguf>` proves bit-identical logits between the two (`docs/ENGINE.md`, GGUF layouts). llama.cpp itself cannot load the canonical file at the time of writing, so the oracle tools keep using the interim one.
 
 ## Run
-```
-PY=/data/engine/.venv/bin/python
-MODEL=/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf
-DRAFTER=/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf
-INK_CPUS=2,4,6,8,10,12,14,16,18,20,22,24 $PY -m server --backend ink --model $MODEL --lib build/src/capi/libink.so \
-    --threads 12 --slots 2 --ctx 8192 --drafter $DRAFTER --spec auto --port 8000
-curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
-    -d '{"model":"inkling-2-mini","messages":[{"role":"user","content":"Say hi."}],"max_tokens":64,"temperature":0}'
-```
-One pool thread per physical core (`INK_CPUS` = even CPU ids on this box; core 0 is slow). Two engine processes must never share CPUs (spin barriers convoy).
-Steady RSS ~17 GB (+0.4 GB drafter), peak ~34 GB during load. `tools/serve.sh start|stop|status|logs` runs it as a managed localhost-only process (SSH tunnel from a laptop: `ssh -N -L 8000:127.0.0.1:8000 <vm>`); `--default-reasoning-effort none` answers without thinking when a client sends no `reasoning_effort` (editor titles/Tab). `docs/SERVING.md` has limits, TTFT, slot/KV memory and the agent-task results.
 
-## Validate
+```bash
+tools/serve.sh start        # first run downloads the model (17.6 GB) + drafter (0.4 GB) from Hugging Face, then serves on 127.0.0.1:8000
+tools/serve.sh status       # health, memory
+tools/serve.sh logs
+tools/serve.sh stop
 ```
-INK_THREADS=12 build/src/engine/test_engine oracle|greedy|determinism      # vs llama.cpp oracles in tools/oracle
-INK_THREADS=12 build/src/engine/test_prefill quick|nll <dir>                # prefill == decode bit for bit; NLL parity on wikitext-2
-INK_THREADS=12 build/src/spec/test_spec all                                 # greedy speculation == plain decode, token for token and state for state
-$PY server/tests/run_all.py                                                 # 64 server tests (mock); INK_GGUF+INK_LIB(+INK_DRAFTER) enable the real-engine tests
+Set `HF_TOKEN` before the first start to avoid Hugging Face's unauthenticated-download throttling. Tunables are environment variables (`INK_THREADS`, `INK_CTX`, `INK_SLOTS`, `INK_SPEC`, `INK_MODEL_DIR`, …) — see the header of [`tools/serve.sh`](tools/serve.sh).
+
+Ask it something:
+```bash
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
+  "model": "inkling-2-mini", "max_tokens": 400, "temperature": 0, "reasoning_effort": "low",
+  "messages": [{"role":"user","content":"Write a Python function that parses ISO-8601 dates."}]
+}'
+```
+The model thinks before answering (`reasoning_content`); `reasoning_effort` takes `none | minimal | low | medium | high` or a number 0–0.99. Requests that omit it get `none` (direct answer) by default — change with `INK_DEFAULT_EFFORT`.
+
+**From your laptop:** the server listens on localhost only. Tunnel it: `ssh -N -L 8000:127.0.0.1:8000 user@server`, then use `http://localhost:8000/v1` in any OpenAI-compatible client (Cursor, Caret, Continue, aider, the OpenAI SDK — model id `inkling-2-mini`). Tools, streaming, `reasoning_content`, prefix caching and `/metrics` are supported; embeddings, vision and logprobs are not.
+
+## Verify
+
+```bash
+ninja -C build test_engine test_prefill test_spec
+INK_THREADS=12 build/src/engine/test_engine oracle          # logits vs llama.cpp on the bundled oracle prompts
+INK_THREADS=12 build/src/engine/test_prefill quick          # batched prefill == token-by-token decode, bit for bit
+INK_THREADS=12 build/src/spec/test_spec quick               # speculative decoding == plain decoding, token for token
+.venv/bin/python server/tests/run_all.py                    # 72 server tests (no model needed)
 tools/with_bench_lock.sh build/src/engine/bench_decode --threads 12,16 --ctx 16,1000 --n 64 --reps 3
 ```
-Numerics: parity with llama.cpp is gated on argmax / top-10 / NLL within 0.01 nats, not on tight cosine (quantisation flips are the noise floor, `docs/ENGINE.md`).
+
+## Layout
+
+| path | what |
+|---|---|
+| `src/kernels_*` | AVX-512 kernels: Q8_0 / NVFP4 / BF16 matvec and GEMM, attention with learned relative bias, short convolutions, norms, router |
+| `src/engine` | decode executor, batched prefill, slot checkpoints and rewind, hugepage weight arena |
+| `src/drafter`, `src/spec` | DSpark block drafter; verify, exact rollback, rejection sampler, adaptive speculation policy |
+| `src/capi` | `libink.so` — the C ABI (`include/ink/ink_abi.h`) |
+| `server/` | OpenAI-compatible server (FastAPI + ctypes) |
+| `tests/`, `bench/`, `tools/` | gates against llama.cpp oracles, benchmarks, model download, serve script |
+| `docs/` | design notes and measurements: `ENGINE.md` (results + decision log), `MODEL.md` (the forward pass), `KERNELS_*.md`, `PREFILL_DESIGN.md`, `DSPARK.md`, `SPEC_DESIGN.md`, `REWIND.md`, `SERVING.md`; `docs/status/` has the build log of every agent that worked on it |
+
+Both GGUF layouts Unsloth has published for this model load (`inkling2_loop` and the canonical `inkling2`; identical weights, verified bit-identical logits). The model is Apache-2.0 (Thinking Machines); quantised files by Unsloth.
+
+## Limits
+
+Single-box personal server: one engine, ~14 tok/s total, two concurrent conversations by default. Speculative decoding is on in `auto` mode but barely pays on this CPU (it needs VNNI/AMX to win); it never costs more than ~4%. Contexts were validated against llama.cpp up to ~2.7k tokens; longer contexts run (tested to 36k) but slow down to ~11 tok/s at 28k.

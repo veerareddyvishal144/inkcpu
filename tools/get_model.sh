@@ -8,7 +8,8 @@
 #   dspark-Inkling-2-Mini-Q8_0.gguf   402 MB  DSpark drafter (speculative decoding; optional: without it run serve.sh with INK_SPEC=off)
 # Optional: HF_TOKEN for authenticated (faster, rate-limit-free) downloads; INK_MODEL_DIR (default /data/inkling-mini/models).
 set -euo pipefail
-DIR=${INK_MODEL_DIR:-/data/inkling-mini/models}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DIR=${INK_MODEL_DIR:-$( [ -d /data/inkling-mini/models ] && echo /data/inkling-mini/models || echo "$ROOT/models" )}
 REPO=https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/main
 FILES="Inkling-2-Mini-UD-Q4_K_XL.gguf dspark-Inkling-2-Mini-Q8_0.gguf"
 CHECK=${1:-}

@@ -5,18 +5,19 @@
 #   INK_CPUS (16 physical cores), INK_SLOTS (2), INK_CTX (65536), INK_PREFILL_CHUNK (512), INK_DEFAULT_EFFORT (none = answer
 #   without thinking when the client sends no reasoning_effort), INK_SPEC (auto|off|4|8), INK_MODEL_DIR (/data/inkling-mini/models),
 #   INK_LIB (build-orch/src/capi/libink.so), INK_NO_DOWNLOAD=1 (fail instead of fetching missing model files), INK_API_KEY (optional bearer key)
-cd /data/inkling-mini/engine || exit 1
-PY=/data/engine/.venv/bin/python
-RUN=/data/inkling-mini/engine/run
+ROOT=$(cd "$(dirname "$0")/.." && pwd); cd "$ROOT" || exit 1
+# python: INK_PY, else the repo venv (.venv), else the dev box venv, else python3 on PATH
+PY=${INK_PY:-$( [ -x "$ROOT/.venv/bin/python" ] && echo "$ROOT/.venv/bin/python" || { [ -x /data/engine/.venv/bin/python ] && echo /data/engine/.venv/bin/python || command -v python3; } )}
+RUN=$ROOT/run
 PORT=${INK_PORT:-8000}
 SFX=""; [ "$PORT" != "8000" ] && SFX="-$PORT"
 PIDF=$RUN/server$SFX.pid; LOG=$RUN/server$SFX.log
 THREADS=${INK_THREADS:-16}
 export INK_CPUS=${INK_CPUS:-2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,0}
-MDIR=${INK_MODEL_DIR:-/data/inkling-mini/models}
+MDIR=${INK_MODEL_DIR:-$( [ -d /data/inkling-mini/models ] && echo /data/inkling-mini/models || echo "$ROOT/models" )}
 MODEL=$MDIR/Inkling-2-Mini-UD-Q4_K_XL.gguf
 DRAFTER=$MDIR/dspark-Inkling-2-Mini-Q8_0.gguf
-LIB=${INK_LIB:-/data/inkling-mini/engine/build-orch/src/capi/libink.so}
+LIB=${INK_LIB:-$( [ -f "$ROOT/build/src/capi/libink.so" ] && echo "$ROOT/build/src/capi/libink.so" || echo "$ROOT/build-orch/src/capi/libink.so" )}
 SPEC=${INK_SPEC:-auto}
 mkdir -p "$RUN"
 alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
@@ -25,7 +26,7 @@ case "${1:-status}" in
     if alive; then echo "already running (pid $(cat "$PIDF"))"; exit 0; fi
     if [ ! -s "$MODEL" ] || { [ "$SPEC" != "off" ] && [ ! -s "$DRAFTER" ]; }; then
       if [ "${INK_NO_DOWNLOAD:-0}" = "1" ]; then echo "model files missing in $MDIR and INK_NO_DOWNLOAD=1 (see tools/get_model.sh)"; exit 1; fi
-      echo "model files missing in $MDIR: downloading with tools/get_model.sh (17.6 GB + 0.4 GB, resumable)"; INK_MODEL_DIR="$MDIR" tools/get_model.sh || exit 1
+      echo "model files missing in $MDIR: downloading with tools/get_model.sh (17.6 GB + 0.4 GB, resumable)"; INK_MODEL_DIR="$MDIR" "$ROOT/tools/get_model.sh" || exit 1
     fi
     DR=(); [ "$SPEC" != "off" ] && DR=(--drafter "$DRAFTER")
     echo "starting on 127.0.0.1:$PORT, $THREADS threads on CPUs $INK_CPUS, model dir $MDIR, log $LOG"

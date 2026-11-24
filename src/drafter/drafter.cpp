@@ -15,6 +15,15 @@
 
 #include "drafter_impl.h"
 
+#include "ink/kernels_gemv_multix.h"
+
+namespace ink {
+namespace {
+// K2 (wave 1): base lm_head pass through gemv_q8_0_multix instead of the batched GEMM (env INK_DRAFTER_MULTIX, default 1; 0 = gemm_q8_0). Bit-identical either way.
+const int g_drafter_multix = [] { const char* e = std::getenv("INK_DRAFTER_MULTIX"); return e && *e ? std::atoi(e) : 1; }();
+}  // namespace
+}  // namespace ink
+
 namespace ink {
 
 const char* DrafterProfile::name(int p) {
@@ -829,7 +838,13 @@ void DrafterImpl::body(Run& R, int tid, int nth) {
                 } else {
                     const int64_t r0 = (u - JO / 16) * 64;
                     const int rows = (int)std::min<int64_t>(64, nv - r0);
-                    gemm_q8_0((const char*)tgt.lm_head.w + (size_t)r0 * tgt.lm_head.rs, tgt.lm_head.rs, a_lm, 1, n + 1, D, Z.base + r0, Z.nvp, rows);
+                    if (g_drafter_multix && n <= kMultixMaxX) {   // K2 (wave 1): small-n multi-activation GEMV, one lm_head stream for the n hidden rows; bit-identical to gemm_q8_0
+                        const block_q8_0* xs[kMultixMaxX];
+                        for (int j = 0; j < n; ++j) xs[j] = Z.q8x + (size_t)(1 + j) * (D / 32);
+                        gemv_q8_0_multix((const char*)tgt.lm_head.w + (size_t)r0 * tgt.lm_head.rs, tgt.lm_head.rs, rows, xs, n, D, Z.base + (size_t)Z.nvp + r0, (size_t)Z.nvp);
+                    } else {
+                        gemm_q8_0((const char*)tgt.lm_head.w + (size_t)r0 * tgt.lm_head.rs, tgt.lm_head.rs, a_lm, 1, n + 1, D, Z.base + r0, Z.nvp, rows);
+                    }
                 }
             }
         });

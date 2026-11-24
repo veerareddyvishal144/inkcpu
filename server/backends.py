@@ -89,6 +89,7 @@ def derive_fed(anchor: int, emitted: Sequence[int], stop_ids: Sequence[int]) -> 
 class Backend:
     name = "base"
     supports_spec = False               # True: spec_step() is implemented (the scheduler may use it for greedy / simple sampling)
+    supports_sample = False             # True: sample() works without spec_step (InkBackend with ink_sample): usable for the plain path (--sampler c)
 
     def __init__(self, n_slots: int, max_ctx: int, n_vocab: int = N_VOCAB):
         self.n_slots, self.max_ctx, self.n_vocab = n_slots, max_ctx, n_vocab
@@ -457,6 +458,12 @@ class InkBackend(Backend):
             lib.ink_slot_checkpoints.restype = c_int
             lib.ink_slot_checkpoints.argtypes = [c_void_p, c_int, ctypes.POINTER(ctypes.c_int64), c_int]
         self._lib = lib
+        # ink_sample (S2's C++ Sampler, same kept set / probabilities as server/sampling.py, counter-based RNG) can also serve the
+        # PLAIN decode path (--sampler c, agent T): bind it whenever the library exports it, independently of the spec symbols.
+        self.supports_sample = hasattr(lib, "ink_sample")
+        if self.supports_sample:
+            lib.ink_sample.restype = ctypes.c_int32
+            lib.ink_sample.argtypes = [c_void_p, self._pf, ctypes.POINTER(self.SamplingParamsC), ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
         if self.timer_slack_us > 0:
             # The pool's idle workers poll with 20 us sleeps (ThreadPool, include/ink/threadpool.h): with the kernel's default 50 us
             # timer slack that is ~30% of one core for an IDLE server (measured). The slack of the creating thread is inherited by

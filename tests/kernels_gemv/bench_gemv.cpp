@@ -4,7 +4,7 @@
 // numbers for a pure streaming-sum kernel that reads exactly the same bytes with the same thread split (upper bound).
 //
 // usage: bench_gemv [--threads 8,12,16] [--shapes substr] [--reps 3] [--time 0.25] [--pool-gb 2.5]
-//                   [--pf bytes] [--hint 0|1|2|3] [--nohuge] [--nostream]
+//                   [--pf bytes] [--hint 0|1|2|3] [--nohuge] [--nostream] [--group 4|8] [--pre 0|1] [--chunk rows] [--rows N --nm M] [--cpus list] [--static]
 #include <immintrin.h>
 
 #include <algorithm>
@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "ink/kernels_gemv.h"
+#include "ink/nvfp4_repack.h"
 #include "ink/threadpool.h"
 #include "testutil.h"
 
@@ -24,8 +25,10 @@ using namespace ink;
 
 static const double kPeakGBs = 92.5;
 static bool g_dynamic = true;            // dynamic chunk scheduling (--static: contiguous equal slices)
+static int g_chunk = 0;                   // --chunk N: rows per dynamic chunk (0 = total/(6*threads) clamped to [16,512]); 32 mimics the engine's expert calls
 static std::vector<int> g_cpus;           // --cpus list (empty = pool default: even CPUs)
-enum { Q8 = 0, NVFP4 = 1, BF16 = 2, F32 = 3 };
+enum { Q8 = 0, NVFP4 = 1, BF16 = 2, F32 = 3, NVFP4R = 4 };   // NVFP4R = re-encoded scales (gemv_multi_nvfp4r, agent K1)
+static inline bool is_q8x(int kind) { return kind == Q8 || kind == NVFP4 || kind == NVFP4R; }
 struct Shape {
     const char* name;
     int kind, k, rows, nm;  // nm = matrices per call (experts), rows = rows per matrix
@@ -39,12 +42,14 @@ static const Shape kShapes[] = {
     {"q8_0 200058x2304 (lm_head)", Q8, 2304, 200058, 1, false},
     {"nvfp4 8x gate_up 2304x2304", NVFP4, 2304, 2304, 8, false},
     {"nvfp4 8x down 2304x1152", NVFP4, 1152, 2304, 8, true},
+    {"nvfp4r 8x gate_up 2304x2304", NVFP4R, 2304, 2304, 8, false},
+    {"nvfp4r 8x down 2304x1152", NVFP4R, 1152, 2304, 8, true},
     {"bf16 3072x2304", BF16, 2304, 3072, 1, false},
     {"f32 2304x2304", F32, 2304, 2304, 1, false},
 };
 
 static size_t row_bytes_of(int kind, int k) {
-    return kind == Q8 ? row_bytes_q8_0(k) : kind == NVFP4 ? row_bytes_nvfp4(k) : kind == BF16 ? row_bytes_bf16(k) : row_bytes_f32(k);
+    return kind == Q8 ? row_bytes_q8_0(k) : (kind == NVFP4 || kind == NVFP4R) ? row_bytes_nvfp4(k) : kind == BF16 ? row_bytes_bf16(k) : row_bytes_f32(k);
 }
 
 static double now_s() {
@@ -52,7 +57,7 @@ static double now_s() {
 }
 
 static void fill_tile(int kind, std::vector<uint8_t>& tile, tu::Rng& rng) {
-    const size_t unit = kind == Q8 ? 34 : kind == NVFP4 ? 36 : 64;
+    const size_t unit = kind == Q8 ? 34 : (kind == NVFP4 || kind == NVFP4R) ? 36 : 64;
     const size_t n = ((size_t)1 << 20) / unit * unit;
     tile.assign(n, 0);
     if (kind == Q8) {
@@ -61,12 +66,13 @@ static void fill_tile(int kind, std::vector<uint8_t>& tile, tu::Rng& rng) {
             b->d = f32_to_fp16(0.002f + 0.02f * rng.uni());
             for (int j = 0; j < 32; ++j) b->qs[j] = (int8_t)rng.range(-127, 127);
         }
-    } else if (kind == NVFP4) {
+    } else if (kind == NVFP4 || kind == NVFP4R) {
         for (size_t i = 0; i < n; i += 36) {
             block_nvfp4* b = (block_nvfp4*)&tile[i];
             for (int s = 0; s < 4; ++s) b->d[s] = (uint8_t)(0x30 + rng.u32() % 0x28);
             for (int j = 0; j < 32; ++j) b->qs[j] = (uint8_t)rng.u32();
         }
+        if (kind == NVFP4R) nvfp4r_repack_blocks(tile.data(), n / 36);
     } else if (kind == BF16) {
         uint16_t* h = (uint16_t*)tile.data();
         for (size_t i = 0; i < n / 2; ++i) h[i] = f32_to_bf16(rng.sym());
@@ -125,7 +131,7 @@ static Meas measure(ThreadPool& pool, const Shape& s, uint8_t* buf, size_t buf_b
     for (int i = 0; i < nx; ++i) {
         std::vector<float> x(s.k);
         for (int j = 0; j < s.k; ++j) x[j] = rng.gauss();
-        if (s.kind == Q8 || s.kind == NVFP4) {
+        if (is_q8x(s.kind)) {
             xq[i].resize(s.k / 32);
             quantize_row_q8_0(x.data(), xq[i].data(), s.k);
         } else {
@@ -141,7 +147,7 @@ static Meas measure(ThreadPool& pool, const Shape& s, uint8_t* buf, size_t buf_b
         for (int j = 0; j < nm; ++j) {
             const size_t idx = (cursor + j) % count;
             const int xi = s.x_per_mat ? j : 0;
-            mats[j] = GemvMat{buf + idx * mat_bytes, rb, (s.kind == Q8 || s.kind == NVFP4) ? (const void*)xq[xi].data() : (const void*)xf[xi].data(),
+            mats[j] = GemvMat{buf + idx * mat_bytes, rb, is_q8x(s.kind) ? (const void*)xq[xi].data() : (const void*)xf[xi].data(),
                               y_all.data() + (size_t)j * s.rows, s.rows};
         }
         cursor = (cursor + nm) % count;
@@ -150,6 +156,7 @@ static Meas measure(ThreadPool& pool, const Shape& s, uint8_t* buf, size_t buf_b
                 switch (s.kind) {
                     case Q8: gemv_multi_q8_0(mats.data(), nm, s.k, b, e); break;
                     case NVFP4: gemv_multi_nvfp4(mats.data(), nm, s.k, b, e); break;
+                    case NVFP4R: gemv_multi_nvfp4r(mats.data(), nm, s.k, b, e); break;
                     case BF16: gemv_multi_bf16(mats.data(), nm, s.k, b, e); break;
                     default: gemv_multi_f32(mats.data(), nm, s.k, b, e); break;
                 }
@@ -168,6 +175,7 @@ static Meas measure(ThreadPool& pool, const Shape& s, uint8_t* buf, size_t buf_b
         if (g_dynamic) {
             int64_t chunk = total / ((int64_t)pool.size() * 6);
             chunk = std::max<int64_t>(16, std::min<int64_t>(512, chunk)) & ~(int64_t)3;
+            if (g_chunk > 0) chunk = g_chunk;
             pool.run_chunks(total, chunk, work);
         } else {
             pool.run([&](int tid, int n) {
@@ -239,6 +247,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--rows") ov_rows = std::atoi(next());
         else if (a == "--nm") ov_nm = std::atoi(next());
+        else if (a == "--group") g_gemv_nvfp4r_group = std::atoi(next());   // nvfp4r rows per group (4 / 8)
+        else if (a == "--pre") g_gemv_nvfp4r_pre = std::atoi(next());       // nvfp4r per-call activation precompute (0 / 1)
+        else if (a == "--chunk") g_chunk = std::atoi(next());
     }
     const size_t bytes = (size_t)(pool_gb * 1e9);
     uint8_t* buf = (uint8_t*)alloc_weight_buffer(bytes, huge);

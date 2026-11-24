@@ -22,8 +22,9 @@ pool.run_chunks(total_rows, chunk, [&](int tid, int64_t b, int64_t e) { gemv_mul
 ```
 Dispatch: epoch counter (release store) polled by workers; join: per-worker `done` flags polled by the caller; barrier:
 per-thread arrive flags gathered by thread 0, one release flag. All flags are 64-byte padded monotonic counters, `_mm_pause`
-spin, no futex/condvar in the hot path. Workers spin `idle_spin_us` (2 ms) after a job, then poll with 20 us sleeps
-(first run after a long idle gap costs up to ~100 us). Default CPU list: 0,2,4,...,30 then 1,3,5,...
+spin, no futex/condvar in the hot path. Workers spin `idle_spin_us` (2 ms) after a job, then PARK on a futex (agent T, wave 1, 2026-11-23;
+`INK_POOL_PARK=0` restores the old 20 us nanosleep polling): an idle 16-thread pool costs 0.12-0.16 % of one core instead of 86-120 % (50 us timer slack)
+or 7 % (5 ms slack); the first run() after a long idle gap costs a futex wake (16 threads: median 183 us vs 81 us polling, p90 283 vs 1524 us). Default CPU list: 0,2,4,...,30 then 1,3,5,...
 Latency (`bench_pool`, min / median over 11 rounds x 20000, load 10.8): run()+join empty body: 8 thr 527/547 ns, 12 thr 676/732 ns,
 16 thr 856/1130 ns. barrier(): 8 thr 617/645 ns, 12 thr 605/657 ns, 16 thr 810/1020 ns. Targets (barrier < 2 us, dispatch < 5 us at 16 threads): met.
 
@@ -100,3 +101,18 @@ Static vs dynamic (NVFP4 gate_up, 16 thr, default even CPUs, load 3.1): 41.2 vs 
 - Fuse: q|k|v (shared x) in one `gemv_multi_q8_0` call; 8 experts as 8 `GemvMat` (gate_up shares x; down has one x per expert); one `run` per fused op, `barrier()` between dependent ops inside one `run`.
 - Quantise x once per matvec (`quantize_row_q8_0`; cost not measured separately, estimated well under 1 us for K=2304) on one thread, then barrier, or on every thread into a private buffer.
 - Apply the per-expert F32 scale (`ffn_*_exps.scale[e]`) outside the kernel (e.g. folded into the router weight).
+
+## 7. NVFP4 with re-encoded scales: `gemv_nvfp4r` (agent K1, wave 1, 2026-11-23)
+The decode-path expert kernel was ALU-bound (~23 instructions per 36-byte row super-block, 13 on the two vector-ALU ports, 8 scalar loads of them
+for the 4 UE4M3 scale bytes). `include/ink/nvfp4_repack.h` re-encodes the 4 scale bytes of every super-block at load (engine arena only, block stays
+36 B; `nvfp4r_repack_blocks`, byte table `nvfp4r_encode_table`) so that a scale decodes as `bit_cast<float>(code << 20) * 2^116`, bit-identical to
+`ue4m3_to_f32`. `gemv_nvfp4r` / `gemv_multi_nvfp4r` (same API as the nvfp4 kernels, re-encoded weights ONLY) process 8 rows per group (`g_gemv_nvfp4r_group`,
+env `INK_NVFP4R_GROUP=4` for 4): per group super-block the 8 x 4 scale bytes are gathered with 2 x (vmovd + 3 vpinsrd), decoded with vpmovzxbd + vpslld +
+vmulps, multiplied once by `[dx0 dx0 dx1 dx1] x 4`, and every row expands its 4 scales with ONE vpermps. Hot loop: 121 instructions per 8 row super-blocks
+(15.1 per 36 B, 9 vector-ALU per row + ~2.75 shared, 2.1 loads per row instead of 9). The nibble path, the integer sums, `fma` order and `hsum16` tree are
+unchanged, so `gemv_nvfp4r(re-encoded) == gemv_nvfp4(original) == gemv_nvfp4r_ref` bit for bit (test_gemv: every shape / mode / stride / split, both group
+sizes, fused multi). Default `g_gemv_nvfp4r_pre = 1` (`INK_NVFP4R_PRE=0` off): the shared per-super-block activation vectors (XP, C, DX) are precomputed once per call
+(>= 8 rows, 192 B per super-block on the stack): +6-10% in the kernel A/B, bit-identical.
+Engine: `INK_NVFP4R=1` (default 0, `Tune::nvfp4r`) repacks the NVFP4 expert tensors inside the parallel arena copy (~0.3 s), sets `LayerPacked::nvfp4r`,
+and the decode phases G/H call the nvfp4r kernels; the batched prefill / verify GEMM must switch on the same flag before the default can flip.
+Measurements: docs/status/K1.md (kernel A/B, full-model gates, decode profile).

@@ -82,8 +82,11 @@ struct SpecPolicyOptions {
     int explore = 16;                // while speculating: every `explore` spec steps one step uses the OTHER candidate width (keeps its acceptance / time estimates fresh); 0 = off
     double prior_c[7] = {0.60, 0.64, 0.76, 0.78, 0.62, 0.76, 0.73};   // conditional acceptance priors (docs/DSPARK.md 9.2, pooled greedy n = 7)
     // bytes-model priors for times that were not measured yet (relative to one plain step): verify(T) and draft(n)
-    double verify_ratio[9] = {0, 1.0, 1.59, 2.0, 2.47, 2.8, 3.1, 3.4, 3.72};   // x (N + E(T)) / B1 of docs/ROUTING.md, index = T (the real ratio is measured)
-    double draft_a = 0.21, draft_b = 0.013;                                    // draft(n) ~ plain * (a + b n)
+    double verify_ratio[9] = {0, 1.0, 1.45, 1.9, 2.33, 2.65, 2.97, 3.3, 3.6};   // index = T; the real ratio is measured. K2 2026-11-23: verify/plain measured with the
+                                                                               // multix MoE path (12 threads, same window): T=4 2.45 (code) / 2.20 (chat), T=8 3.75 / 3.47; the old
+                                                                               // values were the bytes model of docs/ROUTING.md (2.47 / 3.72), which the GEMM path never reached (2.7 / 4.2)
+    double draft_a = 0.20, draft_b = 0.025;                                    // draft(n) ~ plain * (a + b n); K2 2026-11-23: measured idle-host drafts 21-23 ms (n=3) / 29-30 (n=7)
+                                                                               // vs a 72 ms plain step = 0.30 / 0.41, minus the 11 % multix base pass -> 0.27 / 0.37
 };
 
 class SpecPolicy {

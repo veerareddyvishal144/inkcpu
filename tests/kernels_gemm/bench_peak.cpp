@@ -6,6 +6,8 @@
 //   mix4 : maddubs, madd, cvt, fma                 (no sign transfer)
 //   mix5 : mask_sub, maddubs, madd, cvt, fma       (the real kernel: scale broadcast from memory)
 //   mix6 : mix5 + vmulps for the scale product     (what B1's gemv does per row)
+//   copy : mix5 as the GEMM tile really does it: X loaded once per 4 pairs (4 rows), each row does reg-copy + merge-masked vpsubb
+//   reld : same, but X is re-loaded from L1 for every row and the masked vpsubb is done in place (no register copy)  [K3, wave 1]
 // Usage: bench_peak [threads=1] [cpus-list e.g. 2,4,...]   (run through tools/with_bench_lock.sh)
 #include <immintrin.h>
 #include <time.h>
@@ -62,6 +64,16 @@ __attribute__((noinline)) float run_mix(long iters, const Bufs& b, uint64_t kmas
                 const __m512i X = _mm512_load_si512(b.x + 64 * p);
                 const __m512i m = _mm512_maddubs_epi16(aw, X);
                 acc[p] = _mm512_castsi512_ps(_mm512_add_epi32(_mm512_castps_si512(acc[p]), m));  // keeps it alive; +1 p05 uop (accounted below)
+            } else if constexpr (MIX == 5 || MIX == 6) {
+                // 4 "rows" share one X (p / 4 selects the X vector, p % 4 the row mask), as in tile_kernel
+                const int8_t* xp = b.x + 64 * (p >> 2);
+                if constexpr (MIX == 6) asm volatile("" : "+r"(xp));  // opaque pointer: the compiler cannot merge the 4 loads
+                const __m512i X = _mm512_load_si512(xp);
+                const __mmask64 kr = (__mmask64)(km >> (p & 3)) ^ (__mmask64)(0x5555555555555555ull * (uint64_t)(p & 3));
+                const __m512i XS = _mm512_mask_sub_epi8(X, kr, zero, X);
+                const __m512i I = _mm512_madd_epi16(_mm512_maddubs_epi16(aw, XS), ones);
+                const __m512 S = _mm512_castpd_ps(_mm512_set1_pd(*(const double*)(b.s + 16 * p)));
+                acc[p] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(I), S, acc[p]);
             } else {
                 __m512i X = _mm512_load_si512(b.x + 64 * p);
                 if constexpr (MIX >= 3) X = _mm512_mask_sub_epi8(X, km, zero, X);
@@ -136,8 +148,8 @@ int main(int argc, char** argv) {
             b.dx[i] = 0.002f * (float)((i % 5) + 1);
         }
     }
-    const char* names[5] = {"fma   (1 uop/pair)", "madubs(1+1 uop)", "mix4  (4 uop)", "mix5  (5 uop)", "mix6  (6 uop)"};
-    std::vector<std::vector<double>> res(5, std::vector<double>(nthr, 0.0));
+    const char* names[7] = {"fma   (1 uop/pair)", "madubs(1+1 uop)", "mix4  (4 uop)", "mix5  (5 uop)", "mix6  (6 uop)", "copy  (5+copy)", "reld  (5+reload)"};
+    std::vector<std::vector<double>> res(7, std::vector<double>(nthr, 0.0));
     auto go = [&](auto tag, int idx) {
         constexpr int M = decltype(tag)::value;
         pool.run([&](int tid, int) {
@@ -151,10 +163,12 @@ int main(int argc, char** argv) {
     go(std::integral_constant<int, 2>{}, 2);
     go(std::integral_constant<int, 3>{}, 3);
     go(std::integral_constant<int, 4>{}, 4);
+    go(std::integral_constant<int, 5>{}, 5);
+    go(std::integral_constant<int, 6>{}, 6);
     // FMA mix: 1 FMA per pair at 2 FMA/cycle -> cycles = 0.5 per pair -> f = 0.5 / ns
     std::printf("%-20s %12s %12s %12s %12s\n", "mix", "ns/pair(min)", "ns/pair(med)", "cyc/pair", "GMAC/s/core(max-thread)");
     double fghz_all = 0;
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 7; ++i) {
         std::vector<double> v = res[i];
         std::sort(v.begin(), v.end());
         const double mn = v.front(), md = v[v.size() / 2];

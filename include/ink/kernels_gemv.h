@@ -36,12 +36,16 @@ inline size_t row_bytes_f32(int k) { return (size_t)k * 4; }
 // ---- single-matrix row-range kernels (AVX-512 F/BW/DQ, no VNNI) ----
 void gemv_q8_0(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);
 void gemv_nvfp4(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);
+// NVFP4 whose 4 scale bytes per super-block were RE-ENCODED with nvfp4r_repack_rows / nvfp4r_repack_blocks (include/ink/nvfp4_repack.h;
+// the engine's arena copy when LayerPacked::nvfp4r is set). Bit-identical to gemv_nvfp4 on the original bytes; never mix the encodings.
+void gemv_nvfp4r(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);
 void gemv_bf16(const void* w, size_t row_stride, const float* x, int k, float* y, int nrows);
 void gemv_f32(const void* w, size_t row_stride, const float* x, int k, float* y, int nrows);
 
 // ---- scalar references with the same accumulation structure (tests, oracle for the kernels) ----
 void gemv_q8_0_ref(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);
 void gemv_nvfp4_ref(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);
+void gemv_nvfp4r_ref(const void* w, size_t row_stride, const block_q8_0* x, int k, float* y, int nrows);   // re-encoded scales
 void gemv_bf16_ref(const void* w, size_t row_stride, const float* x, int k, float* y, int nrows);
 void gemv_f32_ref(const void* w, size_t row_stride, const float* x, int k, float* y, int nrows);
 
@@ -59,6 +63,7 @@ struct GemvMat {
 };
 void gemv_multi_q8_0(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1);
 void gemv_multi_nvfp4(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1);
+void gemv_multi_nvfp4r(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1);
 void gemv_multi_bf16(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1);
 void gemv_multi_f32(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1);
 
@@ -75,5 +80,7 @@ void free_weight_buffer(void* p);
 // ---- tunables (read once per kernel call; for experiments, defaults are the tuned values) ----
 extern int g_gemv_prefetch_bytes;  // software prefetch distance per row stream (0 = none). default 512
 extern int g_gemv_prefetch_hint;   // 0 = T0, 1 = T1, 2 = NTA, 3 = no prefetch instructions at all
+extern int g_gemv_nvfp4r_group;    // rows per group in gemv_nvfp4r: 8 (default) or 4; env INK_NVFP4R_GROUP (results identical)
+extern int g_gemv_nvfp4r_pre;      // 1 (default): gemv_nvfp4r precomputes the shared activation vectors once per call (>= 8 rows), +6-10%; env INK_NVFP4R_PRE=0 off (results identical)
 
 }  // namespace ink

@@ -12,7 +12,15 @@ Targets: `ink_engine` (static), `ink` (libink.so), `test_engine`, `bench_decode`
 `Engine::decode(slot, token, logits)` does ONE `ThreadPool::run()` per token. Inside, every thread executes the same straight-line code for
 the 48 visits; serial work runs on tid 0 while the others wait in `pool.barrier()`; matvec phases use dynamic chunk scheduling from a shared
 atomic counter per phase (counters are numbered identically on every thread because the control flow is data independent; they are zeroed
-before each run). Kernels are B1's (`gemv_*`, thread pool) and B2's (norms, clips, short conv, attention, router, depth mix, SiTU);
+before each run). Wave 1 (E1) added an OPT-IN variant (`INK_PF_ROUNDS=1|2`, default 0 = off): the first chunk indices of every phase are assigned statically (chunk tid, tid+nth,
+...) so that a thread idle before a barrier (serial phases, the 8 threads without a KV group at short context, early finishers) prefetches its first chunks of the next
+phase into L2 (`_mm_prefetch` T1). Rows are grouped exactly as before: bit-identical. Measured 2026-11-23 it LOST ~5 % at ctx 16 against plain dynamic scheduling
+(software prefetches drain through the L1 fill buffers at ~3 GB/s per core and delayed the barriers even with the stop epoch), hence off by default.
+Software prefetches drain through the L1 fill buffers (~3 GB/s per core here), so the prefetch loops poll a stop epoch (`Scratch::pf_stop`) every 1 KB and quit as soon
+as the thread everyone waits for bumps it right before entering the barrier (the serial thread, the first finished attention group, the last thread leaving a dynamic
+phase): the prefetched volume adapts to the real idle window and never delays the barrier. In phase C each group thread also prefetches its own cold inputs first
+(conv histories and taps of its channels, clip scales, the rel-bias rows of the query's block, the other cores' projection outputs, the K column to be written and at
+short context the K block it reads; `INK_PF_ATTN_IN=0` disables). Kernels are B1's (`gemv_*`, thread pool) and B2's (norms, clips, short conv, attention, router, depth mix, SiTU);
 the only executor-owned arithmetic is the expert combine and a few glue loops. All results are independent of the thread count (checked
 bit-for-bit at 5/8/12/16 threads): every reduction either lives inside one kernel call whose result does not depend on how rows are grouped
 (B1) or is computed by one thread in a fixed order; the attention key split `nsplit` depends only on the number of visible keys.
@@ -25,7 +33,7 @@ bit-for-bit at 5/8/12/16 threads): every reduction either lives inside one kerne
   dynamic chunking keeps it from stalling the barriers. Static work (8 KV groups) goes to tid 0..7.
 * `Engine::set_threads(n)` rebuilds the pool without reloading weights (used by the determinism test and the benchmark sweeps).
 * `INK_CPUS=3,5,7,...` overrides the CPU list (wraps around); useful to stay off the CPUs another tenant pins to (even vs odd CPUs measured the same at load 19: 13.0 vs 13.4 tok/s).
-* Idle workers spin 2 ms after a job and then poll with 20 us sleeps (ThreadPool default), so the first token after a pause costs <= ~100 us extra.
+* Idle workers spin 2 ms after a job and then park on a futex (agent T, wave 1; `INK_POOL_PARK=0` = the old 20 us polling), so the first token after a pause costs a futex wake (median +5 us, p90 +30 us).
 
 ## 3. Weights (load)
 
@@ -45,7 +53,7 @@ bit-for-bit at 5/8/12/16 threads): every reduction either lives inside one kerne
 
 ## 4. State per slot (`SlotState`)
 
-* KV: 48 `KvLayer` (B2 layout, fp16, blocks of 64 positions). SWA visits (40): ring of `kSwaRingBlocks` = 32 blocks = 2048 positions (so a batched prefill can append a whole chunk of up to 1025 tokens
+* KV: 48 `KvLayer` (B2 layout, fp16, blocks of 64 positions; since wave 1 each tensor is a 2 MiB-aligned anonymous mapping with MADV_HUGEPAGE, `INK_KV_HUGE=0` = 4 KiB pages). SWA visits (40): ring of `kSwaRingBlocks` = 32 blocks = 2048 positions (so a batched prefill can append a whole chunk of up to 1025 tokens
   before the attention runs; the attention window is still 1024 by position mask), 2 x 4 MiB per visit = 320 MiB per slot of virtual memory, committed lazily as positions are written.
   Global visits (8): one anonymous `mmap(MAP_NORESERVE)` of `ceil(max_ctx/64)+1` blocks per tensor (lazy, zero filled), `n_blocks = pos/64 + 1` is set before every token;
   32 KiB of KV per cached token for the 8 global visits.
@@ -62,9 +70,9 @@ message mix and the loop controllers (+8 barriers).
 | phase | what | work split | bytes (SWA / NVFP4 visit) | barrier after |
 |---|---|---|---|---|
 | A (PH_MIX) | [msgs: depth mix of the 2 bank states, 4 queries] attention-input depth mix (nq 1 or 3), rmsnorm x norm weight, Q8_0 quantisation, bf16 rounding (sink / dyn-tap input) | serial | 0 | yes (SWA, no msgs: Q8 once, all three inputs share it) |
-| ctrl (PH_CTRL) | 3 attention controllers batched: gate input (serial), down matvec 4608->64, gain+forget 64->2304, `ctrl_apply` per channel range; then norms (serial) | dyn | 4.7 MB per visit (also FFN controller) | 3 + 1 |
+| ctrl (PH_CTRL) | 3 attention controllers batched: gate input (serial), down matvec 4608->64 (chunks of 4 rows), then per (controller, 64-channel block): gain+forget rows 64->2304 fused with `ctrl_apply` of the block; then norms (serial) | dyn | 4.7 MB per visit (also FFN controller) | 2 + 1 |
 | B (PH_PROJ) | wq\|wk\|wv\|attn_gate\|attn_rel (one `gemv_multi_q8_0`, different x per matrix) + BF16 sink / dyn-tap matvecs as extra virtual rows | dyn, chunk 32 -> 8 | 19.9 MB (global 20.0) | yes |
-| C (PH_ATTN) | per KV group g (tid g): short conv K,V (dyn taps on global layers), K clip, V norm, Q clip, R clip, `kv_append`; then attention. nsplit = 1: the same thread runs the task, `attn_decode_finish` (with sigmoid gate) and the Q8_0 quantisation of its 384 outputs. nsplit > 1 (>= 2 x `split_keys` = 768 visible keys): b, items (g, s) dyn, b, finish per group | static / dyn | K+V fp16 of the visible keys | yes (1 or 3) |
+| C (PH_ATTN) | per KV group g (tid g): short conv K,V (dyn taps on global layers), K clip, V norm, Q clip, R clip, `kv_append`; then attention. nsplit = 1: the same thread runs the task, `attn_decode_finish` (with sigmoid gate) and the Q8_0 quantisation of its 384 outputs. nsplit > 1 (>= 2 x `split_keys` = 768 visible keys; `attn_decode_nsplit`: keys / split_keys clamped to [1,16] by default, env INK_ATTN_GRANULE=g for ceil(keys/g)): b, items (g, s) dyn, the thread completing the LAST item of a group runs that group's finish (per-group arrival counters) | static / dyn | K+V fp16 of the visible keys | yes (1 or 2) |
 | E (PH_WO) | wo matvec (K = 3072) by 32-row chunks; the thread that produced rows [b,e) also does the post-conv and the residual add for those channels (block-start layers: no residual) | dyn | 7.5 MB | yes |
 | F1 (PH_FFNMIX) | push inpSA to the block list (block starts), FFN depth mix, [FFN controller], rmsnorm x ffn_norm, Q8_0 | serial | 0 | yes |
 | F2 (PH_ROUTER) | router matvec 128 x 2304 (BF16) by 8-row chunks; then EVERY thread computes `router_topk` redundantly (identical result, no broadcast barrier) | dyn | 0.59 MB | yes |
@@ -72,7 +80,8 @@ message mix and the loop controllers (+8 barriers).
 | H (PH_DOWN) | unit = 16-row tile x 8 experts (chunks of 32 rows, 16 at the tail; tiles inside a chunk run back to back): `d_i = (dot_i * down_scale) * w_i`, summed in top-k order (sequential adds, AVX-512, no FMA), then post-conv and `cur = ffn_inp + ffn_out` in place for those channels | dyn, 32 -> 16 rows | 11.9 MB (Q8_0 layers 22.6 MB) | yes |
 | end | after visit 47: final depth mix, rmsnorm, Q8_0 (serial), b, lm_head 200058 rows in 512 -> 64-row chunks, each chunk followed by `vsoftcap` on its own rows | dyn | 489.7 MB | (join) |
 
-8 barriers per SWA visit without messages with nsplit 1 (A, B, C, E, F1, F2, G, H), 10 with nsplit > 1, 16-18 on message visits. ~520 barriers per token at ~1-1.5 us.
+8 barriers per SWA visit without messages with nsplit 1 (A, B, C, E, F1, F2, G, H), 9 with nsplit > 1, 14-15 on message visits: 528 barriers per token at ctx < 768, 576 beyond
+(before wave 1: 10 / 16-18, i.e. 576 / 672). The barrier is tid 0 polling 15 arrive lines in sequence then one release store (~1.5-2 us when everyone has arrived).
 
 ## 6. Numerics decisions
 
@@ -192,12 +201,43 @@ At ctx 1000 the attention phase grows from 1.3 to 5.8 ms (12 threads; 201 MB of 
 ```
 cmake -S src/engine/standalone -B build-c1d -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build-c1d      # or the root CMake: ninja -C <root build> ink test_engine bench_decode
 INK_PROFILE=1 tools/with_bench_lock.sh build-c1d/engine/bench_decode --threads 8,12,16 --ctx 16,1000 --n 64 --reps 2 --splits 384,100000
+# wave 1 (E1): the context is built with Engine::forward (batched prefill) so long contexts are cheap; --granules 0,256 sweeps the split rule, --dump P writes P_ctx<c>_t<n>.f32
+# (64 greedy logits rows) for bit-identity checks (cmp), --tokens FILE uses an int32 token file, INK_FINE=1 adds a thread-0 rdtsc breakdown of phases A / C / F1
+INK_PROFILE=1 tools/with_bench_lock.sh build-e1/src/engine/bench_decode --threads 16 --ctx 16,1000,4000,8000,16000 --n 64 --reps 2 --dump build-e1/ref/ref
 tools/with_bench_lock.sh build-c1d/engine/bench_stream 12,16 3.0
 INK_THREADS=12 nice -n 10 build-c1d/engine/test_engine oracle | greedy | determinism | slots <ring dirs> | nll <dirA> <dirB> | trace 2
 tests/engine/make_nll_data.sh build-c1b/data      # llama.cpp side data for (c) and the ring-wrap runs
 /data/engine/.venv/bin/python tests/engine/test_capi.py build-c1d/capi/libink.so
 ```
 
+
+### 9.2 Wave 1, agent E1 (2026-11-23): long-context attention and fixed per-token overheads (full log: docs/status/E1.md)
+
+Method: `bench_decode` builds the context with the batched prefill, 16 threads, 2 x 64 greedy tokens per cell, same-window A/B under the lock on an idle box
+(the loadavg printed during a run is the run's own 16 spinning threads). Baseline = the pre-wave build in the same harness.
+
+| ctx | attention phase ms/token: baseline -> final | KV GB/s | whole token tok/s: baseline -> final (best of 2) |
+|---|---|---|---|
+| 16 | 1.97 -> 1.5-2.0 | - | 13.65 -> 13.8-14.8 |
+| 1000 | 6.80 -> 5.2-6.0 | 30 -> 33-39 | 12.85 -> 13.0-13.3 |
+| 4000 | 8.62 -> 7.3-7.5 | 35 -> 40 | 12.75 -> 12.4-13.0 |
+| 8000 | 9.95 -> 8.1 | 43 -> 53 | 12.58 -> 12.5-12.9 |
+(Identical configurations vary by 5-7 % in whole-token tok/s between runs on this shared box; the attention-phase reduction is the consistent part.)
+
+What did it (all bit-identical: logits dumps at ctx 16 / 1000 / 4000 / 8000 equal the pre-wave build byte for byte; oracle / greedy / determinism / slots+ring / test_prefill
+quick unchanged): (1) software prefetch 4 KiB ahead inside the attention kernel across block and chunk boundaries (+17-25 % per-thread DRAM streaming in the
+kernel microbench, 7.5 -> 9.4 GB/s at 32K context); (2) the thread that completes the last split of a KV group runs that group's merge (2 barriers per split visit
+instead of 3); (3) the controllers' gain+forget matvec fused with ctrl_apply (2 barriers per call instead of 3); (4) each attention group thread prefetches its own
+cold inputs first (histories, taps, clip scales, rel rows, other cores' projections, the K column: task 6.9 -> 4.3 us per visit); (5) KV mapped with MADV_HUGEPAGE
+(no measurable effect at <= 4000 context; kept). Tried and left OFF: a finer key split above 767 keys (`INK_ATTN_GRANULE`: no gain, changes rounding), static-first
+chunk assignment + idle-thread weight prefetch (`INK_PF_ROUNDS`: -5 % even with a stop epoch, because software prefetches drain through the L1 fill buffers at
+~3 GB/s per core and delay the barriers).
+
+What limits the rest (measured with `INK_FINE=1`, thread 0 rdtsc + thread 1 arrival stamps): the marginal KV streaming runs at 57-72 GB/s (like the projection
+phase); the remaining attention cost is a fixed ~30-40 us per visit of which the barrier after the group work is 17-30 us although the idle threads arrived
+15 us earlier -- the box's idle PRODUCTION server preempts the 16 spinning threads ~3000 times per second (220 per token; measured as nonvoluntary context switches,
+matched by the server's 3311 voluntary switches/s), i.e. 2-3 ms/token on every decode measured today. Restarting production on the futex-parking pool (agent T)
+should recover that for everyone. At ctx 1000 the split visits still lose ~40 % of their time to barrier imbalance (thread 0: items 44 us, final barrier 34-46 us).
 
 ## 10. Where the next speed-up is (analysis, not implemented)
 

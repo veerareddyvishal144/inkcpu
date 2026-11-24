@@ -2,13 +2,17 @@
 // (optimised gemv_* and, on small cases, the scalar gemv_*_ref). Shapes: K in {64,192,1152,2304,3072,4608}, rows incl. odd counts,
 // nt in {1,2,3,5,8,16,17,64,256}, 4 value modes (normal, extreme, zero scales, random fp16/UE4M3 bit patterns), padded row strides,
 // padded ldy (guard values must survive), row/token splitting, MoE routing (token-indexed and pair-indexed activations).
+// NVFP4 cases also run gemm_nvfp4r / gemm_moe_nvfp4r on a copy whose scale bytes were re-encoded with nvfp4r_repack_rows
+// (include/ink/nvfp4_repack.h) and require the same bits as gemv_nvfp4 on the ORIGINAL bytes (all 256 scale byte values occur in mode RANDBITS).
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include "ink/kernels_gemm.h"
+#include "ink/nvfp4_repack.h"
 #include "testutil.h"
 
 using namespace ink;
@@ -90,6 +94,14 @@ Mat make_nvfp4(int rows, int k, int pad, int mode, tu::Rng& rng) {
     }
     return m;
 }
+// copy of an NVFP4 matrix with the scale bytes re-encoded in place (same misaligned base, same padded stride)
+Mat reencode(const Mat& m, int rows, int k) {
+    Mat r = m;
+    nvfp4r_repack_rows(r.buf.data() + 4, r.rs, rows, k / 64);
+    return r;
+}
+long g_r_cases = 0;
+
 std::vector<block_q8_0> make_acts(int nt, int k, int mode, tu::Rng& rng) {
     std::vector<block_q8_0> a((size_t)nt * (k / 32));
     for (auto& b : a) {
@@ -175,6 +187,28 @@ void check_dense(int fmt, int k, int rows, int nt, int mode, bool pad_stride, tu
                 ++tu::g_fail;
                 return;
             }
+    }
+    if (fmt == GEMM_FMT_NVFP4) {  // re-encoded scales: gemm_nvfp4r on the repacked copy must reproduce gemv_nvfp4 on the original bytes
+        const Mat Wr = reencode(W, rows, k);
+        std::vector<float> yr((size_t)nt * ldy, sf);
+        auto callr = [&](int ra, int rb, int ta, int tb) {
+            if (rb <= ra || tb <= ta) return;
+            gemm_nvfp4r((const char*)Wr.ptr() + (size_t)ra * Wr.rs, Wr.rs, act, ta, tb, k, yr.data() + ra, ldy, rb - ra);
+        };
+        callr(0, r1, 0, t1);
+        callr(r1, rows, 0, t1);
+        callr(0, r1, t1, nt);
+        callr(r1, rows, t1, nt);
+        ++g_r_cases;
+        for (int t = 0; t < nt; ++t) {
+            size_t first = 0;
+            if (!same_bits(yr.data() + (size_t)t * ldy, yref.data() + (size_t)t * ldy, ldy, &first)) {
+                std::fprintf(stderr, "MISMATCH nvfp4r K=%d rows=%d nt=%d mode=%d pad=%d token=%d idx=%zu gemm_r=%.9g gemv=%.9g\n", k, rows, nt, mode,
+                             (int)pad_stride, t, first, (double)yr[(size_t)t * ldy + first], (double)yref[(size_t)t * ldy + first]);
+                ++tu::g_fail;
+                return;
+            }
+        }
     }
     if ((double)rows * nt * k <= 4e6) {  // scalar reference on small cases
         ++g_ref_cases;
@@ -293,6 +327,26 @@ void check_moe(int fmt, int k, int rows, int E, int ntok, int topk, int chunk_ro
         }
     }
     ++g_cases;
+    if (fmt == GEMM_FMT_NVFP4) {  // re-encoded expert weights -> gemm_moe_nvfp4r, same reference
+        std::vector<uint8_t> wr = wbuf;
+        for (int e = 0; e < E; ++e) nvfp4r_repack_rows(wr.data() + 4 + (size_t)e * es, rs, rows, k / 64);
+        std::vector<float> z1((size_t)np * ldy, sf), z2((size_t)np * ldy, sf);
+        for (int oi : order) {
+            const MoeItem& it = items[(size_t)oi];
+            gemm_moe_nvfp4r(wr.data() + 4, es, rs, acts_t, r.pair_token.data(), r, it, k, z1.data(), ldy);
+            gemm_moe_nvfp4r(wr.data() + 4, es, rs, acts_p, nullptr, r, it, k, z2.data(), ldy);
+        }
+        ++g_r_cases;
+        for (int p = 0; p < np; ++p) {
+            size_t f = 0;
+            if (!same_bits(z1.data() + (size_t)p * ldy, ref1.data() + (size_t)p * ldy, ldy, &f) ||
+                !same_bits(z2.data() + (size_t)p * ldy, ref2.data() + (size_t)p * ldy, ldy, &f)) {
+                std::fprintf(stderr, "MISMATCH moe nvfp4r K=%d rows=%d E=%d ntok=%d topk=%d chunk=%d pair=%d idx=%zu\n", k, rows, E, ntok, topk, chunk_rows, p, f);
+                ++tu::g_fail;
+                return;
+            }
+        }
+    }
     // slots are a permutation of 0..np-1
     std::vector<char> seen((size_t)np, 0);
     for (int p = 0; p < np; ++p) {
@@ -314,10 +368,113 @@ void check_moe(int fmt, int k, int rows, int E, int ntok, int topk, int chunk_ro
     }
 }
 
+// ---- X4 prototype numerics (not a bit-identity check): deviation vs a double-precision reference and Q8_0 re-quantisation flips.
+// Realistic setting: one expert gate/up matrix (2304 x 2304, NORMAL scales, random nibbles), Gaussian activations quantised with
+// quantize_row_q8_0; the SiTU proxy silu(gate) * up is re-quantised to Q8_0 (as the engine does before the down GEMM) for both kernels.
+double ref_dot(const uint8_t* wrow, int k, const block_q8_0* x) {  // exact in double: sum kv * ue4m3(d) * q * dx
+    static const int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    double acc = 0;
+    for (int sb = 0; sb < k / 64; ++sb) {
+        const uint8_t* b = wrow + (size_t)sb * 36;
+        for (int e = 0; e < 64; ++e) {
+            const int s = e >> 4, i = e & 15;
+            const int byte = b[4 + 8 * s + (i & 7)];
+            const int nib = i < 8 ? (byte & 0xF) : (byte >> 4);
+            const block_q8_0* xb = x + 2 * sb + (e >> 5);
+            acc += (double)kv[nib] * (double)ue4m3_to_f32(b[s]) * (double)xb->qs[e & 31] * (double)fp16_to_f32(xb->d);
+        }
+    }
+    return acc;
+}
+double ref_abs(const uint8_t* wrow, int k, const block_q8_0* x) {  // sum |w * x|
+    static const int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    double acc = 0;
+    for (int sb = 0; sb < k / 64; ++sb) {
+        const uint8_t* b = wrow + (size_t)sb * 36;
+        for (int e = 0; e < 64; ++e) {
+            const int s = e >> 4, i = e & 15;
+            const int byte = b[4 + 8 * s + (i & 7)];
+            const int nib = i < 8 ? (byte & 0xF) : (byte >> 4);
+            const block_q8_0* xb = x + 2 * sb + (e >> 5);
+            acc += std::fabs((double)kv[nib] * (double)ue4m3_to_f32(b[s]) * (double)xb->qs[e & 31] * (double)fp16_to_f32(xb->d));
+        }
+    }
+    return acc;
+}
+void check_x4(tu::Rng& rng) {
+    const int k = 2304, rows = 2304, nt = 24;
+    Mat G = make_nvfp4(rows, k, 0, NORMAL, rng), U = make_nvfp4(rows, k, 0, NORMAL, rng);
+    Mat Gr = reencode(G, rows, k), Ur = reencode(U, rows, k);
+    std::vector<float> xf((size_t)nt * k);
+    for (auto& v : xf) v = rng.gauss();
+    std::vector<block_q8_0> acts((size_t)nt * (k / 32));
+    for (int t = 0; t < nt; ++t) quantize_row_q8_0(xf.data() + (size_t)t * k, acts.data() + (size_t)t * (k / 32), k);
+    AlignedBuf b1(gemm_act_bytes(GEMM_FMT_NVFP4, nt, k)), b2(gemm_act_bytes(GEMM_FMT_NVFP4X4, nt, k));
+    gemm_pack_act(GEMM_FMT_NVFP4, acts.data(), 0, nt, nt, k, b1.p);
+    gemm_pack_act(GEMM_FMT_NVFP4X4, acts.data(), 0, nt, nt, k, b2.p);
+    const GemmAct a1 = gemm_act_view(GEMM_FMT_NVFP4, b1.p, nt, k), a2 = gemm_act_view(GEMM_FMT_NVFP4X4, b2.p, nt, k);
+    std::vector<float> ge((size_t)nt * rows), gx((size_t)nt * rows), ue((size_t)nt * rows), ux((size_t)nt * rows);
+    gemm_nvfp4r(Gr.ptr(), Gr.rs, a1, 0, nt, k, ge.data(), rows, rows);
+    gemm_nvfp4r_x4(Gr.ptr(), Gr.rs, a2, 0, nt, k, gx.data(), rows, rows);
+    gemm_nvfp4r(Ur.ptr(), Ur.rs, a1, 0, nt, k, ue.data(), rows, rows);
+    gemm_nvfp4r_x4(Ur.ptr(), Ur.rs, a2, 0, nt, k, ux.data(), rows, rows);
+    // deviation vs double reference on a subset of (row, token)
+    double max_e = 0, max_x = 0, max_xe = 0, maxabs = 0, sum_e = 0, sum_x = 0;
+    long nref = 0;
+    for (int t = 0; t < nt; t += 3)
+        for (int r = 0; r < rows; r += 7) {
+            const uint8_t* wr = (const uint8_t*)G.ptr() + (size_t)r * G.rs;
+            const block_q8_0* x = acts.data() + (size_t)t * (k / 32);
+            const double ref = ref_dot(wr, k, x), ab = ref_abs(wr, k, x);
+            const double de = std::fabs((double)ge[(size_t)t * rows + r] - ref) / ab, dx = std::fabs((double)gx[(size_t)t * rows + r] - ref) / ab;
+            max_e = std::max(max_e, de);
+            max_x = std::max(max_x, dx);
+            sum_e += de;
+            sum_x += dx;
+            max_xe = std::max(max_xe, std::fabs((double)gx[(size_t)t * rows + r] - (double)ge[(size_t)t * rows + r]));
+            maxabs = std::max(maxabs, std::fabs(ref));
+            ++nref;
+        }
+    std::printf("x4 numerics (2304x2304, 24 tokens, %ld (row,token) samples vs double): max |y-ref|/sum|wx|: exact %.3g, x4 %.3g; mean: exact %.3g, x4 %.3g; "
+                "max |x4-exact| %.3g (max |y| %.3g)\n", nref, max_e, max_x, sum_e / nref, sum_x / nref, max_xe, maxabs);
+    TU_CHECK(max_x < 1e-5);  // sanity: the prototype must stay at float-rounding level
+    // Q8_0 re-quantisation flips: raw GEMM output rows and the SiTU proxy silu(g) * u
+    long flips_raw = 0, flips_act = 0, dflips_raw = 0, dflips_act = 0, n = 0;
+    std::vector<float> he((size_t)rows), hx((size_t)rows);
+    std::vector<block_q8_0> qa(rows / 32), qb(rows / 32);
+    auto flips = [&](const float* a, const float* b, long& fq, long& fd) {
+        quantize_row_q8_0(a, qa.data(), rows);
+        quantize_row_q8_0(b, qb.data(), rows);
+        for (int i = 0; i < rows / 32; ++i) {
+            if (qa[i].d != qb[i].d) ++fd;
+            for (int j = 0; j < 32; ++j) fq += qa[i].qs[j] != qb[i].qs[j];
+        }
+    };
+    for (int t = 0; t < nt; ++t) {
+        flips(ge.data() + (size_t)t * rows, gx.data() + (size_t)t * rows, flips_raw, dflips_raw);
+        for (int r = 0; r < rows; ++r) {
+            const float g1 = ge[(size_t)t * rows + r], g2 = gx[(size_t)t * rows + r];
+            he[(size_t)r] = g1 / (1.f + std::exp(-g1)) * ue[(size_t)t * rows + r];
+            hx[(size_t)r] = g2 / (1.f + std::exp(-g2)) * ux[(size_t)t * rows + r];
+        }
+        flips(he.data(), hx.data(), flips_act, dflips_act);
+        n += rows;
+    }
+    std::printf("x4 Q8_0 re-quantisation flips vs exact kernel: raw GEMM output %ld of %ld int8 values (%.4f%%), %ld of %ld block scales; "
+                "silu(gate)*up %ld of %ld (%.4f%%), %ld block scales\n", flips_raw, n, 100.0 * flips_raw / n, dflips_raw, n / 32, flips_act, n,
+                100.0 * flips_act / n, dflips_act);
+}
+
 }  // namespace
 
 int main() {
     std::printf("test_gemm  loadavg %s\n", tu::loadavg().c_str());
+    TU_CHECK(nvfp4r_selfcheck() == 0);  // every UE4M3 byte value re-encodes and decodes to the same float (scalar and vector)
+    // optional: exercise the non-default code paths (old per-accumulator epilogue, no 5-token tail tiles); results must not change
+    if (const char* e = std::getenv("INK_GEMM_EPILOGUE")) g_gemm_epilogue = std::atoi(e);
+    if (const char* e = std::getenv("INK_GEMM_TAIL5")) g_gemm_tail5 = std::atoi(e);
+    if (const char* e = std::getenv("INK_GEMM_TILE")) g_gemm_tile = std::atoi(e);
+    std::printf("flags: epilogue %d tail5 %d tile %d\n", g_gemm_epilogue, g_gemm_tail5, g_gemm_tile);
     tu::Rng rng(20261121);
     const int Ks[] = {64, 192, 1152, 2304, 3072, 4608};
     const int Rows[] = {1, 2, 3, 4, 5, 7, 13, 33, 64, 65};
@@ -361,8 +518,9 @@ int main() {
         gemm_quantize_pack_act(fmt, x.data(), (size_t)k + 3, 0, nt, nt, k, b.p);
         TU_CHECK(std::memcmp(a.p, b.p, gemm_act_bytes(fmt, nt, k)) == 0);
     }
-    std::printf("moe + pack done, cases %ld (scalar-ref cases %ld), failures %d, loadavg %s\n", g_cases, g_ref_cases, tu::g_fail,
-                tu::loadavg().c_str());
-    std::printf(tu::g_fail ? "FAILED\n" : "ALL PASS (bit-identical to B1 gemv)\n");
+    check_x4(rng);
+    std::printf("moe + pack done, cases %ld (scalar-ref cases %ld, re-encoded nvfp4r cases %ld), failures %d, loadavg %s\n", g_cases, g_ref_cases,
+                g_r_cases, tu::g_fail, tu::loadavg().c_str());
+    std::printf(tu::g_fail ? "FAILED\n" : "ALL PASS (bit-identical to B1 gemv, incl. gemm_nvfp4r / gemm_moe_nvfp4r on re-encoded scales)\n");
     return tu::g_fail ? 1 : 0;
 }

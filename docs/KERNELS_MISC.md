@@ -59,6 +59,14 @@ Build/run (the root cmake currently fails to configure because B1's `src/kernels
   (running max, sum, 3x128 accumulators); `attn_decode_finish(q, g, partials+g*nsplit, nsplit, out)` merges the splits in index order (sink included), applies `sigmoid(gate)` and writes `out[g*384..+384)`.
   Splits cut the visible key range on 64-position block boundaries; results are bit-identical for a fixed `nsplit` whatever thread runs whatever item (tested: reversed item order).
   Use nsplit 1 for SWA (8 items), `ceil(threads/8)` or more for global (`attn_suggest_nsplit`). Scratch: 1.6 KB per partial; stack ~15 KB per call (prefill 30 KB).
+* **Split rule shared by the executors (E1, wave 1)**: `attn_decode_nsplit(n_keys, split_keys, max_split)` is THE function every executor that runs the decode kernels per
+  token must use (decode does; prefill / verify in their decode-kernel modes should, see docs/requests.md): 1 split below `2*split_keys` (767 keys with the engine default 384,
+  the regime where the prefill tile kernel is bit-identical to decode), else by default the old `n_keys / split_keys` clamped to [1, max_split] (numerics identical to every
+  earlier build); env `INK_ATTN_GRANULE=g` switches to `ceil(n_keys / g)` clamped to [2, max_split] (g = 256 measured: no gain over 2 splits per SWA visit, so opt-in);
+  `attn_set_split_granule()` overrides it per process (benchmarks). It depends on the visible keys only, never on the thread count.
+* **Software prefetch (E1, wave 1)**: `attn_range` prefetches 4 KiB ahead in both passes (2 lines per d row of K, 4 lines per V key, `_MM_HINT_T1`) and runs across block and chunk
+  boundaries (K of the next block -> V of the chunk's first block -> K of the next chunk), because the L2 streamer restarts at every 4 KiB page and at every 16 KiB block.
+  Pure hint, numerics untouched (verified bit-identical on 64-token logits dumps at ctx 1000/4000/8000 against the previous build). The engine maps the KV with MADV_HUGEPAGE since the same wave.
 * **Prefill**: `attn_prefill_group(L, table, P, g, t0, t1, out[n][3072])` for token range [t0,t1) of a batch: 2 query tokens x 3 heads per tile, keys streamed in 1024-key chunks
   (scores of a chunk live on the stack), never an n x n matrix. Items (g, token range) are independent. Per-token `tau` array. Odd ranges fall back to a 1-query tile.
 * The kernel takes `q`, `R` after clip and applies `tau/sqrt(128)` and `tau` itself; `gate` is the pre-sigmoid matvec output (nullptr = no gate).

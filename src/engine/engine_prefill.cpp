@@ -19,9 +19,11 @@
 #include <mutex>
 #include <map>
 #include <unordered_map>
+#include <vector>
 
 #include "ink/engine_prefill.h"
 #include "ink/kernels_gemm.h"
+#include "ink/kernels_gemv_multix.h"
 #include "ink/kernels_misc_simd.h"
 
 namespace ink {
@@ -220,6 +222,8 @@ PrefillTune make_tune() {
     t.attn_tq = env_int("INK_PF_ATTN_TQ", t.attn_tq);
     t.gemm_group = env_int("INK_PF_GROUP", t.gemm_group);
     if (const char* a = std::getenv("INK_PF_ATTN")) t.attn_decode_kernels = std::strcmp(a, "decode") == 0 ? 1 : 0;
+    t.multix = env_int("INK_PF_MULTIX", t.multix);
+    t.multix_check = env_int("INK_PF_MULTIX_CHECK", 0);
     return t;
 }
 
@@ -590,7 +594,7 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
                 const int tt = (int)(i % per_g);
                 const int64_t pos = c.pos0 + tt;
                 const int64_t n_keys = swa ? std::min<int64_t>(pos + 1, kSwaWindow) : pos + 1;
-                const int nsplit = (int)std::min<int64_t>(kMaxSplit, std::max<int64_t>(1, n_keys / split_keys));
+                const int nsplit = attn_decode_nsplit(n_keys, split_keys, kMaxSplit);   // E1 (wave 1): the decode executor's key-split rule, shared so the "decode kernels" mode stays bit-identical
                 const AttnQuery aq{X.q + (size_t)tt * kQW, X.rel + (size_t)tt * kRelW, X.sink + (size_t)tt * kNQHeads, X.gate + (size_t)tt * kQW,
                                    pos, swa ? 1.0f : X.tau[tt]};
                 AttnPartial parts[kMaxSplit];
@@ -618,7 +622,7 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
                 for (int tt = t0; tt < t1; ++tt) {
                     const int64_t pos = c.pos0 + tt;
                     const int64_t n_keys = swa ? std::min<int64_t>(pos + 1, kSwaWindow) : pos + 1;
-                    const int nsplit = (int)std::min<int64_t>(kMaxSplit, std::max<int64_t>(1, n_keys / split_keys));
+                    const int nsplit = attn_decode_nsplit(n_keys, split_keys, kMaxSplit);   // E1 (wave 1): the decode executor's key-split rule, shared so the "decode kernels" mode stays bit-identical
                     const AttnQuery aq{X.q + (size_t)tt * kQW, X.rel + (size_t)tt * kRelW, X.sink + (size_t)tt * kNQHeads, X.gate + (size_t)tt * kQW,
                                        pos, swa ? 1.0f : X.tau[tt]};
                     AttnPartial parts[kMaxSplit];
@@ -715,6 +719,11 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     const uint64_t used_exp = (uint64_t)X.n_used_experts;
 
     // ---------------------------------------------------------------- G: expert gate_up (gate chunk + matching up chunk) + scale + SiTU + Q8_0
+    // Kernel per item (K2, wave 1): experts with <= tu.multix routed pairs run the multi-activation GEMV (one weight stream, activations addressed indirectly
+    // through pair_token, no 4-row panel unpack); bigger experts run the batched GEMM. Both are bit-identical per (row, token) to the decode GEMV.
+    // nvfp4r (K1): the arena holds re-encoded NVFP4 scale bytes -> the nvfp4r_* kernels (K3's gemm_moe_nvfp4r, K2's gemv_nvfp4r_multix) must read them.
+    const int mx_max = std::min(c.tu.multix, kMultixMaxX);
+    const bool nvr = nv && L.nvfp4r;
     {
         const GemmAct axe = gemm_act_view(efmt, X.act_xe, n, kD);
         float* tmp = X.gu_tmp + (size_t)t.tid * X.gu_tmp_stride;
@@ -722,15 +731,54 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
             const MoeItem& it = X.items_gu[(size_t)i];
             const int p0 = X.route.offset[it.expert], p1 = X.route.offset[it.expert + 1], np = p1 - p0;
             const int w = it.row1 - it.row0, ldt = 2 * w;   // tile per pair: [w gate | w up]
-            float* yg = off_floats(tmp, -((int64_t)p0 * ldt + it.row0));
-            float* yu = off_floats(tmp, -((int64_t)p0 * ldt + (kFF + it.row0)) + w);
-            const MoeItem ig{it.expert, it.row0, it.row1}, iu{it.expert, kFF + it.row0, kFF + it.row1};
-            if (nv) {
-                gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
-                gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+            if (np <= mx_max) {
+                const block_q8_0* xs[kMultixMaxX];
+                for (int q = 0; q < np; ++q) xs[q] = X.xq + (size_t)X.route.pair_token[(size_t)(p0 + q)] * kQB;
+                const char* we = (const char*)L.gu + (size_t)it.expert * L.gu_eb;
+                auto mxk = nv ? (nvr ? gemv_nvfp4r_multix : gemv_nvfp4_multix) : gemv_q8_0_multix;
+                mxk(we + (size_t)it.row0 * L.gu_rs, L.gu_rs, w, xs, np, kD, tmp, (size_t)ldt);
+                mxk(we + (size_t)(kFF + it.row0) * L.gu_rs, L.gu_rs, w, xs, np, kD, tmp + w, (size_t)ldt);
+                if (c.tu.multix_check) {   // K2 diagnostic (INK_PF_MULTIX_CHECK=1): the GEMM path into a second tile must agree bit for bit
+                    static thread_local std::vector<float> chk;
+                    if (chk.size() < (size_t)np * ldt) chk.resize((size_t)np * ldt);
+                    float* t2 = chk.data();
+                    float* yg = off_floats(t2, -((int64_t)p0 * ldt + it.row0));
+                    float* yu = off_floats(t2, -((int64_t)p0 * ldt + (kFF + it.row0)) + w);
+                    const MoeItem ig{it.expert, it.row0, it.row1}, iu{it.expert, kFF + it.row0, kFF + it.row1};
+                    if (nvr) {
+                        gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                        gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                    } else if (nv) {
+                        gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                        gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                    } else {
+                        gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                        gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                    }
+                    for (int q = 0; q < np; ++q)
+                        for (int r = 0; r < ldt; ++r)
+                            if (std::memcmp(&tmp[(size_t)q * ldt + r], &t2[(size_t)q * ldt + r], 4) != 0) {
+                                std::fprintf(stderr, "MULTIX CHECK G: visit %d expert %d np %d rows [%d,%d) pair %d col %d (%s): multix %.9g gemm %.9g (token %d, n %d, tid %d)\n",
+                                             vis.index, it.expert, np, it.row0, it.row1, q, r, r < w ? "gate" : "up", (double)tmp[(size_t)q * ldt + r], (double)t2[(size_t)q * ldt + r],
+                                             X.route.pair_token[(size_t)(p0 + q)], n, t.tid);
+                                q = np;
+                                break;
+                            }
+                }
             } else {
-                gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
-                gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                float* yg = off_floats(tmp, -((int64_t)p0 * ldt + it.row0));
+                float* yu = off_floats(tmp, -((int64_t)p0 * ldt + (kFF + it.row0)) + w);
+                const MoeItem ig{it.expert, it.row0, it.row1}, iu{it.expert, kFF + it.row0, kFF + it.row1};
+                if (nvr) {
+                    gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                    gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                } else if (nv) {
+                    gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                    gemm_moe_nvfp4(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                } else {
+                    gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                    gemm_moe_q8_0(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                }
             }
             const float s = nv ? L.gu_scale[it.expert] : 1.0f;
             for (int q = 0; q < np; ++q) {
@@ -756,15 +804,41 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     dyn_range(c, t, np_all, 32, [&](int64_t b, int64_t e) { gemm_pack_act(efmt, X.actq, (int)b, (int)e, np_all, kFF, X.act_dn); });
     PBAR(PF_PACKDN, 0, 0);
 
-    // ---------------------------------------------------------------- H: expert down GEMM (pair-indexed activations) -> y_dn[pair][kD]
+    // ---------------------------------------------------------------- H: expert down GEMM (pair-indexed activations) -> y_dn[pair][kD]; same kernel choice as G
     {
         const GemmAct adn = gemm_act_view(efmt, X.act_dn, np_all, kFF);
         dyn_items(c, t, (int64_t)X.items_dn.size(), [&](int64_t i) {
             const MoeItem& it = X.items_dn[(size_t)i];
-            if (nv)
+            const int p0 = X.route.offset[it.expert], np = X.route.offset[it.expert + 1] - p0;
+            if (np <= mx_max) {
+                const block_q8_0* xs[kMultixMaxX];
+                for (int q = 0; q < np; ++q) xs[q] = X.actq + (size_t)(p0 + q) * kFB;
+                const char* we = (const char*)L.dn + (size_t)it.expert * L.dn_eb + (size_t)it.row0 * L.dn_rs;
+                auto mxk = nv ? (nvr ? gemv_nvfp4r_multix : gemv_nvfp4_multix) : gemv_q8_0_multix;
+                mxk(we, L.dn_rs, it.row1 - it.row0, xs, np, kFF, X.y_dn + (size_t)p0 * kD + it.row0, (size_t)kD);
+                if (c.tu.multix_check) {   // K2 diagnostic: GEMM into a thread-local buffer, compare
+                    static thread_local std::vector<float> chk;
+                    const int nr = it.row1 - it.row0;
+                    if (chk.size() < (size_t)(p0 + np) * kD) chk.resize((size_t)(p0 + np) * kD);
+                    if (nvr) gemm_moe_nvfp4r(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, chk.data(), kD);
+                    else if (nv) gemm_moe_nvfp4(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, chk.data(), kD);
+                    else gemm_moe_q8_0(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, chk.data(), kD);
+                    for (int q = 0; q < np; ++q)
+                        for (int r = 0; r < nr; ++r)
+                            if (std::memcmp(&X.y_dn[(size_t)(p0 + q) * kD + it.row0 + r], &chk[(size_t)(p0 + q) * kD + it.row0 + r], 4) != 0) {
+                                std::fprintf(stderr, "MULTIX CHECK H: visit %d expert %d np %d rows [%d,%d) pair %d row %d: multix %.9g gemm %.9g (n %d, tid %d)\n", vis.index, it.expert, np,
+                                             it.row0, it.row1, q, r, (double)X.y_dn[(size_t)(p0 + q) * kD + it.row0 + r], (double)chk[(size_t)(p0 + q) * kD + it.row0 + r], n, t.tid);
+                                q = np;
+                                break;
+                            }
+                }
+            } else if (nvr) {
+                gemm_moe_nvfp4r(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, X.y_dn, kD);
+            } else if (nv) {
                 gemm_moe_nvfp4(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, X.y_dn, kD);
-            else
+            } else {
                 gemm_moe_q8_0(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, X.y_dn, kD);
+            }
         });
         PBAR(PF_DOWN, (uint64_t)np_all * kD * kFF, used_exp * (uint64_t)kD * L.dn_rs);
     }
@@ -872,8 +946,15 @@ void chunk_body(PCtx& c, PTh& t) {
         PBAR(PF_LMHEAD, (uint64_t)H.rows * kD, H.bytes());
     } else {
         const GemmAct afin = gemm_act_view(GEMM_FMT_Q8, X.act_fin, n, kD);
+        const bool lm_mx = n <= std::min(c.tu.multix, kMultixMaxX);   // K2 (wave 1): verify (n = T <= 8 rows) -> one lm_head stream for all rows; bit-identical to gemm_q8_0
+        const block_q8_0* lm_xs[kMultixMaxX];
+        if (lm_mx)
+            for (int tt = 0; tt < n; ++tt) lm_xs[tt] = X.fin_q + (size_t)tt * kQB;
         dyn_range(c, t, H.rows, 32, [&](int64_t b, int64_t e) {
-            gemm_q8_0((const char*)H.w + (size_t)b * H.rs, H.rs, afin, 0, n, kD, c.logits_all + b, (size_t)nv, (int)(e - b));
+            if (lm_mx)
+                gemv_q8_0_multix((const char*)H.w + (size_t)b * H.rs, H.rs, (int)(e - b), lm_xs, n, kD, c.logits_all + b, (size_t)nv);
+            else
+                gemm_q8_0((const char*)H.w + (size_t)b * H.rs, H.rs, afin, 0, n, kD, c.logits_all + b, (size_t)nv, (int)(e - b));
             for (int tt = 0; tt < n; ++tt) vsoftcap(c.logits_all + (size_t)tt * nv + b, c.logits_all + (size_t)tt * nv + b, (size_t)(e - b), cfg.final_logit_softcap);
         });
         PBAR(PF_LMHEAD, (uint64_t)n * H.rows * kD, H.bytes());
@@ -1042,6 +1123,7 @@ int engine_verify(Engine& E, int slot, const int32_t* tokens, int T, float* logi
     if (X.pend_slot >= 0) return -8;           // previous verify not committed
     PrefillTune gt = prefill_tune();
     gt.attn_decode_kernels = (exact < 0 ? verify_exact_default() : exact != 0) ? 1 : 0;
+    gt.tok_claim = env_int("INK_VERIFY_TOK", 1);   // K2: one row per token-parallel item (T <= 8 rows; the prefill default of 4 left most threads idle in those phases)
     build_proj_items(E, gt, X.items_proj);
     pin_calling_thread(E);
     const size_t rec_visit = (size_t)(T + 3) * (2 * kKVW + 2 * kD);

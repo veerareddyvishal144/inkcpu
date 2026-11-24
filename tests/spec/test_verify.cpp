@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> text = prompt("long_context_qa");   // 715 tokens of real text
     while (text.size() < 2200) text.insert(text.end(), text.begin(), text.begin() + std::min<size_t>(715, 2200 - text.size()));   // repeated text for the wrap case
     std::printf("test_verify %s, load %s\n", mode.c_str(), load1().c_str());
+    if (mode == "k2") run_p(E, text, 40, {4}, {0});   // K2 (wave 1): fast bisect cell (T = 4, fast attention, p = 40)
     if (mode == "quick" || mode == "all") run_p(E, text, 40, {2, 4, 8}, {1, 0});
     if (mode == "quick" || mode == "block" || mode == "all") run_p(E, text, 61, {8}, {1});
     if (mode == "wrap" || mode == "all") run_p(E, text, 2044, {8}, {1});

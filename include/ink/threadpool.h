@@ -4,6 +4,8 @@
 //   pool.run([&](int tid, int n) { ...phase 1...; pool.barrier(); ...phase 2... });
 //
 // Hot path (dispatch, join, barrier) uses only cache-line-padded atomics and _mm_pause: no futex, no condvar.
+// Idle workers spin idle_spin_us after a job and then PARK on a futex (zero CPU) until the next dispatch; the dispatcher
+// issues the futex wake only when a worker is parked (one extra load on the hot path, no syscall). Agent T, wave 1.
 // Every thread of a run() must call barrier() the same number of times. run() must not be called concurrently
 // or re-entrantly (one dispatcher thread per pool).
 #pragma once
@@ -24,8 +26,8 @@ public:
     // nthreads includes the calling thread (tid 0). cpus[i] is the logical CPU for thread i (shorter lists wrap).
     // Empty list = CPUs 0,2,4,... (first hyperthread of each physical core), then 1,3,5,... if nthreads > ncpu/2.
     // pin=false skips all affinity calls (the caller thread is pinned too when pin=true).
-    // idle_spin_us: workers spin this long after finishing a job, then poll with 20 us sleeps until the next job
-    // (the next run() after a long idle gap then costs up to ~100 us once).
+    // idle_spin_us: workers spin this long after finishing a job, then park on a futex until the next job (the next run()
+    // after a long idle gap then costs one futex wake, ~30-100 us once). Env INK_POOL_PARK=0: legacy 20 us nanosleep polling.
     explicit ThreadPool(int nthreads, std::vector<int> cpus = {}, bool pin = true, int idle_spin_us = 2000);
     ~ThreadPool();
     ThreadPool(const ThreadPool&) = delete;
@@ -72,6 +74,10 @@ public:
     // Thread id inside run(), -1 outside.
     static int current_tid();
 
+    // Diagnostics: workers currently parked on the futex (0 while a token is being decoded), and futex wakes issued so far.
+    int parked() const;
+    uint64_t wakeups() const { return wakeups_; }
+
 private:
     struct alignas(64) Slot {
         std::atomic<uint32_t> v;
@@ -84,15 +90,18 @@ private:
     };
     void worker_main(int tid);
     uint32_t wait_epoch(uint32_t seen);
+    void publish_epoch(uint32_t e);   // epoch store + futex wake when a worker is parked
 
     int n_;
     bool pin_;
+    bool park_;                       // futex parking (default) vs legacy nanosleep polling (INK_POOL_PARK=0)
     uint64_t idle_cycles_;
     std::vector<int> cpus_;
-    std::unique_ptr<Slot[]> slots_;   // [0]=epoch, [1]=barrier release, [2+i]=done[i], [2+n+i]=arrive[i], [2+2n+i]=barrier counter[i], [2+3n]=chunk counter
+    std::unique_ptr<Slot[]> slots_;   // [0]=epoch, [1]=barrier release, [2+i]=done[i], [2+n+i]=arrive[i], [2+2n+i]=barrier counter[i], [2+3n]=chunk counter, [3+3n]=parked workers
     std::unique_ptr<JobDesc> job_;
     std::vector<std::unique_ptr<WorkerHandle>> workers_;
     uint32_t epoch_local_ = 0;
+    uint64_t wakeups_ = 0;
 };
 
 }  // namespace ink

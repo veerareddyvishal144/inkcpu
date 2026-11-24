@@ -103,3 +103,65 @@ Freshly downloaded `/data/inkling-mini/models_fresh/Inkling-2-Mini-UD-Q4_K_XL.gg
 `test_prefill quick`: prefill == decode bit-identical, vs llama.cpp cosine 0.99983, argmax equal. `tests/engine/test_capi.py` PASS. `server/tests/test_ink_real.py` on the new file: 15/15
 (a-h, speculation i-l, rewind m-o; b re-run after restoring effort-0 semantics). Production now serves the canonical file (`INK_MODEL_DIR=/data/inkling-mini/models_fresh`), identical
 greedy output to the interim file. llama.cpp (2a28df0f9, PR 32218) cannot load the canonical file: oracle tooling keeps the interim copy in `models/`.
+
+## 2026-11-23 Optimisation wave 1 (orchestrator + agents K1, K2, K3, E1, T, R; contract `docs/OPT_WAVE1.md`, per-agent logs `docs/status/{K1,K2,K3,E1,T}.md`, research `docs/RESEARCH_WAVE1.md`)
+
+Question: how much more speed is in the engine on this host without changing what it computes? Everything below is bit-identical to the pre-wave build
+(same logits at ctx 16 / 1000 / 4000 / 8000, prefill == decode, verify == decode) unless marked otherwise; parity with llama.cpp is therefore unchanged.
+
+### What changed (all default ON unless noted)
+1. **NVFP4 sub-block scales re-encoded at load** (`include/ink/nvfp4_repack.h`, K1): code = (e+11)<<3 | man3, decode = bitcast(code<<20) * 2^116, exact for all 256 UE4M3
+   bytes (self-check), applied in place to the arena copy of the expert tensors of layers 0-19 while copying (+0.3 s load). 16 scales now decode in 3 vector uops instead of
+   16 table loads. `INK_NVFP4R=0` restores the GGUF-encoded kernels.
+2. **Decode expert GEMV `gemv_nvfp4r`** (K1): 8-row groups, grouped scale gather, per-call activation precompute; 14.8 instructions per 36-byte row super-block instead of 26.8,
+   2.4 loads instead of 9. Phase G (gate_up) 22.3 -> 18.0 ms/token (55 -> 68 GB/s) in K1's same-window run; phase H (down) unchanged at ~52 GB/s: bound by its 16-row call
+   structure (144 tiles per visit), not by the kernel (open item).
+3. **Prefill / verify GEMM** (K3): `gemm_moe_nvfp4r` unpack with vector scale decode (unpack 1.2-1.6x faster), batched bit-identical epilogue for all Q8_0/NVFP4 GEMMs (49 uops
+   instead of ~160 per tile), batched tail tiles. MoE layer at 16 threads on the real `code.rtrace` routing: +9.2 % (64 tokens), +4.8 % (256), +3.5 % (1024).
+4. **Small-n expert matmuls `gemv_*_multix`** (K2): one weight stream against up to 8 activation vectors (shared nibble/scale decode, per-token arithmetic identical to the GEMV),
+   used by prefill/verify phases G/H for experts with <= 8 routed pairs (`INK_PF_MULTIX`, 0 = GEMM always), by the verify lm_head and by the drafter's lm_head. Verify step
+   T=4: 2.58x -> 2.15x a plain step, T=8: 4.11x -> 3.43x (near-idle, 12 threads); speculation policy priors re-measured (`include/ink/spec.h` verify_ratio). Short prefill
+   16 tokens +18 %, 64 tokens +9 %.
+5. **Decode executor** (E1): KV cache mapped 2 MiB-aligned with MADV_HUGEPAGE (`INK_KV_HUGE=0` off), K/V software prefetch across block boundaries, finish-by-last-split
+   (2 barriers instead of 3 per split attention visit), controllers' gain+forget fused with ctrl_apply (2 barriers instead of 3), attention group-input prefetch. Attention phase
+   -11..-19 % at ctx >= 1000 (ctx 8000: 9.95 -> 8.1 ms/token, KV read 43 -> 53 GB/s); barriers per token 576 -> 528. Measured and left OFF: finer key split above 767 keys
+   (`INK_ATTN_GRANULE`, no gain), idle-thread weight prefetch during serial segments (`INK_PF_ROUNDS`, -5 %: software prefetches drain through the L1 fill buffers).
+6. **Thread pool parks idle workers on a futex** (T; `INK_POOL_PARK=0` = old 20 us polling): idle 16-thread pool 0.12-0.16 % of one core instead of 86-120 % (50 us slack) or
+   7 % (production's 5 ms slack); hot path unchanged within noise; first dispatch after an idle gap median 183 us vs 81 us. The old polling pool of the idle PRODUCTION server
+   preempted every 16-thread benchmark ~3000 times/s (2-3 ms/token of barrier stalls in every measurement taken while it ran).
+7. **Server** (T): per-token overhead measured at 0.21-0.36 ms (greedy) / 1.2-1.5 ms (sampled, numpy) = 0.3-2 % of a token; start-up hygiene (affinity before numpy import,
+   OPENBLAS/OMP threads = 1); optional C sampler (`--sampler c`, slower than numpy here, off).
+
+### Findings that closed doors
+* SMT (T, idle host, lock): decode 14.05 / 13.88 / 14.28 / 10.95 tok/s at 16 / 20 / 24 / 32 threads (ctx 16); prefill 256 tokens 82.3 / 72.3 / 71.4 / 74.4. The GEMMs saturate the FMA
+  ports with one thread per core, the spin barriers convoy with more threads than free vCPUs. One thread per physical core stays.
+* R1 of the research report (integer-folded sub-block scales): no uop advantage once the scales are gathered per 4-row group; not implemented. ik_llama.cpp / llama.cpp repacked
+  4-bit paths all require VNNI; no published no-VNNI 4-bit kernel beats the 5-uop MAC chain (`docs/RESEARCH_WAVE1.md`).
+* Numerics-deviating prototype left OFF: K3's 4-uop GEMM inner loop (`gemm_moe_nvfp4r_x4`, +7-11 % on the MoE GEMMs, ESTIMATE ~+6-7 % prefill) flips 1 of 55296 int8 outputs at
+  re-quantisation and would end prefill == decode bit-identity. Decision deferred to the owner.
+
+### Gates on the integrated build (`build-final`, default flags)
+Unit: test_gemv 3981 cases, test_gemv_multix 2813, test_gemm 2454, test_threadpool, test_quantize, test_kernels_misc, test_policy, test_sampler, test_gguf: all pass; server mock suite 73/73.
+Full model (under the lock, `build-final/gates/00_summary.txt`): `test_engine oracle` reproduces the section-8 table of ENGINE_DESIGN.md digit for digit (incl. the m2_code_c
+noise-floor label), `greedy` PASS, `determinism` bit-identical over 16/16/12/8/8/5 threads, `slots` + both ring wraps PASS (cosine 0.9993749 / 0.9995351 = C1's values),
+`test_prefill quick` prefill == decode bit for bit (logits, conv histories, all KV) in both attention modes, `test_verify quick` PASS (T=2/4/8, exact and fast attention),
+`test_rewind quick` ALL PASS, C ABI smoke test PASS, decode logits of the 6 oracle prompts + 32 greedy steps bit-identical between INK_NVFP4R=0 and 1, `test_drafter model`
+265/265. Server: 73/73 mock tests, 15/15 real-engine tests (greedy via HTTP == raw libink == llama.cpp, speculation, stop tokens, tool calls, rewind, Caret pattern).
+Production restarted on the integrated build at 20:46 UTC (idle CPU 0 % instead of 12 %).
+
+### Final idle-host benchmark (`tools/final_bench_wave1.sh build-orch build-final build-final/final_bench`, 20:47-21:3x UTC, host idle 98 % at start, production idle on the new pool)
+Old = the pre-wave build (build-orch, commit 95f2cab), new = build-final with all wave-1 defaults; old and new alternated in the same lock window (two runs each, best rep and all reps).
+
+| metric (16 threads unless noted) | old | new | change |
+|---|---|---|---|
+| decode ctx 16 (64 tokens x 3 reps, runs A / B) | 13.99 (13.39 13.99 12.85) / 14.34 (14.34 14.12 13.83) tok/s | 14.74 (14.48 14.74 14.32) / 15.76 (15.76 15.52 14.89) | +5..+10 % |
+| decode ctx 1000 | 13.40 (13.08 12.70 13.40) / 13.18 (13.18 12.91 12.86) | 14.30 (14.04 14.11 14.30) / 14.86 (14.36 14.86 14.18) | +7..+13 % |
+| decode ctx 16, 12 threads | 13.86 (2026-11-22 baseline) | 15.33 (15.18 15.33 15.18) | +11 % |
+| decode ctx 8000 (context built by prefill) | n/a | 13.75 (13.75 13.62); attention 8.0 ms/token = 54 GB/s of KV | |
+| decode ctx 16000 | n/a | 12.99 (12.72 12.99); attention 11.3 ms/token = 61 GB/s | |
+| prefill 256 / 512 / 1024 tokens (chunk 256) | 80.6 / 82.8 / 80.1 tok/s | 86.8 / 83.5 / 82.3 | +8 / +1 / +3 % |
+| prefill 1024 tokens, chunk 512 (server default) | n/a | 86.6 | |
+SPEC_ROWS_PLACEHOLDER
+Run-to-run spread of identical configurations is ~5 % on this VM (the two old runs differ by 2.5 %, the two new runs by 7 %), so the decode gain is "+6..+10 %" rather than a single number;
+the per-phase profiles (INK_PROFILE=1 in the result files) attribute it to gate_up (22 -> 18 ms), attention at long context, controllers and fewer barriers. Prefill's gain is the
+K3 unpack/epilogue plus K2's multix for small experts (+8 % at 256 tokens, ~+3 % at 1024). What did NOT change: bytes per token (3.87 GB) and therefore the ~20 tok/s exact floor.

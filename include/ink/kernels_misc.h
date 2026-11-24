@@ -126,6 +126,13 @@ void attn_decode_task(const KvLayer& L, const float* rel_table, const AttnQuery&
 void attn_decode_finish(const AttnQuery& q, int g, const AttnPartial* parts /*[nsplit]*/, int nsplit, float* out /*[3072]*/);
 // serial convenience: scratch must hold 8*nsplit partials (index g*nsplit+s)
 void attn_decode(const KvLayer& L, const float* rel_table, const AttnQuery& q, int nsplit, AttnPartial* scratch, float* out /*[3072]*/);
+// Key-split rule of the decode executor, shared with every executor that runs attn_decode_task per token (prefill / verify in their
+// "decode kernels" mode must call the same function to stay bit-identical to decode). Depends on the visible keys only, never on threads:
+//   n_keys < 2*split_keys (767 with the default 384): 1 split (the prefill tile kernel is bit-identical to decode in this regime);
+//   else, by default (granule 0), the legacy rule n_keys / split_keys clamped to [1, max_split]; with env INK_ATTN_GRANULE=g > 0: ceil(n_keys / g) clamped to
+//   [2, max_split] (measured 2026-11-23: g = 256 gives 4 instead of 2 splits per SWA visit without a measurable gain, so it stays opt-in).
+int attn_decode_nsplit(int64_t n_keys, int split_keys, int max_split);
+int attn_set_split_granule(int granule);   // process-wide override of the granule (benchmarks; < 0 = query only); returns the previous value
 // Heuristic from the measurements in docs/KERNELS_MISC.md: enough (group, split) items to occupy n_threads, one split per
 // 8 threads' worth for a window-sized key range.  Results change bit-wise with nsplit (not with the thread count).
 inline int attn_suggest_nsplit(int64_t n_keys, int n_threads) {

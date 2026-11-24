@@ -50,9 +50,13 @@ struct Scratch {
     alignas(64) float fin_x[kD];
     alignas(64) block_q8_0 fin_q[kD / 32];
     alignas(64) float taps[kEngineTapFloats];   // taps of the last token (written only when a tap sink / tap capture is requested)
+    alignas(64) std::atomic<uint32_t> pf_stop;  // prefetch stop epoch: bumped by a thread about to enter a barrier that idle prefetchers wait for
+    alignas(64) std::atomic<uint64_t> fine_t1_arrive;   // INK_FINE: rdtsc of thread 1's arrival at the phase-A barrier (waiter-side barrier timing)
     int used_phases = 0;                      // dynamic-scheduling counters used by the previous token (reset only those)
 };
 
 std::vector<int> engine_default_cpus(int n);
+// E1 debug: fine rdtsc breakdown of phase A (serial work vs barrier) and phase C (pre / task / finish / barrier wait) on thread 0, enabled by env INK_FINE=1
+void engine_fine_report(FILE* f, double tsc_per_us);   // tsc_per_us from Engine::prof (<= 0: kcycles)
 
 }  // namespace ink

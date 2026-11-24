@@ -40,6 +40,7 @@ class ServerConfig:
     sse_keepalive_s: float = 10.0   # SSE comment line every N s while no event is pending (long prefills)
     default_reasoning_effort: Optional[str] = None   # used when a request carries no reasoning_effort (None = template default 0.9)
     spec: bool = True                       # use the backend's speculative steps when it has them (penalties always use plain decode)
+    c_sampler: bool = False                 # --sampler c: ink_sample for plain-path sampling too (default: the numpy Sampler, unchanged behaviour)
 
 
 class ApiError(Exception):
@@ -135,7 +136,7 @@ def create_app(backend: Backend, cfg: Optional[ServerConfig] = None, tokenizer: 
         reqlog.write(rec)
 
     sched = Scheduler(backend, tok, max_queue=cfg.max_queue, prefill_chunk=cfg.prefill_chunk, on_finish=on_finish, spec=cfg.spec,
-                      prefix_reuse_min=cfg.prefix_reuse_min)
+                      prefix_reuse_min=cfg.prefix_reuse_min, c_sampler=cfg.c_sampler)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -6,13 +6,24 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "ink/kernels_gemv.h"
+#include "ink/nvfp4_repack.h"
 
 namespace ink {
 
 int g_gemv_prefetch_bytes = 512;
 int g_gemv_prefetch_hint = 0;
+int g_gemv_nvfp4r_group = [] {   // rows per group of the nvfp4r kernel (4 or 8); env INK_NVFP4R_GROUP for A/B experiments
+    const char* s = std::getenv("INK_NVFP4R_GROUP");
+    const int v = s && *s ? std::atoi(s) : 8;
+    return v == 4 ? 4 : 8;
+}();
+int g_gemv_nvfp4r_pre = [] {     // 1 (default): per-call precompute of the shared activation vectors (XP, C, DX) per super-block; env INK_NVFP4R_PRE=0 off
+    const char* s = std::getenv("INK_NVFP4R_PRE");
+    return s && *s ? (std::atoi(s) != 0) : 1;
+}();
 
 namespace {
 
@@ -160,6 +171,152 @@ void nvfp4_rows(const char* w, size_t rs, const void* xv, int nsb, float* y, int
     for (int r = 0; r < R; ++r) y[r] = hsum16(acc[r]);
 }
 
+// ------------------------------------------------------------------ NVFP4 with RE-ENCODED scales ("nvfp4r") x Q8_0
+// Same nibble / integer path as nvfp4_rows. The sub-block scale bytes are the re-encoded codes of include/ink/nvfp4_repack.h
+// (engine arena after the load-time repack): for every group of up to 4 rows the 4 x 4 scale bytes of the current super-block are
+// gathered into one xmm (vmovd + 3 vpinsrd, 4 loads), decoded with 3 vector uops (vpmovzxbd, vpslld 20, vmulps 2^116), multiplied
+// ONCE by the activation scales [dx0 dx0 dx1 dx1] x 4 and expanded per row with ONE vpermps (lane l of row j <- element
+// 4j + ((l & 7) >> 1)). That replaces 8 scalar loads + 3 vinsertps + vmulps + vpermps per row super-block.
+// Bit-identity: code_f * 2^116 is exact (= ue4m3_to_f32 of the original byte, see the header), so S_l = fl(ue4m3 * dx) is the same
+// float as in nvfp4_rows and gemv_nvfp4_ref; the integer sums, the fma order and the reduction tree are unchanged.
+template <int R, int H>
+void nvfp4r_rows(const char* w, size_t rs, const void* xv, int nsb, float* y, int pf) {
+    static_assert(R == 1 || R == 2 || R == 4 || R == 8, "row group");
+    const block_q8_0* x = static_cast<const block_q8_0*>(xv);
+    const __m512i TBL = _mm512_broadcast_i32x4(_mm_setr_epi8(12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0));
+    const __m512i M0F = _mm512_set1_epi8(0x0F);
+    const __m512i SH = _mm512_setr_epi64(0, 0, 0, 0, 4, 4, 4, 4);
+    const __m512i IDXQ = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m512i ONES16 = _mm512_set1_epi16(1);
+    const __m512i U12 = _mm512_set1_epi8(12);
+    const __m512i IDXDX = _mm512_setr_epi32(0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1);   // (dx0, dx1, ., .) -> [dx0 dx0 dx1 dx1] x 4
+    const __m512i IDXR0 = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1, 2, 2, 3, 3);   // row j of a group: IDXR0 + 4j
+    const __m512i IDXR1 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(4));
+    const __m512i IDXR2 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(8));
+    const __m512i IDXR3 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(12));
+    constexpr int NG = (R + 3) / 4;
+    __m512 acc[R];
+    const char* wr[R];
+    for (int r = 0; r < R; ++r) {
+        acc[r] = _mm512_setzero_ps();
+        wr[r] = w + (size_t)r * rs;
+    }
+    auto ld32 = [](const char* p) {
+        int32_t v;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    for (int sb = 0; sb < nsb; ++sb) {
+        const block_q8_0* xb = x + 2 * sb;
+        const __m512i XP = _mm512_permutexvar_epi64(IDXQ, ld2(xb[0].qs, xb[1].qs));
+        const __m512i C = _mm512_madd_epi16(_mm512_maddubs_epi16(U12, XP), ONES16);
+        const __m128 dx2 = _mm_cvtph_ps(_mm_cvtsi32_si128((int)((uint32_t)xb[0].d | ((uint32_t)xb[1].d << 16))));
+        const __m512 DX = _mm512_permutexvar_ps(IDXDX, _mm512_castps128_ps512(dx2));
+        const size_t off = (size_t)sb * sizeof(block_nvfp4);
+        __m512 S16[NG];
+        for (int g = 0; g < NG; ++g) {
+            __m128i sc = _mm_cvtsi32_si128(ld32(wr[4 * g] + off));
+            if (4 * g + 1 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 1] + off), 1);
+            if (4 * g + 2 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 2] + off), 2);
+            if (4 * g + 3 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 3] + off), 3);
+            S16[g] = _mm512_mul_ps(nvfp4r_decode16v(sc), DX);
+        }
+        for (int r = 0; r < R; ++r) {
+            const char* wp = wr[r] + off;
+            pf1<H>(wp + pf);
+            const block_nvfp4* wb = reinterpret_cast<const block_nvfp4*>(wp);
+            const __m512i Q = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)wb->qs));
+            const __m512i N = _mm512_and_si512(_mm512_srlv_epi64(Q, SH), M0F);
+            const __m512i Wu = _mm512_shuffle_epi8(TBL, N);
+            const __m512i I = _mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(Wu, XP), ONES16), C);
+            const __m512i idx = (r & 3) == 0 ? IDXR0 : (r & 3) == 1 ? IDXR1 : (r & 3) == 2 ? IDXR2 : IDXR3;
+            const __m512 S = _mm512_permutexvar_ps(idx, S16[r >> 2]);
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(I), S, acc[r]);
+        }
+    }
+    // fully unrolled so that acc[] stays in registers (a rolled epilogue made gcc store all R accumulators every super-block)
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r) y[r] = hsum16(acc[r]);
+}
+
+// Variant with the per-super-block activation vectors precomputed once per call (nvfp4r_prepare_act): saves the XP / C / DX work
+// (vinserti64x4, vpermq, vpmaddubsw, vpmaddwd, vcvtph2ps, vpermps ~ 8 ALU uops per group super-block) at the cost of 3 L1 loads.
+struct alignas(64) NvAct {
+    __m512i XP;   // activation bytes in the shuffled nibble order
+    __m512i C;    // sum(12 * x) per int32 lane
+    __m512 DX;    // [dx0 dx0 dx1 dx1] x 4
+};
+constexpr int kNvActMax = 72;   // K <= 4608
+
+inline void nvfp4r_prepare_act(const block_q8_0* x, int nsb, NvAct* act) {
+    const __m512i IDXQ = _mm512_setr_epi64(0, 2, 4, 6, 1, 3, 5, 7);
+    const __m512i ONES16 = _mm512_set1_epi16(1);
+    const __m512i U12 = _mm512_set1_epi8(12);
+    const __m512i IDXDX = _mm512_setr_epi32(0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1);
+    for (int sb = 0; sb < nsb; ++sb) {
+        const block_q8_0* xb = x + 2 * sb;
+        const __m512i XP = _mm512_permutexvar_epi64(IDXQ, ld2(xb[0].qs, xb[1].qs));
+        act[sb].XP = XP;
+        act[sb].C = _mm512_madd_epi16(_mm512_maddubs_epi16(U12, XP), ONES16);
+        const __m128 dx2 = _mm_cvtph_ps(_mm_cvtsi32_si128((int)((uint32_t)xb[0].d | ((uint32_t)xb[1].d << 16))));
+        act[sb].DX = _mm512_permutexvar_ps(IDXDX, _mm512_castps128_ps512(dx2));
+    }
+}
+
+template <int R, int H>
+void nvfp4r_rows_pre(const char* w, size_t rs, const void* xv, int nsb, float* y, int pf) {
+    static_assert(R == 1 || R == 2 || R == 4 || R == 8, "row group");
+    const NvAct* act = static_cast<const NvAct*>(xv);
+    const __m512i TBL = _mm512_broadcast_i32x4(_mm_setr_epi8(12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0));
+    const __m512i M0F = _mm512_set1_epi8(0x0F);
+    const __m512i SH = _mm512_setr_epi64(0, 0, 0, 0, 4, 4, 4, 4);
+    const __m512i ONES16 = _mm512_set1_epi16(1);
+    const __m512i IDXR0 = _mm512_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3, 0, 0, 1, 1, 2, 2, 3, 3);
+    const __m512i IDXR1 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(4));
+    const __m512i IDXR2 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(8));
+    const __m512i IDXR3 = _mm512_add_epi32(IDXR0, _mm512_set1_epi32(12));
+    constexpr int NG = (R + 3) / 4;
+    __m512 acc[R];
+    const char* wr[R];
+    for (int r = 0; r < R; ++r) {
+        acc[r] = _mm512_setzero_ps();
+        wr[r] = w + (size_t)r * rs;
+    }
+    auto ld32 = [](const char* p) {
+        int32_t v;
+        std::memcpy(&v, p, 4);
+        return v;
+    };
+    for (int sb = 0; sb < nsb; ++sb) {
+        const __m512i XP = act[sb].XP;
+        const __m512i C = act[sb].C;
+        const __m512 DX = act[sb].DX;
+        const size_t off = (size_t)sb * sizeof(block_nvfp4);
+        __m512 S16[NG];
+        for (int g = 0; g < NG; ++g) {
+            __m128i sc = _mm_cvtsi32_si128(ld32(wr[4 * g] + off));
+            if (4 * g + 1 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 1] + off), 1);
+            if (4 * g + 2 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 2] + off), 2);
+            if (4 * g + 3 < R) sc = _mm_insert_epi32(sc, ld32(wr[4 * g + 3] + off), 3);
+            S16[g] = _mm512_mul_ps(nvfp4r_decode16v(sc), DX);
+        }
+        for (int r = 0; r < R; ++r) {
+            const char* wp = wr[r] + off;
+            pf1<H>(wp + pf);
+            const block_nvfp4* wb = reinterpret_cast<const block_nvfp4*>(wp);
+            const __m512i Q = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*)wb->qs));
+            const __m512i N = _mm512_and_si512(_mm512_srlv_epi64(Q, SH), M0F);
+            const __m512i Wu = _mm512_shuffle_epi8(TBL, N);
+            const __m512i I = _mm512_sub_epi32(_mm512_madd_epi16(_mm512_maddubs_epi16(Wu, XP), ONES16), C);
+            const __m512i idx = (r & 3) == 0 ? IDXR0 : (r & 3) == 1 ? IDXR1 : (r & 3) == 2 ? IDXR2 : IDXR3;
+            const __m512 S = _mm512_permutexvar_ps(idx, S16[r >> 2]);
+            acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(I), S, acc[r]);
+        }
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < R; ++r) y[r] = hsum16(acc[r]);
+}
+
 // ------------------------------------------------------------------ BF16 x F32 and F32 x F32
 inline __m512 bf16x16(const char* p) {
     return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i*)p)), 16));
@@ -252,6 +409,41 @@ inline void drive(const char* w, size_t rs, size_t rowbytes, int nrows, float* y
         default: drive<0>((const char*)w, rs, RB, nrows, y, x, N, ROWS<4, 0>, ROWS<2, 0>, ROWS<1, 0>, pf); break; \
     }
 
+// 8-row groups (nvfp4r): the next group's row heads are prefetched while the current group runs; tails use 4, 2, 1 rows.
+template <int H>
+inline void drive8(const char* w, size_t rs, size_t rowbytes, int nrows, float* y, const void* x, int n, RowsFn f8, RowsFn f4,
+                   RowsFn f2, RowsFn f1, int pf) {
+    const int hb = (int)std::min<size_t>((size_t)std::max(pf, 0), rowbytes);
+    const int first = nrows < 8 ? nrows : 8;
+    for (int i = 0; i < first; ++i) pf_head<H>(w + (size_t)i * rs, hb);
+    int r = 0;
+    for (; r + 8 <= nrows; r += 8) {
+        const int nxt = std::min(8, nrows - (r + 8));
+        for (int i = 0; i < nxt; ++i) pf_head<H>(w + (size_t)(r + 8 + i) * rs, hb);
+        f8(w + (size_t)r * rs, rs, x, n, y + r, pf);
+    }
+    int rem = nrows - r;
+    if (rem >= 4) {
+        f4(w + (size_t)r * rs, rs, x, n, y + r, pf);
+        r += 4;
+        rem -= 4;
+    }
+    if (rem >= 2) {
+        f2(w + (size_t)r * rs, rs, x, n, y + r, pf);
+        r += 2;
+        rem -= 2;
+    }
+    if (rem == 1) f1(w + (size_t)r * rs, rs, x, n, y + r, pf);
+}
+
+#define INK_DRIVE8(ROWS, RB, N)                                                                                               \
+    switch (g_gemv_prefetch_hint) {                                                                                           \
+        case 1: drive8<1>((const char*)w, rs, RB, nrows, y, x, N, ROWS<8, 1>, ROWS<4, 1>, ROWS<2, 1>, ROWS<1, 1>, pf); break; \
+        case 2: drive8<2>((const char*)w, rs, RB, nrows, y, x, N, ROWS<8, 2>, ROWS<4, 2>, ROWS<2, 2>, ROWS<1, 2>, pf); break; \
+        case 3: drive8<3>((const char*)w, rs, RB, nrows, y, x, N, ROWS<8, 3>, ROWS<4, 3>, ROWS<2, 3>, ROWS<1, 3>, pf); break; \
+        default: drive8<0>((const char*)w, rs, RB, nrows, y, x, N, ROWS<8, 0>, ROWS<4, 0>, ROWS<2, 0>, ROWS<1, 0>, pf); break; \
+    }
+
 }  // namespace
 
 // ------------------------------------------------------------------ public single-matrix kernels
@@ -267,6 +459,35 @@ void gemv_nvfp4(const void* w, size_t rs, const block_q8_0* x, int k, float* y, 
     if (k <= 0 || k % QK_NVFP4) bad_k("gemv_nvfp4", k);
     const int pf = g_gemv_prefetch_bytes;
     INK_DRIVE(nvfp4_rows, row_bytes_nvfp4(k), k / QK_NVFP4)
+}
+
+namespace {
+void gemv_nvfp4r_pre(const void* w, size_t rs, const NvAct* x, int k, float* y, int nrows) {
+    const int pf = g_gemv_prefetch_bytes;
+    if (g_gemv_nvfp4r_group == 8) {
+        INK_DRIVE8(nvfp4r_rows_pre, row_bytes_nvfp4(k), k / QK_NVFP4)
+    } else {
+        INK_DRIVE(nvfp4r_rows_pre, row_bytes_nvfp4(k), k / QK_NVFP4)
+    }
+}
+}  // namespace
+
+void gemv_nvfp4r(const void* w, size_t rs, const block_q8_0* x, int k, float* y, int nrows) {
+    if (nrows <= 0) return;
+    if (k <= 0 || k % QK_NVFP4) bad_k("gemv_nvfp4r", k);
+    const int nsb = k / QK_NVFP4;
+    if (g_gemv_nvfp4r_pre && nrows >= 8 && nsb <= kNvActMax) {   // the precompute pays off from one 8-row group on
+        alignas(64) NvAct act[kNvActMax];
+        nvfp4r_prepare_act(x, nsb, act);
+        gemv_nvfp4r_pre(w, rs, act, k, y, nrows);
+        return;
+    }
+    const int pf = g_gemv_prefetch_bytes;
+    if (g_gemv_nvfp4r_group == 8) {
+        INK_DRIVE8(nvfp4r_rows, row_bytes_nvfp4(k), nsb)
+    } else {
+        INK_DRIVE(nvfp4r_rows, row_bytes_nvfp4(k), nsb)
+    }
 }
 
 void gemv_bf16(const void* w, size_t rs, const float* x, int k, float* y, int nrows) {
@@ -308,6 +529,11 @@ void gemv_multi_q8_0(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1) 
 void gemv_multi_nvfp4(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1) {
     multi_walk(m, nm, vr0, vr1, [&](const void* w, size_t rs, const void* x, float* y, int n) {
         gemv_nvfp4(w, rs, (const block_q8_0*)x, k, y, n);
+    });
+}
+void gemv_multi_nvfp4r(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1) {
+    multi_walk(m, nm, vr0, vr1, [&](const void* w, size_t rs, const void* x, float* y, int n) {
+        gemv_nvfp4r(w, rs, (const block_q8_0*)x, k, y, n);
     });
 }
 void gemv_multi_bf16(const GemvMat* m, int nm, int k, int64_t vr0, int64_t vr1) {

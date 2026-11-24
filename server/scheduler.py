@@ -56,6 +56,40 @@ from .sampling import Sampler, SamplingParams
 from .tokenizer import InkTokenizer
 
 
+STEP_TRACE = os.environ.get("INK_STEP_TRACE", "0") not in ("", "0")
+
+
+class StepTrace:
+    """Per-token timing of the plain decode loop (agent T, env INK_STEP_TRACE=1): what the server spends between two ink_forward calls.
+    engine = inside backend.step(); sample = sampler; emit = _on_token (parser, stop strings, sink -> call_soon_threadsafe);
+    gap = from the previous step's engine return to this step's engine call (= sample + emit + scheduler loop + GIL waits);
+    loop = gap - sample - emit (deque, cancel check, condition variable, GIL hand-offs). Printed at request end (stdout, server log)."""
+
+    def __init__(self):
+        self.engine: List[float] = []
+        self.sample: List[float] = []
+        self.emit: List[float] = []
+        self.gap: List[float] = []
+        self.t_ret: Optional[float] = None     # perf_counter when the last engine call returned
+
+    @staticmethod
+    def _pct(v: List[float], q: float) -> float:
+        if not v:
+            return 0.0
+        w = sorted(v)
+        return w[min(len(w) - 1, int(q * len(w)))] * 1e3
+
+    def summary(self, rid: str) -> str:
+        n = len(self.gap)
+        if n == 0:
+            return "step-trace %s: no decode steps" % rid
+        loop = [g - s_ - e for g, s_, e in zip(self.gap, self.sample[1:], self.emit[1:])] if len(self.sample) > n else []
+        f = lambda v: "mean %.3f med %.3f p90 %.3f max %.3f ms" % (sum(v) / len(v) * 1e3, self._pct(v, 0.5), self._pct(v, 0.9), self._pct(v, 1.0))
+        return ("step-trace %s: %d steps | engine %s | gap(ret->next call) %s | sample %s | emit %s | loop/GIL %s | overhead %.2f%% of engine"
+                % (rid, n, f(self.engine), f(self.gap), f(self.sample), f(self.emit), f(loop) if loop else "n/a",
+                   100.0 * sum(self.gap) / max(1e-9, sum(self.engine))))
+
+
 class QueueFull(Exception):
     def __init__(self, retry_after: int):
         super().__init__("request queue is full")
@@ -251,6 +285,9 @@ class Sequence:
         eff = req.spec_mode if req.spec_mode is not None else getattr(be, "spec_default_mode", 1)
         self.spec_mode = req.spec_mode if req.spec_mode is not None else -1       # -1: let the engine apply its default
         self.use_spec = bool(sched.spec_enabled and be.supports_spec and not req.sampling.has_penalties and eff != 0)
+        # --sampler c: the engine's sampler (ink_sample) on the plain path too (no penalties / logit_bias there): same kept set and probabilities
+        # as the numpy Sampler (S2's parity tests), a different random stream per seed; ~1 ms less python per sampled token (agent T).
+        self.use_csampler = bool(not self.use_spec and sched.c_sampler and getattr(be, "supports_sample", False) and not req.sampling.has_penalties)
         self.spec_steps = self.spec_drafted = self.spec_accepted = self.spec_emitted = 0
         self.spec_synced: Optional[bool] = None
         self.spec_t_hist: Dict[int, int] = {}
@@ -258,6 +295,7 @@ class Sequence:
         self.spec_seed = (int(seed) if seed is not None else int.from_bytes(os.urandom(8), "little")) & 0xFFFFFFFFFFFFFFFF
         self._content: List[str] = []
         self._reasoning: List[str] = []
+        self.trace: Optional[StepTrace] = StepTrace() if STEP_TRACE else None
         if self.parser is not None and req.parser_prefix_ids:  # forced tokens (e.g. tool_choice) are part of the output
             for t in req.parser_prefix_ids:
                 self._emit(self.parser.feed_token(t))
@@ -289,22 +327,35 @@ class Sequence:
         try:
             if self.anchor is None:                       # a token is sampled from the logits (plain decode / first token)
                 ts = time.perf_counter()
-                if self.use_spec:                         # the engine's sampler (ink_sample): first link of the request's seed chain
+                if self.use_spec or self.use_csampler:    # the engine's sampler (ink_sample): first link of the request's seed chain
                     tok, self.spec_seed = be.sample(self.logits, self._spec_request(), self.spec_seed)
                 else:
                     tok = self.sampler.sample(self.logits)
                 self.sampler.accept(tok)
-                self.t_sample += time.perf_counter() - ts
+                t1 = time.perf_counter()
+                self.t_sample += t1 - ts
                 if self.t_first is None:
                     self.t_first = time.monotonic()
-                if self._on_token(tok):
+                tr = self.trace
+                done = self._on_token(tok)
+                if tr is not None:
+                    t2 = time.perf_counter()
+                    tr.sample.append(t1 - ts)
+                    tr.emit.append(t2 - t1)
+                if done:
                     return True
                 if self.use_spec:
                     self.anchor = tok                     # the next step processes it together with the drafts
                 else:
                     te = time.perf_counter()
+                    if tr is not None and tr.t_ret is not None:
+                        tr.gap.append(te - tr.t_ret)
                     self.logits = be.step(self.slot.id, tok)
-                    self.t_engine_dec += time.perf_counter() - te
+                    t3 = time.perf_counter()
+                    self.t_engine_dec += t3 - te
+                    if tr is not None:
+                        tr.engine.append(t3 - te)
+                        tr.t_ret = t3
                     self.slot.tokens.append(tok)
                     self.slot.last_logits = self.logits
                 return False
@@ -422,9 +473,11 @@ class Sequence:
 
 class Scheduler:
     def __init__(self, backend: Backend, tokenizer: InkTokenizer, max_queue: int = 8, prefill_chunk: int = 256,
-                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None, spec: bool = True, prefix_reuse_min: int = 1024):
+                 on_finish: Optional[Callable[[GenRequest, Finish], None]] = None, spec: bool = True, prefix_reuse_min: int = 1024,
+                 c_sampler: bool = False):
         self.backend, self.tokenizer = backend, tokenizer
         self.spec_enabled = spec
+        self.c_sampler = c_sampler
         self.prefix_reuse_min = prefix_reuse_min
         self.max_queue, self.prefill_chunk = max_queue, max(1, prefill_chunk)
         self.on_finish = on_finish
@@ -548,6 +601,8 @@ class Scheduler:
             self._active.append(Sequence(self, req, slot, n_reused, mark))
 
     def _finish(self, seq: Sequence) -> None:
+        if seq.trace is not None:
+            print(seq.trace.summary(seq.req.id), flush=True)
         healthy = seq.error is None
         self.table.release(seq.slot, healthy)
         fin = seq.conclude()

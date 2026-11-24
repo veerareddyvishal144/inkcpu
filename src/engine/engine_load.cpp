@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "engine_priv.h"
+#include "ink/nvfp4_repack.h"
 #ifdef INK_HAVE_PREFILL
 #include "ink/engine_prefill.h"
 #endif
@@ -129,9 +130,13 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
         const void** slot;
         const uint8_t* src;
         size_t bytes;
+        bool nvfp4r;            // K1: NVFP4 expert tensor whose scale bytes are re-encoded in the arena copy (INK_NVFP4R=1)
     };
     std::vector<Pend> pend;
-    auto big = [&](const void** slot, const TensorRef& t, size_t bytes = 0) { pend.push_back({slot, t.data, bytes ? bytes : t.nbytes}); };
+    e->tune.nvfp4r = envi("INK_NVFP4R", e->tune.nvfp4r);
+    auto big = [&](const void** slot, const TensorRef& t, size_t bytes = 0, bool nvfp4r = false) {
+        pend.push_back({slot, t.data, bytes ? bytes : t.nbytes, nvfp4r});
+    };
     auto small = [&](size_t bytes) -> void* {
         void* p = std::aligned_alloc(64, align_up(std::max<size_t>(bytes, 64), 64));
         e->small_.push_back(p);
@@ -253,8 +258,9 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
             p.gu_eb = p.gu_rs * (size_t)lw.ffn_gate_up_exps.ne[1];
             p.dn_rs = lw.ffn_down_exps.row_bytes();
             p.dn_eb = p.dn_rs * (size_t)lw.ffn_down_exps.ne[1];
-            big(&p.gu, lw.ffn_gate_up_exps);
-            big(&p.dn, lw.ffn_down_exps);
+            p.nvfp4r = p.expert_type == T_NVFP4 && e->tune.nvfp4r != 0;   // K1: re-encode the sub-block scales while copying (below)
+            big(&p.gu, lw.ffn_gate_up_exps, 0, p.nvfp4r);
+            big(&p.dn, lw.ffn_down_exps, 0, p.nvfp4r);
             if (lw.ffn_gate_up_exps.ne[1] != 2 * kFF || lw.ffn_down_exps.ne[1] != kD || lw.ffn_gate_up_exps.ne[0] != kD ||
                 lw.ffn_down_exps.ne[0] != kFF)
                 bad = "expert tensor shape";
@@ -303,20 +309,32 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
         uint8_t* dst;
         const uint8_t* src;
         size_t n;
+        bool nvfp4r;
     };
     std::vector<Piece> pieces;
     const size_t kPiece = (size_t)4 << 20;
+    // K1: pieces of a re-encoded expert tensor hold whole 36-byte super-blocks (the tensor is dense: rows and experts contiguous), so each
+    // piece is repacked right after its memcpy while it is still cache-hot; 4193280 = 36 * 116480 = 64 * 65520
+    const size_t kPieceNv = kPiece / (36 * 64) * (36 * 64);
     for (size_t i = 0; i < pend.size(); ++i) {
         uint8_t* dst = (uint8_t*)e->arena_ + offs[i];
         *pend[i].slot = dst;
-        for (size_t o = 0; o < pend[i].bytes; o += kPiece) pieces.push_back({dst + o, pend[i].src + o, std::min(kPiece, pend[i].bytes - o)});
+        const size_t ps = pend[i].nvfp4r ? kPieceNv : kPiece;
+        if (pend[i].nvfp4r && pend[i].bytes % sizeof(block_nvfp4)) return fail("nvfp4r repack: expert tensor size is not a multiple of 36 bytes");
+        for (size_t o = 0; o < pend[i].bytes; o += ps) pieces.push_back({dst + o, pend[i].src + o, std::min(ps, pend[i].bytes - o), pend[i].nvfp4r});
     }
+    size_t nv_tensors = 0, nv_bytes = 0;
+    for (const Pend& p : pend)
+        if (p.nvfp4r) { ++nv_tensors; nv_bytes += p.bytes; }
+    if (e->tune.nvfp4r) nvfp4r_encode_table();   // build the byte table once before the threads race for it
+    const auto t_copy = clk::now();
     std::atomic<size_t> next{0};
     e->pool->run([&](int tid, int nth) {
         for (;;) {
             const size_t i = next.fetch_add(1, std::memory_order_relaxed);
             if (i >= pieces.size()) break;
             std::memcpy(pieces[i].dst, pieces[i].src, pieces[i].n);
+            if (pieces[i].nvfp4r) nvfp4r_repack_blocks(pieces[i].dst, pieces[i].n / sizeof(block_nvfp4));
             // drop the copied source pages right away (whole pages inside the piece; the edges go with the file-wide call below), so the mapping and the arena never
             // coexist in full: peak RSS ~ arena + one piece per thread instead of 2x the weights (docs/requests.md, V item 2)
             const uintptr_t a = ((uintptr_t)pieces[i].src + 4095) & ~(uintptr_t)4095, b = ((uintptr_t)pieces[i].src + pieces[i].n) & ~(uintptr_t)4095;
@@ -325,6 +343,9 @@ std::unique_ptr<Engine> Engine::create(const std::string& path, const EngineOpti
     });
     // the page cache keeps the file; drop this process's page-table references to it (only token_embd rows are read later)
     madvise(const_cast<uint8_t*>(e->gguf->base()), e->gguf->file_size(), MADV_DONTNEED);
+    if (e->tune.nvfp4r)
+        std::fprintf(stderr, "ink: NVFP4 expert scales re-encoded at load (%zu tensors, %.1f GB, copy+repack %.0f ms; INK_NVFP4R=0 disables)\n",
+                     nv_tensors, (double)nv_bytes / 1e9, std::chrono::duration<double, std::milli>(clk::now() - t_copy).count());
 
     // ---------------------------------------------------------------- scratch, counters, slots
     e->scr_ = (Scratch*)std::aligned_alloc(64, align_up(sizeof(Scratch), 64));
@@ -360,15 +381,37 @@ void Engine::set_threads(int n) {
 }
 
 // ---------------------------------------------------------------------------------------------------- slots
+// KV tensors (E1, wave 1): 2 MiB-aligned anonymous mappings with MADV_HUGEPAGE (env INK_KV_HUGE=0 restores plain 4 KiB pages), so the decode
+// attention streams 170-700 MB/token through 2 MiB TLB entries. Lazy commit granularity becomes 2 MiB (16 blocks = 1024 positions) per tensor:
+// <= +2 MiB of RSS per tensor (16 global tensors per slot); the SWA rings (4 MiB per tensor) are filled completely after 2048 positions anyway.
+// The alignment slivers are unmapped here so that free_slot's munmap(ptr, kv_map_bytes) covers exactly the mapping that remains.
+static void* kv_mmap(size_t bytes, bool huge) {
+    const int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+    if (!huge) return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
+    const size_t al = (size_t)2 << 20;
+    void* raw = mmap(nullptr, bytes + al, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (raw == MAP_FAILED) return raw;
+    const uintptr_t base = (uintptr_t)raw, aligned = (base + al - 1) / al * al;
+    if (aligned > base) munmap(raw, aligned - base);
+    const uintptr_t end = base + bytes + al;
+    if (end > aligned + bytes) munmap((void*)(aligned + bytes), end - (aligned + bytes));
+    madvise((void*)aligned, bytes, MADV_HUGEPAGE);
+    return (void*)aligned;
+}
+
 bool Engine::alloc_slot(SlotState& s, std::string* err) {
     const size_t blk_bytes = kKvBlockElems * 2;
     const size_t cap_blocks = ((size_t)opt.max_ctx + kKvBlock - 1) / kKvBlock + 1;
+    static const bool huge = [] {
+        const char* e = std::getenv("INK_KV_HUGE");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
     for (int v = 0; v < kVisits; ++v) {
         const bool swa = layers[plan[v].phys].swa;
         const size_t nb = swa ? (size_t)tune.swa_blocks : cap_blocks;
         const size_t bytes = nb * blk_bytes;
-        void* k = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        void* vv = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        void* k = kv_mmap(bytes, huge);
+        void* vv = kv_mmap(bytes, huge);
         if (k == MAP_FAILED || vv == MAP_FAILED) {
             if (err) *err = "mmap failed for the KV cache";
             return false;

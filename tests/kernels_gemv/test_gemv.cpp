@@ -6,9 +6,11 @@
 //   (d) results do not depend on how rows are split into calls (bitwise) and the fused multi-matrix entry point matches,
 //   (e) Q8_0 / NVFP4 vs ggml's generic dot (dlopen of the llama.cpp build) within 3e-5 * sum|w*x|.
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 #include "ink/kernels_gemv.h"
+#include "ink/nvfp4_repack.h"
 #include "testutil.h"
 
 using namespace ink;
@@ -233,6 +235,46 @@ static void test_one(int kind, int k, int rows, int mode, int sv, tu::Rng& rng) 
         TU_CHECK(same);
     }
 
+    // nvfp4r (agent K1): the kernel on RE-ENCODED scale bytes == gemv_nvfp4 on the original bytes, bit for bit; == its scalar ref;
+    // split-invariant (8/4/2/1-row tails) and identical for both row-group sizes
+    if (kind == NVFP4) {
+        Prob q = p;
+        nvfp4r_repack_rows(q.wbuf.data() + q.off, q.rs, rows, k / QK_NVFP4);   // only the 4 scale bytes of every block change
+        for (int r = 0; r < rows; ++r)   // the nibbles and the padding/guard garbage are untouched
+            for (int sb = 0; sb < k / QK_NVFP4; ++sb)
+                TU_CHECK(!std::memcmp(((const block_nvfp4*)(q.w() + (size_t)r * q.rs))[sb].qs, ((const block_nvfp4*)(p.w() + (size_t)r * p.rs))[sb].qs, 32));
+        TU_CHECK(!std::memcmp(q.w() + (size_t)rows * q.rs, p.w() + (size_t)rows * p.rs, 64));
+        std::vector<float> yk(rows + 1, -777.f), yr2(rows), ys2(rows);
+        const int oldg = g_gemv_nvfp4r_group, oldpre = g_gemv_nvfp4r_pre;
+        for (int variant = 0; variant < 4; ++variant) {
+            const int grp = (variant & 1) ? 4 : 8;
+            g_gemv_nvfp4r_group = grp;
+            g_gemv_nvfp4r_pre = variant >> 1;
+            std::fill(yk.begin(), yk.end(), -777.f);
+            gemv_nvfp4r(q.w(), q.rs, q.xq.data(), k, yk.data(), rows);
+            TU_CHECK(yk[rows] == -777.f);
+            gemv_nvfp4r_ref(q.w(), q.rs, q.xq.data(), k, yr2.data(), rows);
+            bool same = true;
+            for (int r = 0; r < rows; ++r) same = same && (yk[r] == y[r]) && (yr2[r] == y[r]);
+            if (!same) std::fprintf(stderr, "NVFP4R mismatch k=%d rows=%d mode=%s sv=%d group=%d pre=%d\n", k, rows, kModeName[mode], sv, grp, g_gemv_nvfp4r_pre);
+            TU_CHECK(same);
+            if (rows >= 3) {
+                int r = 0;
+                while (r < rows) {
+                    const int n = std::min(rows - r, rng.range(1, 11));
+                    gemv_nvfp4r(q.w() + (size_t)r * q.rs, q.rs, q.xq.data(), k, ys2.data() + r, n);
+                    r += n;
+                }
+                bool s2 = true;
+                for (int i = 0; i < rows; ++i) s2 = s2 && (ys2[i] == y[i]);
+                if (!s2) std::fprintf(stderr, "NVFP4R split variance k=%d rows=%d mode=%s group=%d pre=%d\n", k, rows, kModeName[mode], grp, g_gemv_nvfp4r_pre);
+                TU_CHECK(s2);
+            }
+        }
+        g_gemv_nvfp4r_group = oldg;
+        g_gemv_nvfp4r_pre = oldpre;
+    }
+
     // ggml oracle (generic dot) for the quantised formats
     if (g_have_oracle && (kind == Q8 || kind == NVFP4) && mode != TINYHUGE) {
         for (int r = 0; r < rows; ++r) {
@@ -286,6 +328,36 @@ static void test_multi(int kind, int k, int mode, tu::Rng& rng) {
         for (int r = 0; r < nr[i]; ++r) same = same && (ymulti[i][r] == yfull[i][r]);
     if (!same) std::fprintf(stderr, "MULTI mismatch %s k=%d mode=%s\n", kKindName[kind], k, kModeName[mode]);
     TU_CHECK(same);
+    if (kind == NVFP4) {   // fused nvfp4r entry point on re-encoded copies, random virtual-row splits
+        Prob q[nm];
+        GemvMat rm[nm];
+        std::vector<std::vector<float>> yrm(nm);
+        for (int i = 0; i < nm; ++i) {
+            q[i] = p[i];
+            nvfp4r_repack_rows(q[i].wbuf.data() + q[i].off, q[i].rs, nr[i], k / QK_NVFP4);
+            yrm[i].assign(nr[i], -1.f);
+            rm[i] = GemvMat{q[i].w(), q[i].rs, q[i].xq.data(), yrm[i].data(), nr[i]};
+        }
+        for (int variant = 0; variant < 4; ++variant) {
+            const int grp = (variant & 1) ? 4 : 8;
+            const int oldg = g_gemv_nvfp4r_group, oldpre = g_gemv_nvfp4r_pre;
+            g_gemv_nvfp4r_group = grp;
+            g_gemv_nvfp4r_pre = variant >> 1;
+            int v2 = 0;
+            while (v2 < total) {
+                const int n = std::min(total - v2, rng.range(1, 17));
+                gemv_multi_nvfp4r(rm, nm, k, v2, v2 + n);
+                v2 += n;
+            }
+            g_gemv_nvfp4r_group = oldg;
+            g_gemv_nvfp4r_pre = oldpre;
+            bool s3 = true;
+            for (int i = 0; i < nm; ++i)
+                for (int r = 0; r < nr[i]; ++r) s3 = s3 && (yrm[i][r] == yfull[i][r]);
+            if (!s3) std::fprintf(stderr, "MULTI nvfp4r mismatch k=%d mode=%s group=%d\n", k, kModeName[mode], grp);
+            TU_CHECK(s3);
+        }
+    }
     ++g_cases;
 }
 
@@ -307,10 +379,25 @@ int main() {
                 }
             for (int mode = 0; mode < NMODES; ++mode) test_multi(kind, k, mode, rng);
         }
+    {   // nvfp4r encoding: self-check of the header, byte table == nvfp4r_encode, block repack == per-byte encode
+        TU_CHECK(nvfp4r_selfcheck() == 0);
+        const uint8_t* tab = nvfp4r_encode_table();
+        for (int b = 0; b < 256; ++b) TU_CHECK(tab[b] == nvfp4r_encode((uint8_t)b));
+        std::vector<uint8_t> blk(36 * 300), blk2;
+        for (size_t i = 0; i < blk.size(); ++i) blk[i] = (uint8_t)rng.u32();
+        blk2 = blk;
+        nvfp4r_repack_blocks(blk2.data(), 300);
+        for (int i = 0; i < 300; ++i) {
+            for (int s = 0; s < 4; ++s) TU_CHECK(blk2[36 * i + s] == nvfp4r_encode(blk[36 * i + s]));
+            TU_CHECK(!std::memcmp(&blk2[36 * i + 4], &blk[36 * i + 4], 32));
+        }
+        ++g_cases;
+    }
     {   // nrows == 0 must be a no-op
         float y = 5.f;
         gemv_q8_0(nullptr, 0, nullptr, 32, &y, 0);
         gemv_nvfp4(nullptr, 0, nullptr, 64, &y, 0);
+        gemv_nvfp4r(nullptr, 0, nullptr, 64, &y, 0);
         gemv_bf16(nullptr, 0, nullptr, 32, &y, 0);
         gemv_f32(nullptr, 0, nullptr, 32, &y, 0);
         TU_CHECK(y == 5.f);
@@ -328,8 +415,20 @@ int main() {
                 for (int i = 0; i < 13; ++i) TU_CHECK(a[i] == b[i]);
             }
         g_gemv_prefetch_bytes = oldpf; g_gemv_prefetch_hint = oldh;
+        // same for nvfp4r (both group sizes) on the re-encoded copy
+        nvfp4r_repack_rows(p.wbuf.data() + p.off, p.rs, 13, 2304 / QK_NVFP4);
+        gemv_nvfp4r(p.w(), p.rs, p.xq.data(), 2304, b.data(), 13);
+        for (int i = 0; i < 13; ++i) TU_CHECK(a[i] == b[i]);
+        for (int grp : {4, 8})
+            for (int h = 0; h < 4; ++h)
+                for (int pf : {0, 64, 512, 4096}) {
+                    g_gemv_prefetch_hint = h; g_gemv_prefetch_bytes = pf; g_gemv_nvfp4r_group = grp;
+                    gemv_nvfp4r(p.w(), p.rs, p.xq.data(), 2304, b.data(), 13);
+                    for (int i = 0; i < 13; ++i) TU_CHECK(a[i] == b[i]);
+                }
+        g_gemv_prefetch_bytes = oldpf; g_gemv_prefetch_hint = oldh; g_gemv_nvfp4r_group = 8;
     }
-    std::printf("test_gemv: %d cases (kernel==ref bitwise, vs double, unit-exact, split-invariant, multi%s)\n", g_cases, g_have_oracle ? ", vs ggml" : "");
+    std::printf("test_gemv: %d cases (kernel==ref bitwise, vs double, unit-exact, split-invariant, multi, nvfp4r==nvfp4%s)\n", g_cases, g_have_oracle ? ", vs ggml" : "");
     if (tu::g_fail) {
         std::printf("test_gemv: %d FAILURES\n", tu::g_fail);
         return 1;

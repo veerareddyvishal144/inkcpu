@@ -1,6 +1,6 @@
 # inkcpu
 
-Run **Inkling 2 Mini** (Thinking Machines' 26B mixture-of-experts model) on an ordinary x86 server with **no GPU** — 2.5–3.7× faster than llama.cpp on the same machine, with an OpenAI-compatible API you can point your editor or agent at.
+Run **Inkling 2 Mini** (Thinking Machines' 26B mixture-of-experts model) on an ordinary x86 server with **no GPU** — 2.8–3.9× faster than llama.cpp on the same machine, with an OpenAI-compatible API you can point your editor or agent at.
 
 One model, one CPU class, built from scratch: GGUF reader, AVX-512 kernels, a decode executor with one thread-pool run per token, batched prefill, DSpark speculative decoding, slot checkpoint/rewind for prompt reuse, and a FastAPI server. Everything is measured against stock llama.cpp on the same GGUF and the same host.
 
@@ -10,14 +10,15 @@ Xeon Platinum 8171M (16 cores, AVX-512, no VNNI/AMX), 125 GB RAM, no GPU. Same G
 
 | | tuned llama.cpp | **inkcpu** | speed-up |
 |---|---|---|---|
-| Generation (decode), 12 threads | 5.5 tok/s | **13.9 tok/s** | 2.5× |
-| Generation, 16 threads | 4.7 tok/s | **14.3 tok/s** | 3.0× |
-| Prompt processing (prefill), 256 tokens, 16 threads | 22 tok/s | **83 tok/s** | 3.7× |
+| Generation (decode), 12 threads | 5.5 tok/s | **15.3 tok/s** | 2.8× |
+| Generation, 16 threads | 4.7 tok/s | **14.7–15.8 tok/s** | 3.1–3.4× |
+| Generation at 8k / 16k tokens of context, 16 threads | n/a | **13.8 / 13.0 tok/s** | |
+| Prompt processing (prefill), 256 tokens, 16 threads | 22 tok/s | **87 tok/s** | 3.9× |
 | Coding-agent task through the API (same 7-test task) | 643 s | **207–291 s** | ~2.5× |
 | Follow-up turn in an editor thread (7k-token re-rendered prompt) | full re-process | **1.8 s** (prefix rewind) | 68× |
 | Memory | 17.6 GB | 17 GB resident (34 GB peak while loading) | |
 
-Outputs match llama.cpp: identical greedy text on the test prompts, next-token log-likelihood within 0.005 nats on 2,400-token real text. Details, per-phase profiles and what limits the speed: [`docs/ENGINE.md`](docs/ENGINE.md).
+Outputs match llama.cpp: identical greedy text on the test prompts, next-token log-likelihood within 0.005 nats on 2,400-token real text. Numbers from the 2026-11-23 idle-host run (`tools/final_bench_wave1.sh`); run-to-run spread on this VM is about 5 %. Details, per-phase profiles, what limits the speed and what is left to try: [`docs/ENGINE.md`](docs/ENGINE.md), [`docs/RESEARCH_WAVE2.md`](docs/RESEARCH_WAVE2.md).
 
 What a CPU still can't hide: every *new* prompt token costs ~12–15 ms, so a 10k-token tool result takes ~2 minutes to read. Repeated prefixes (system prompts, conversation history) are nearly free thanks to the slot cache and rewind.
 

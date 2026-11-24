@@ -123,3 +123,36 @@ activation rows: 239-310 vs 204-320 GMAC/s (no consistent difference, within noi
 (1220 cases); checks guard values beyond `rows` in padded `ldy`, misaligned weight bases, padded row strides, independent token-range packing, 4x split calls (rows split at multiples of 4, tokens at nt/3),
 MoE items executed in shuffled order with token-indexed and pair-indexed activations and repeated experts per token, `pair_slot` permutation, quantize+pack == quantize then pack.
 Benchmarks: `bench_peak [threads] [cpus]`, `bench_gemm [--what st|dense|nvfp4|moe|small|all] [--threads 16] [--reps N] [--chunk R] [--group G] [--tile T] [--prefetch 0|1] [--trace PATH] [--visit V]`.
+
+## 8. Wave 1 (2026-11-23, agent K3): re-encoded-scale unpack, batched epilogue, x4 prototype
+
+Full log and raw numbers: `docs/status/K3.md`. All ratios are same-window A/B; the host was shared (loadavg noted there).
+
+* **`gemm_nvfp4r` / `gemm_moe_nvfp4r`**: same arguments and the same `GEMM_FMT_NVFP4` activation pack as `gemm_nvfp4` / `gemm_moe_nvfp4`, but the weights' 4 scale
+  bytes per super-block must be re-encoded per `include/ink/nvfp4_repack.h` (the engine does this at load when `Tune::nvfp4r` is set and marks `LayerPacked::nvfp4r`;
+  never call the `_r` kernels on GGUF-encoded bytes). Unpack: 16 scales = 4 dword loads + 3 shuffles + `nvfp4r_decode16` + ONE 64-byte store into the unchanged
+  `dw[row][4 sb + s]` layout, sign mask stored with `kmovq m64, k`, 4-super-block body unrolled. The old unpack was front-end bound (~23 fused uops per row
+  super-block), the new one is ~13 with a port-5 floor of 4. Measured: unpack 1.2-1.6x faster; kernel +12.6 % at nt=4, +4.3 % at nt=16, +1-5 % at nt=64/256.
+* **Batched bit-identical epilogue** (default on, `g_gemm_epilogue`; all Q8_0/NVFP4 entry points): the 16 accumulators of a tile are reduced pairwise with hsum16's tree in
+  physical lane order (49 uops instead of ~160); 2/3/5-token tail tiles are batched too and 1-token tails are absorbed into a 5-token tile (`g_gemm_tail5`, default on).
+  +1.7-3.0 % Q8_0, +2.1-4.0 % NVFP4 when L2-resident, 0 % when memory-streamed. Same floats in the same order: `test_gemm` (2454 cases, 651 on re-encoded
+  weights incl. all 256 scale byte values) passes bit-identical against `gemv_nvfp4` / `gemv_q8_0` and the scalar references, also with the old paths forced
+  (`INK_GEMM_EPILOGUE=0`, `INK_GEMM_TAIL5=0`, `INK_GEMM_TILE=5`).
+* **Locked 16-thread MoE layer A/B** (real `code.rtrace` routing, visit 12, default CPU list, loadavg 1.5 at start; same-window ALU peak 723-738 GMAC/s):
+
+  | tokens (pairs per used expert) | GGUF encoding + new epilogue | nvfp4r | ratio (layer) |
+  |---|---|---|---|
+  | 64 (8.8) | 322 GMAC/s (44.5 % of peak) | 352 (48.6 %) | 1.092x |
+  | 256 (19.7) | 384 (51.9 %) | 402 (54.4 %) | 1.048x |
+  | 1024 (69.4) | 407 (55.3 %) | 421 (57.2 %) | 1.035x |
+
+  Wave-0 reference (G's table, load 8-18): 283 / 310 GMAC/s at 64 / 256 tokens. ESTIMATE on the PREFILL_DESIGN profile: ~+5.5 % prefill tok/s at 256-token chunks, more for 16-64-token prompts.
+* **Tunables re-checked**: group 64 / tile 4 / prefetch T1 stay (group 32 -2..-4 %, tile 5 -3..-7 %, prefetch off / T0 and group 128-256 within noise); indirect activation rows
+  beat a pre-gathered copy again. The inner loop runs at ~70 % of the 5-uop port bound; no bit-identical lever is left in it.
+* **`gemm_nvfp4r_x4` / `gemm_moe_nvfp4r_x4` + `GEMM_FMT_NVFP4X4` pack (PROTOTYPE, NOT wired, numerics-deviating)**: weights stored as kv+12 (no sign masks), a 4-uop inner loop,
+  and the 12*sum(x) bias correction applied as a K/16 float dot product. Kernel 1.13-1.19x vs the exact nvfp4r kernel at K=2304, 1.07-1.10x at K=1152; MoE layer +7-11 % on top
+  of nvfp4r at 16 threads. Numerics: max |y - ref| / sum|w x| 5.2e-8 (exact kernel 1.7e-8); Q8_0 re-quantisation of raw outputs flips 1 of 55296 int8 values, 0 block scales.
+  Using it would break prefill == decode bit-identity (decode stays exact) in exchange for an ESTIMATED further ~+6-7 % prefill; the parity gate against llama.cpp
+  (argmax / top-10 / cosine) must be measured before it is ever enabled. Orchestrator decision pending.
+* Bench: `bench_gemm --what rvs|epi|x4|unpack|tail|tune|moe --cpus ... --ntok ...` (median-of-ratios A/B). Under the bench lock use `--ntok 256` only: the full MoE
+  setup (two 570 MB random expert stacks + re-encoding + peak calibration) held the lock 17 minutes for 1 minute of timing.

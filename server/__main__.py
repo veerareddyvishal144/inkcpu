@@ -34,6 +34,9 @@ def main(argv=None):
     ap.add_argument("--spec", default=None, metavar="auto|off|2..8",
                     help="engine default for requests without a `speculation` field: auto (policy picks the width), off (plain decode), "
                          "or a fixed verify width 2..8; default: the engine's (env INK_SPEC, else auto)")
+    ap.add_argument("--sampler", choices=["numpy", "c"], default=os.environ.get("INK_SAMPLER", "numpy"),
+                    help="plain-path sampler: numpy (server/sampling.py, default) or c (the engine's ink_sample: same kept set and probabilities, "
+                         "other random stream per seed, ~1 ms less python per sampled token); penalties always use numpy")
     ap.add_argument("--no-keep-off-engine-cpus", action="store_true",
                     help="do not move the HTTP/Python threads off the CPUs listed in INK_CPUS")
     ap.add_argument("--request-log", default=None, help="JSONL request log path (default env INK_REQUEST_LOG, '' disables)")
@@ -43,18 +46,23 @@ def main(argv=None):
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if here not in sys.path:
         sys.path.insert(0, here)
-    from server.app import ServerConfig, create_app
-    from server import backends
 
     cpus = [int(c) for c in os.environ.get("INK_CPUS", "").split(",") if c.strip().isdigit()]
     if a.threads is None:
         a.threads = len(cpus) if cpus else 16
     if a.backend == "ink" and cpus and not a.no_keep_off_engine_cpus and hasattr(os, "sched_setaffinity"):
         # the spin-barrier pool convoys when a Python thread lands on one of its CPUs: keep this process's own threads away
-        # (threads created later inherit the mask; the engine re-pins its own pool threads explicitly)
+        # (threads created later inherit the mask; the engine re-pins its own pool threads explicitly). This must happen BEFORE
+        # numpy is imported: numpy's OpenBLAS creates one worker thread per CPU at import time (they inherited the full mask and
+        # floated over the engine CPUs in the first production deployment: 30 idle threads with mask 0-31). The server never calls
+        # BLAS, so one OpenBLAS thread is enough (agent T, wave 1).
         allowed = set(os.sched_getaffinity(0)) - set(cpus)
         if allowed:
             os.sched_setaffinity(0, allowed)
+    for var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+    from server.app import ServerConfig, create_app
+    from server import backends
     if a.backend == "mock":
         be = backends.MockBackend(n_slots=a.slots, max_ctx=a.ctx)
     elif a.backend == "llama":
@@ -68,7 +76,7 @@ def main(argv=None):
                                  spec_mode=spec_mode)
     cfg = ServerConfig(served_name=a.served_name, max_queue=a.max_queue, default_max_tokens=a.default_max_tokens,
                        request_log=a.request_log, log_bodies=a.log_bodies, prefill_chunk=a.prefill_chunk, default_reasoning_effort=a.default_reasoning_effort, spec=not a.no_spec,
-                       prefix_reuse_min=a.prefix_reuse_min)
+                       prefix_reuse_min=a.prefix_reuse_min, c_sampler=(a.sampler == "c"))
     app = create_app(be, cfg)
     import threading
     import time

@@ -86,6 +86,8 @@ struct LayerPacked {
     size_t dn_rs = 0, dn_eb = 0;
     const float* gu_scale = nullptr;       // [128] (NVFP4 layers only)
     const float* dn_scale = nullptr;
+    bool nvfp4r = false;                   // K1: the arena copies of gu / dn hold RE-ENCODED sub-block scales (include/ink/nvfp4_repack.h):
+                                           // read them with the nvfp4r_* kernels only (gemv_nvfp4r, gemm_moe_nvfp4r, ...); false = GGUF encoding
     const float* msg_query = nullptr;      // [4][2304] (core layers)
     Mat ctrl_down[4], ctrl_gain[4], ctrl_forget[4];   // core layers: Q, K, V, FFN
 };
@@ -133,6 +135,9 @@ struct Tune {                              // env-overridable tunables (read at 
     int swa_blocks = kSwaRingBlocks;       // SWA ring size in 64-position blocks (env INK_SWA_BLOCKS, tests only; >= 16)
     int ckpt_max = 8;                      // checkpoints kept per slot (env INK_CKPT_MAX; 0 = no checkpoints at all, rewind always fails)
     int ckpt_deep = 2;                     // of which deep ones (with the SWA window copy, ~170 MiB each at 32 ring blocks; env INK_CKPT_DEEP)
+    int nvfp4r = 1;                        // K1: re-encode the NVFP4 expert scales at load (LayerPacked::nvfp4r, include/ink/nvfp4_repack.h); decode uses
+                                           // gemv_nvfp4r, prefill/verify use gemm_moe_nvfp4r / gemv_nvfp4r_multix. Bit-identical to the GGUF encoding
+                                           // (K1/K2 gates, 2026-11-23). Default ON since wave 1; env INK_NVFP4R=0 restores the GGUF-encoded kernels.
 };
 
 class Engine {

@@ -7,6 +7,7 @@
 // the chunk max is taken, p = exp(s - max) is formed, and p.V is accumulated; chunk states (m, l, acc) are merged in order.
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include "ink/kernels_misc.h"
 #include "ink/kernels_misc_simd.h"
@@ -18,6 +19,8 @@ namespace {
 constexpr float kNegBig = -1.0e30f;   // masked score
 constexpr float kNegHalf = -1.0e29f;  // "is masked" threshold
 constexpr size_t kGroupStride = (size_t)kKvBlock * kHeadDim;  // fp16 elements per (block, kv head) = 8192
+constexpr int kPfRows = 32;   // K pass: prefetch distance in d rows (32 x 128 B = 4 KiB)
+constexpr int kPfKeys = 16;   // V pass: prefetch distance in keys (16 x 256 B = 4 KiB)
 
 inline float exp_s(float x) { return _mm_cvtss_f32(_mm512_castps512_ps128(exp16(_mm512_set1_ps(x)))); }
 
@@ -61,11 +64,20 @@ void attn_range(const KvLayer& L, const float* table, const float* qs, const flo
             const int64_t b = cb + bi;
             const int64_t jb = b * kKvBlock;
             const uint16_t* Kp = L.k + phys_block(L, b) * kKvBlockElems + (size_t)g * kGroupStride;
+            // software prefetch one page (4 KiB) ahead: the hardware streamer restarts at every 4 KiB page and at every 16 KiB block; the data
+            // consumed after this block is K of the next block, or V of the chunk's first block when pass 2 follows (both 16 KiB contiguous)
+            const uint16_t* nxt = (bi + 1 < nb) ? L.k + phys_block(L, b + 1) * kKvBlockElems + (size_t)g * kGroupStride
+                                                : L.v + phys_block(L, cb) * kKvBlockElems + (size_t)g * kGroupStride;
             __m512 acc[R][4];
 #pragma GCC unroll 6
             for (int r = 0; r < R; ++r) acc[r][0] = acc[r][1] = acc[r][2] = acc[r][3] = _mm512_setzero_ps();
             for (int d = 0; d < kHeadDim; ++d) {
                 const uint16_t* kd = Kp + (size_t)d * kKvBlock;
+                {
+                    const uint16_t* pf = (d + kPfRows < kHeadDim) ? kd + (size_t)kPfRows * kKvBlock : nxt + (size_t)(d + kPfRows - kHeadDim) * kKvBlock;
+                    _mm_prefetch((const char*)pf, _MM_HINT_T1);
+                    _mm_prefetch((const char*)pf + 64, _MM_HINT_T1);
+                }
                 const __m512 k0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(kd)));
                 const __m512 k1 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(kd + 16)));
                 const __m512 k2 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i*)(kd + 32)));
@@ -163,8 +175,22 @@ void attn_range(const KvLayer& L, const float* table, const float* qs, const flo
                 const int kmax = (int)std::min<int64_t>(kKvBlock - 1, max_pos - jb);
                 if (kmin > kmax) continue;
                 const uint16_t* Vp = L.v + phys_block(L, b) * kKvBlockElems + (size_t)g * kGroupStride + (size_t)d0 * 16;
+                // prefetch 16 keys (4 KiB) ahead; past this block: V of the next block, or K of the next chunk's first block
+                const uint16_t* nxt = (bi + 1 < nb) ? L.v + phys_block(L, b + 1) * kKvBlockElems + (size_t)g * kGroupStride
+                                                    : (cb + 16 < b1 ? L.k + phys_block(L, cb + 16) * kKvBlockElems + (size_t)g * kGroupStride : nullptr);
                 for (int kk = kmin; kk <= kmax; ++kk) {
                     const uint16_t* vr = Vp + (size_t)kk * kHeadDim;
+                    {
+                        const int ahead = kk + kPfKeys;
+                        const uint16_t* pf = (ahead <= kmax) ? vr - (size_t)d0 * 16 + (size_t)kPfKeys * kHeadDim
+                                                             : (nxt ? nxt + (size_t)(ahead - kmax - 1) * kHeadDim : nullptr);
+                        if (pf) {
+                            _mm_prefetch((const char*)pf, _MM_HINT_T1);
+                            _mm_prefetch((const char*)pf + 64, _MM_HINT_T1);
+                            _mm_prefetch((const char*)pf + 128, _MM_HINT_T1);
+                            _mm_prefetch((const char*)pf + 192, _MM_HINT_T1);
+                        }
+                    }
                     __m512 pb[R];
 #pragma GCC unroll 6
                     for (int r = 0; r < R; ++r) pb[r] = _mm512_set1_ps(S[r][bi * kKvBlock + kk]);
@@ -277,6 +303,32 @@ void attn_repack_rel_bias(const float* rel_bias, float* table) {
 }
 
 // ------------------------------------------------------------------ decode
+namespace {
+int g_split_granule = -1;   // -1: not read yet (env INK_ATTN_GRANULE; default 0 = legacy rule: the finer split measured no gain, see docs/status/E1.md)
+inline int split_granule() {
+    if (g_split_granule < 0) {
+        const char* e = std::getenv("INK_ATTN_GRANULE");
+        g_split_granule = e && *e ? std::max(0, std::atoi(e)) : 0;
+    }
+    return g_split_granule;
+}
+}  // namespace
+
+int attn_set_split_granule(int granule) {
+    const int old = split_granule();
+    if (granule >= 0) g_split_granule = granule;
+    return old;
+}
+
+int attn_decode_nsplit(int64_t n_keys, int split_keys, int max_split) {
+    const int granule = split_granule();
+    split_keys = std::max(1, split_keys);
+    max_split = std::max(1, max_split);
+    if (granule <= 0 || n_keys < 2 * (int64_t)split_keys)   // legacy rule (also the single-split regime shared with the prefill kernels)
+        return (int)std::min<int64_t>(max_split, std::max<int64_t>(1, n_keys / split_keys));
+    return (int)std::min<int64_t>(max_split, std::max<int64_t>(2, (n_keys + granule - 1) / granule));
+}
+
 void attn_decode_task(const KvLayer& L, const float* rel_table, const AttnQuery& q, int g, int split, int nsplit, AttnPartial* out) {
     alignas(64) float qs[3 * kHeadDim];
     alignas(64) float rs[3 * kRelFeat];

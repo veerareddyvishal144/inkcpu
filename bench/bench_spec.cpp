@@ -167,6 +167,17 @@ int main(int argc, char** argv) {
             if (mode != 0) std::printf(" mismatches %d/%d", r.mismatches, r.tokens);
             std::printf("  (prefill %.1f s, gen %.1f s)\n", r.prefill_s, r.wall);
             std::fflush(stdout);
+            // K2 (wave 1): per-phase profiles of this mode's steps. INK_PF_PROFILE=1 -> verify executor table (spec modes), INK_PROFILE=1 -> decode table (plain mode).
+            if (std::getenv("INK_PF_PROFILE") && mode != 0) {
+                std::printf("  --- verify per-phase profile, mode %s, prompt %s, load %s ---\n", m.c_str(), name.c_str(), load1().c_str());
+                engine_verify_profile_report(E, stdout);
+                engine_verify_profile_reset(E);
+            }
+            if (E.profiling() && mode == 0) {
+                std::printf("  --- decode per-phase profile (plain), prompt %s, load %s ---\n", name.c_str(), load1().c_str());
+                E.profile_report(stdout);
+                E.profile_reset();
+            }
             all[m].push_back(r);
         }
     }

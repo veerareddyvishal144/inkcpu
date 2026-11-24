@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "ink/kernels_gemv.h"
+#include "ink/nvfp4_repack.h"
 
 namespace ink {
 
@@ -73,6 +74,36 @@ void gemv_nvfp4_ref(const void* w, size_t rs, const block_q8_0* x, int k, float*
                     const uint8_t q = wb[sb].qs[8 * s + j];
                     const int nib = hi ? (q >> 4) : (q & 15);
                     const int e = 16 * s + (hi ? 8 : 0) + j;  // element within the 64-element super-block
+                    I += (int)kvalues_fp4[nib] * (int)xb[e >> 5].qs[e & 31];
+                }
+                acc[l] = std::fmaf((float)I, sc[(l & 7) >> 1], acc[l]);
+            }
+        }
+        y[r] = hsum16_ref(acc);
+    }
+}
+
+// re-encoded scales: identical to gemv_nvfp4_ref except for the scale decode (nvfp4r_decode == ue4m3_to_f32 of the original byte)
+void gemv_nvfp4r_ref(const void* w, size_t rs, const block_q8_0* x, int k, float* y, int nrows) {
+    const int nsb = k / QK_NVFP4;
+    for (int r = 0; r < nrows; ++r) {
+        const block_nvfp4* wb = (const block_nvfp4*)rowp(w, rs, r);
+        float acc[16] = {0};
+        for (int sb = 0; sb < nsb; ++sb) {
+            const block_q8_0* xb = x + 2 * sb;
+            const float dxs[2] = {fp16_to_f32(xb[0].d), fp16_to_f32(xb[1].d)};
+            float sc[4];
+            for (int s = 0; s < 4; ++s) sc[s] = nvfp4r_decode(wb[sb].d[s]) * dxs[s >> 1];
+            for (int l = 0; l < 16; ++l) {
+                int I = 0;
+                for (int tt = 0; tt < 4; ++tt) {
+                    const int b = 4 * l + tt;
+                    const int t = b >> 3, j = b & 7;
+                    const int s = t & 3;
+                    const bool hi = t >= 4;
+                    const uint8_t q = wb[sb].qs[8 * s + j];
+                    const int nib = hi ? (q >> 4) : (q & 15);
+                    const int e = 16 * s + (hi ? 8 : 0) + j;
                     I += (int)kvalues_fp4[nib] * (int)xb[e >> 5].qs[e & 31];
                 }
                 acc[l] = std::fmaf((float)I, sc[(l & 7) >> 1], acc[l]);

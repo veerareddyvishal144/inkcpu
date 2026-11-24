@@ -22,6 +22,10 @@ struct PrefillTune {                    // read from the environment (INK_PF_*) 
     int attn_tq = 8;                    // query tokens per attention item; INK_PF_ATTN_TQ
     int attn_decode_kernels = 0;        // 1 = run the decode attention kernels per token (bit-identical to decode); INK_PF_ATTN=decode
     int gemm_group = 0;                 // >0: override ink::g_gemm_group (tokens per weight pass); INK_PF_GROUP
+    int multix = 8;                     // K2 (wave 1): MoE items of experts with <= multix routed pairs run the multi-activation GEMV (gemv_*_multix, weights streamed
+                                        // once, no panel unpack) instead of gemm_moe_*; 0 = always the GEMM. Bit-identical either way. INK_PF_MULTIX. Default 8 = kMultixMaxX:
+                                        // the kernel A/B (bench_gemv_multix, 4 threads) has multix ahead of gemm_moe_* at 1-8 pairs (1.15-1.5x), see docs/status/K2.md
+    int multix_check = 0;               // K2 diagnostic: 1 = also run the GEMM for every multix item and report the first bitwise difference on stderr; INK_PF_MULTIX_CHECK
 };
 
 // The tunables in effect (edit before the first call; chunk and the item sizes may be changed between calls).

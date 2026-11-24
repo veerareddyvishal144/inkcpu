@@ -1,5 +1,5 @@
 # Module kernels_gemv (agent B1): thread pool, Q8_0 quantiser, GEMV kernels, tests and benchmarks.
-add_library(ink_kernels_gemv STATIC threadpool.cpp gemv.cpp gemv_ref.cpp)
+add_library(ink_kernels_gemv STATIC threadpool.cpp gemv.cpp gemv_ref.cpp gemv_multix.cpp)   # gemv_multix.cpp: agent K2 (wave 1)
 target_include_directories(ink_kernels_gemv PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(ink_kernels_gemv PUBLIC Threads::Threads)
 # the scalar references must reproduce the kernels bit-for-bit: no implicit mul+add contraction anywhere
@@ -18,3 +18,13 @@ foreach(b bench_pool bench_gemv)
   target_include_directories(${b} PRIVATE ${INK_GEMV_TESTS})
   target_link_libraries(${b} ink_kernels_gemv)
 endforeach()
+
+# ---- agent K2 (wave 1): small-n multi-activation GEMV test + microbench (bench links the GEMM library for the A/B against gemm_moe_*)
+add_executable(test_gemv_multix ${INK_GEMV_TESTS}/test_gemv_multix.cpp)
+target_include_directories(test_gemv_multix PRIVATE ${INK_GEMV_TESTS})
+target_compile_options(test_gemv_multix PRIVATE -ffp-contract=off)
+target_link_libraries(test_gemv_multix ink_kernels_gemv)
+add_test(NAME test_gemv_multix COMMAND test_gemv_multix)
+add_executable(bench_gemv_multix ${INK_GEMV_TESTS}/bench_gemv_multix.cpp)
+target_include_directories(bench_gemv_multix PRIVATE ${INK_GEMV_TESTS})
+target_link_libraries(bench_gemv_multix ink_kernels_gemv ink_kernels_gemm)

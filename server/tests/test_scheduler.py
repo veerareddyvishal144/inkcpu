@@ -245,3 +245,55 @@ def test_rewind_disabled_backend_keeps_the_append_only_policy():
 
 if __name__ == "__main__":
     raise SystemExit(helpers.run_module(globals()))
+
+
+def test_c_sampler_flag_uses_the_backend_sampler_on_the_plain_path_only_without_penalties():
+    """--sampler c (agent T): plain decode samples through backend.sample (ink_sample) when the backend has one and the request has no
+    penalties; spec_step is never used (spec disabled); penalties fall back to the numpy Sampler."""
+    from server.backends import MockSpecBackend
+    be = MockSpecBackend(n_slots=1, max_ctx=4096)
+    be.supports_sample = True
+    calls = []
+    orig = be.sample
+
+    def counting_sample(logits, req, seed):
+        calls.append(seed)
+        return orig(logits, req, seed)
+    be.sample = counting_sample
+    s = Scheduler(be, tok(), max_queue=1, prefill_chunk=16, spec=False, c_sampler=True)
+    s.start()
+    try:
+        prompt = tok().encode("Once upon a time")
+        for sp, expect_c in ((SamplingParams(seed=5, temperature=0.7), True),
+                             (SamplingParams(seed=5, temperature=0.7, repetition_penalty=1.2), False),
+                             (SamplingParams(seed=5, temperature=0.0), True)):
+            calls.clear()
+            q = queue.Queue()
+            s.submit(GenRequest(id="c", prompt_ids=prompt, sampling=sp, max_tokens=5, sink=q.put, mode="raw"))
+            while True:
+                it = q.get(timeout=20)
+                if it[0] in ("done", "error"):
+                    assert it[0] == "done", it
+                    fin = it[1]
+                    break
+            assert fin.completion_tokens == 5, fin
+            assert fin.spec_steps == 0 and not be.spec_log, "spec path must stay off"
+            if expect_c:
+                assert len(calls) == 5, calls                     # one backend sample per generated token
+                if sp.temperature > 0:
+                    assert len(set(calls)) == 5, "the seed must be chained from draw to draw"
+            else:
+                assert calls == [], "penalties must use the numpy sampler"
+        # the same seeded request twice gives the same tokens (deterministic chain)
+        outs = []
+        for _ in range(2):
+            q = queue.Queue()
+            s.submit(GenRequest(id="d", prompt_ids=prompt, sampling=SamplingParams(seed=11, temperature=0.9), max_tokens=6, sink=q.put, mode="raw"))
+            while True:
+                it = q.get(timeout=20)
+                if it[0] in ("done", "error"):
+                    outs.append(it[1].token_ids)
+                    break
+        assert outs[0] == outs[1], outs
+    finally:
+        s.shutdown()

@@ -40,3 +40,23 @@ already has the equivalent or better of each piece that applies to a RAM-residen
 Markov-context GGUF support (same weights), TurboQuant/Q4_0 KV for Inkling (unmeasured quality, their own fork gates it off), MoE expert cache (GPU), MTP/NextN/
 DFlash2/EAGLE-3 (no heads exist for Inkling), fused-kernel ports (we have the CPU fusions; our 7 ms fixed cost is barriers and serial depth mixes, for which the
 fork has nothing).
+
+## Same-host speed (added 2026-11-24 18:00 UTC)
+atomic-engine `main` (fa190d7, 2026-11-24) built CPU-only on this VM (`-DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF`; the shared build fails to link: the fork's
+`ggml_backend_window_*` symbols are not exported from libggml-base). Its Inkling loader refuses the canonical Unsloth `inkling2` file ("failed to load model"), so the
+interim-layout file in /data/inkling-mini/models was used (same bytes). 16 threads, `OMP_WAIT_POLICY=active OMP_PLACES=cores OMP_PROC_BIND=close` (the tuned
+llama.cpp settings of docs/BASELINE.md), the 616-token prompt of `build-final2/colibri_ab/prompt570.txt`, 100 generated tokens, greedy, loadavg 5-8 (another
+session compiling). Raw: `build-final2/atomic_ab/`.
+
+| engine on this Xeon 8171M | prompt | generation |
+|---|---|---|
+| atomic-engine, llama-bench pp616 / tg100 | 23.6 tok/s | 4.45 tok/s |
+| atomic-engine, llama-cli plain | 22.6 | 4.6 |
+| atomic-engine, llama-cli `--spec-type draft-dspark --spec-draft-n-max 7` (Unsloth drafter) | 22.3 | **1.4** |
+| atomic-engine, same with n_max 3 | 21.9 | **2.1** |
+| inkcpu build-final2, plain | 113.8 | 15.4 |
+| inkcpu, session-lookup + DSpark auto on copy-heavy outputs (12 threads) | | 24-29 |
+
+atomic-engine's CPU path is stock llama.cpp's (its 2026-11-22 idle-host baseline on this box was 5.45 / 22.4): inkcpu is 3.3x faster at decode and 5x at prompt
+processing, and its DSpark speculation on this CPU makes decode 2-3x SLOWER (verify of 7 rows costs far more than 7 plain steps in llama.cpp's CPU MoE path),
+whereas ours gains on code/tool/copy traffic. Their published 77-109 tok/s are M4 Max Metal numbers on a 100 %-acceptance copy fixture.

@@ -161,7 +161,9 @@ Old = the pre-wave build (build-orch, commit 95f2cab), new = build-final with al
 | decode ctx 16000 | n/a | 12.99 (12.72 12.99); attention 11.3 ms/token = 61 GB/s | |
 | prefill 256 / 512 / 1024 tokens (chunk 256) | 80.6 / 82.8 / 80.1 tok/s | 86.8 / 83.5 / 82.3 | +8 / +1 / +3 % |
 | prefill 1024 tokens, chunk 512 (server default) | n/a | 86.6 | |
-SPEC_ROWS_PLACEHOLDER
+| speculation, 12 threads, 8 prompts x 120 tokens, pooled: plain / fixed T=4 / fixed T=8 / auto | 13.58 / 10.77 / (8.16 on 11-22) / 13.48 tok/s | 15.28 / 13.28 / 9.78 / 15.43 | plain +13 %, T=4 +23 %, auto +14 % |
+| speculation per prompt, auto vs plain (new build) | code_completion 13.39 vs 13.82, tool_call 13.29 vs 13.63, chat_code 13.99 vs 13.84 | code_completion 15.31 vs 15.35, tool_call 16.51 vs 15.28 (+8 %), chat_code 16.53 vs 15.34 (+8 %), prose 14.78 vs 15.39 (-4 %) | fixed T=4 on code: 14.13 -> 17.62 |
+All speculative cells produced exactly the plain tokens (0 mismatches in 2611 verified rows at T=8). `bench_spec` defaults to 6 threads; the 6-thread cell of the first run (`spec_new.txt`) is kept for reference only.
 Run-to-run spread of identical configurations is ~5 % on this VM (the two old runs differ by 2.5 %, the two new runs by 7 %), so the decode gain is "+6..+10 %" rather than a single number;
 the per-phase profiles (INK_PROFILE=1 in the result files) attribute it to gate_up (22 -> 18 ms), attention at long context, controllers and fewer barriers. Prefill's gain is the
 K3 unpack/epilogue plus K2's multix for small experts (+8 % at 256 tokens, ~+3 % at 1024). What did NOT change: bytes per token (3.87 GB) and therefore the ~20 tok/s exact floor.

@@ -1,5 +1,5 @@
 # Module kernels_gemm (agent G): batched GEMM kernels for prompt processing (Q8_0, NVFP4, MoE grouped, BF16/F32).
-add_library(ink_kernels_gemm STATIC gemm.cpp gemm_small.cpp)
+add_library(ink_kernels_gemm STATIC gemm.cpp gemm_small.cpp gemm_i16.cpp)
 target_include_directories(ink_kernels_gemm PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(ink_kernels_gemm PUBLIC ink_kernels_gemv)
 # results must match the gemv kernels bit for bit: no implicit mul+add contraction

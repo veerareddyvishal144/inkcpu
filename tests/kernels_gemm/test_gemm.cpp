@@ -465,6 +465,264 @@ void check_x4(tu::Rng& rng) {
                 100.0 * flips_act / n, dflips_act);
 }
 
+
+// ---- I16 kernels (P2, wave 2): NOT bit-identical to gemv_nvfp4 by design. Reference = a scalar model of the kernel's arithmetic: exact integer
+// dot products per 16-k sub-block (reconstructed with plain ints from the ORIGINAL GGUF bytes) and the documented float order
+//   acc = fmaf( fmaf((float)I1, sw1, (float)I0 * sw0), dx, acc )  per Q8_0 block, sequential over blocks.
+// The kernel must reproduce the model BIT FOR BIT (any int16 saturation, wrong bias or lane mix-up would change the floats), for every token
+// tile width / K segment length / row chunking, in dense and MoE form, incl. the adversarial saturation cases (x = +-127 / -128, w = +-12).
+float i16_model_dot(const uint8_t* wrow, int k, const block_q8_0* x) {
+    static const int kv[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+    float acc = 0.f;
+    for (int b = 0; b < k / 32; ++b) {
+        const uint8_t* blk = wrow + (size_t)(b / 2) * 36;
+        const int h = b & 1;
+        int I[2] = {0, 0};
+        for (int s = 0; s < 2; ++s) {
+            const int sb = 2 * h + s;  // sub-block within the super-block
+            for (int i = 0; i < 16; ++i) {
+                const int byte = blk[4 + 8 * sb + (i & 7)];
+                const int nib = i < 8 ? (byte & 0xF) : (byte >> 4);
+                I[s] += kv[nib] * (int)x[b].qs[16 * s + i];
+            }
+        }
+        const float sw0 = ue4m3_to_f32(blk[2 * h]), sw1 = ue4m3_to_f32(blk[2 * h + 1]);
+        const float dx = fp16_to_f32(x[b].d);
+        float f = (float)I[0] * sw0;
+        f = fmaf((float)I[1], sw1, f);
+        acc = fmaf(f, dx, acc);
+    }
+    return acc;
+}
+long g_i16_cases = 0;
+
+// dense: y[t][r] vs the model, guards beyond `rows` in a padded ldy, several tile / segment settings (same bits required)
+bool check_i16_dense(const Mat& W /*original bytes*/, const Mat& Wr /*re-encoded*/, int k, int rows, const std::vector<block_q8_0>& acts, int nt, const char* label) {
+    AlignedBuf buf(gemm_act_bytes(GEMM_FMT_I16, nt, k));
+    gemm_pack_act(GEMM_FMT_I16, acts.data(), 0, nt, nt, k, buf.p);
+    const GemmAct act = gemm_act_view(GEMM_FMT_I16, buf.p, nt, k);
+    const size_t ldy = (size_t)rows + 3;
+    uint32_t sv = kSentinel;
+    float sf;
+    std::memcpy(&sf, &sv, 4);
+    std::vector<float> ref((size_t)nt * ldy, sf);
+    const int nb = k / 32;
+    for (int t = 0; t < nt; ++t)
+        for (int r = 0; r < rows; ++r) ref[(size_t)t * ldy + r] = i16_model_dot((const uint8_t*)W.ptr() + (size_t)r * W.rs, k, acts.data() + (size_t)t * nb);
+    const int tiles[] = {8, 1, 3, 12, 5};
+    const int segs[] = {16, 1, 5, 128, 2};
+    bool ok = true;
+    for (int v = 0; v < 5 && ok; ++v) {
+        g_gemm_i16_tile = tiles[v];
+        g_gemm_i16_seg = segs[v];
+        std::vector<float> y((size_t)nt * ldy, sf);
+        // split rows at a multiple of 16 and tokens at nt/3 for v == 1 (results must not depend on the split)
+        if (v == 1 && rows > 16 && nt >= 3) {
+            const int ra = 16, ta = nt / 3;
+            gemm_nvfp4r_i16(Wr.ptr(), Wr.rs, act, 0, ta, k, y.data(), ldy, ra);
+            gemm_nvfp4r_i16((const char*)Wr.ptr() + (size_t)ra * Wr.rs, Wr.rs, act, 0, ta, k, y.data() + ra, ldy, rows - ra);
+            gemm_nvfp4r_i16(Wr.ptr(), Wr.rs, act, ta, nt, k, y.data(), ldy, rows);
+        } else {
+            gemm_nvfp4r_i16(Wr.ptr(), Wr.rs, act, 0, nt, k, y.data(), ldy, rows);
+        }
+        size_t f = 0;
+        if (!same_bits(y.data(), ref.data(), y.size(), &f)) {
+            std::fprintf(stderr, "MISMATCH i16 %s K=%d rows=%d nt=%d tile=%d seg=%d: token %zu idx %zu got %.9g model %.9g\n", label, k, rows, nt, tiles[v], segs[v],
+                         f / ldy, f % ldy, (double)y[f], (double)ref[f]);
+            ++tu::g_fail;
+            ok = false;
+        }
+    }
+    g_gemm_i16_tile = 8;
+    g_gemm_i16_seg = 16;
+    ++g_i16_cases;
+    return ok;
+}
+
+void check_i16_moe(int k, int rows, int E, int ntok, int topk, int chunk_rows, tu::Rng& rng) {
+    const size_t rs = row_bytes_nvfp4(k);
+    const size_t es = rs * (size_t)rows + 24;
+    std::vector<uint8_t> wbuf(es * E + 16, 0x5A);
+    for (int e = 0; e < E; ++e) {
+        Mat m = make_nvfp4(rows, k, 0, e % NMODES, rng);
+        std::memcpy(wbuf.data() + 4 + (size_t)e * es, m.buf.data() + 4, rs * (size_t)rows);
+    }
+    std::vector<uint8_t> wr = wbuf;
+    for (int e = 0; e < E; ++e) nvfp4r_repack_rows(wr.data() + 4 + (size_t)e * es, rs, rows, k / 64);
+    std::vector<int32_t> ids((size_t)ntok * topk);
+    for (auto& v : ids) v = (int32_t)(rng.u32() % (uint32_t)E);
+    MoeRoute r;
+    moe_build_route(ids.data(), ntok, topk, E, r);
+    const int np = r.n_pairs();
+    std::vector<MoeItem> items;
+    moe_work_items(r, rows, chunk_rows, items);
+    std::vector<block_q8_0> at = make_acts(ntok, k, NORMAL, rng), ap = make_acts(np, k, NORMAL, rng);
+    AlignedBuf bt(gemm_act_bytes(GEMM_FMT_I16, ntok, k)), bp(gemm_act_bytes(GEMM_FMT_I16, np, k));
+    gemm_pack_act(GEMM_FMT_I16, at.data(), 0, ntok, ntok, k, bt.p);
+    gemm_pack_act(GEMM_FMT_I16, ap.data(), 0, np, np, k, bp.p);
+    const GemmAct acts_t = gemm_act_view(GEMM_FMT_I16, bt.p, ntok, k), acts_p = gemm_act_view(GEMM_FMT_I16, bp.p, np, k);
+    const size_t ldy = (size_t)rows + 1;
+    uint32_t sv = kSentinel;
+    float sf;
+    std::memcpy(&sf, &sv, 4);
+    std::vector<float> y1((size_t)np * ldy, sf), y2((size_t)np * ldy, sf), ref1((size_t)np * ldy, sf), ref2((size_t)np * ldy, sf), z((size_t)np * ldy, sf);
+    const int nb = k / 32;
+    for (int e = 0; e < E; ++e)
+        for (int p = r.offset[e]; p < r.offset[e + 1]; ++p)
+            for (int row = 0; row < rows; ++row) {
+                const uint8_t* w = wbuf.data() + 4 + (size_t)e * es + (size_t)row * rs;
+                ref1[(size_t)p * ldy + row] = i16_model_dot(w, k, at.data() + (size_t)r.pair_token[p] * nb);
+                ref2[(size_t)p * ldy + row] = i16_model_dot(w, k, ap.data() + (size_t)p * nb);
+            }
+    std::vector<int> order(items.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = (int)i;
+    for (size_t i = order.size(); i > 1; --i) std::swap(order[i - 1], order[rng.u32() % i]);
+    for (int oi : order) {
+        const MoeItem& it = items[(size_t)oi];
+        gemm_moe_nvfp4r_i16(wr.data() + 4, es, rs, acts_t, r.pair_token.data(), r, it, k, y1.data(), ldy);
+        gemm_moe_nvfp4r_i16(wr.data() + 4, es, rs, acts_p, nullptr, r, it, k, y2.data(), ldy);
+    }
+    // the exact kernel must accept the I16 pack (superset of the NVFP4 pack) and still equal gemv_nvfp4
+    for (int oi : order) gemm_moe_nvfp4r(wr.data() + 4, es, rs, acts_t, r.pair_token.data(), r, items[(size_t)oi], k, z.data(), ldy);
+    std::vector<float> gv((size_t)rows);
+    ++g_i16_cases;
+    for (int p = 0; p < np; ++p) {
+        size_t f = 0;
+        if (!same_bits(y1.data() + (size_t)p * ldy, ref1.data() + (size_t)p * ldy, ldy, &f) || !same_bits(y2.data() + (size_t)p * ldy, ref2.data() + (size_t)p * ldy, ldy, &f)) {
+            std::fprintf(stderr, "MISMATCH i16 moe K=%d rows=%d E=%d ntok=%d topk=%d chunk=%d pair=%d idx=%zu: y1 %.9g ref1 %.9g | y2 %.9g ref2 %.9g\n", k, rows, E, ntok, topk,
+                         chunk_rows, p, f, (double)y1[(size_t)p * ldy + f], (double)ref1[(size_t)p * ldy + f], (double)y2[(size_t)p * ldy + f], (double)ref2[(size_t)p * ldy + f]);
+            ++tu::g_fail;
+            return;
+        }
+        const int e = (int)(std::upper_bound(r.offset.begin(), r.offset.end(), p) - r.offset.begin() - 1);
+        gemv_nvfp4(wbuf.data() + 4 + (size_t)e * es, rs, at.data() + (size_t)r.pair_token[p] * nb, k, gv.data(), rows);
+        if (!same_bits(z.data() + (size_t)p * ldy, gv.data(), (size_t)rows, &f)) {
+            std::fprintf(stderr, "MISMATCH exact kernel on I16 pack K=%d rows=%d pair=%d idx=%zu\n", k, rows, p, f);
+            ++tu::g_fail;
+            return;
+        }
+    }
+}
+
+// adversarial saturation: every weight +-12 (nibbles 7 / 15), every activation +-127 or -128 (the largest magnitudes the formats allow):
+// int16 pair sums reach 2*24*128 = 6144 and 4-pair sums 24576 (< 32767); the model must be reproduced exactly, and the double reference within rounding
+void check_i16_adversarial(tu::Rng& rng) {
+    const int k = 2304, rows = 48, nt = 6;
+    struct Pat { uint8_t wbyte; int8_t xval; const char* name; };
+    const Pat pats[] = {{0x77, 127, "w=+12 x=+127"}, {0x77, -127, "w=+12 x=-127"}, {0x77, -128, "w=+12 x=-128"}, {0xFF, 127, "w=-12 x=+127"},
+                        {0xFF, -128, "w=-12 x=-128"}, {0x7F, -128, "w=+-12 alternating, x=-128"}, {0xF7, 127, "w=-+12 alternating, x=+127"}};
+    for (const Pat& P : pats) {
+        Mat W = make_nvfp4(rows, k, 0, NORMAL, rng);
+        for (int r = 0; r < rows; ++r) {
+            uint8_t* row = W.buf.data() + 4 + (size_t)r * W.rs;
+            for (int c = 0; c < k / 64; ++c) std::memset(row + (size_t)c * 36 + 4, P.wbyte, 32);
+        }
+        std::vector<block_q8_0> acts((size_t)nt * (k / 32));
+        for (size_t i = 0; i < acts.size(); ++i) {
+            acts[i].d = f32_to_fp16(0.01f + 0.001f * (float)(i % 17));
+            for (int j = 0; j < 32; ++j) acts[i].qs[j] = (i % 3 == 2 && (j & 1)) ? (int8_t)-P.xval : P.xval;  // one block in three alternates the sign
+        }
+        Mat Wr = reencode(W, rows, k);
+        if (!check_i16_dense(W, Wr, k, rows, acts, nt, P.name)) continue;
+        // double reference (independent of any accumulation order)
+        AlignedBuf buf(gemm_act_bytes(GEMM_FMT_I16, nt, k));
+        gemm_pack_act(GEMM_FMT_I16, acts.data(), 0, nt, nt, k, buf.p);
+        std::vector<float> y((size_t)nt * rows);
+        gemm_nvfp4r_i16(Wr.ptr(), Wr.rs, gemm_act_view(GEMM_FMT_I16, buf.p, nt, k), 0, nt, k, y.data(), rows, rows);
+        double worst = 0;
+        for (int t = 0; t < nt; ++t)
+            for (int r = 0; r < rows; ++r) {
+                const uint8_t* wr = (const uint8_t*)W.ptr() + (size_t)r * W.rs;
+                const double ref = ref_dot(wr, k, acts.data() + (size_t)t * (k / 32)), ab = ref_abs(wr, k, acts.data() + (size_t)t * (k / 32));
+                worst = std::max(worst, std::fabs((double)y[(size_t)t * rows + r] - ref) / std::max(ab, 1e-30));
+            }
+        std::printf("  i16 adversarial %-32s model bit-exact, max |y-ref|/sum|wx| vs double %.3g\n", P.name, worst);
+        TU_CHECK(worst < 1e-6);
+    }
+}
+
+void check_i16(tu::Rng& rng) {
+    // dense shapes x value modes
+    for (int mode = 0; mode < NMODES; ++mode)
+        for (int k : {64, 192, 1152, 2304})
+            for (int rows : {1, 5, 16, 17, 32, 33, 48})
+                for (int nt : {1, 2, 3, 5, 8, 9, 12, 13, 17, 24, 33}) {
+                    if (mode != NORMAL && (rows > 17 || nt > 13)) continue;
+                    Mat W = make_nvfp4(rows, k, (rows + nt) % 2 ? 24 : 0, mode, rng);
+                    Mat Wr = reencode(W, rows, k);
+                    std::vector<block_q8_0> acts = make_acts(nt, k, mode == RANDBITS ? NORMAL : mode, rng);
+                    check_i16_dense(W, Wr, k, rows, acts, nt, "dense");
+                }
+    std::printf("i16 dense done, cases %ld, fail %d\n", g_i16_cases, tu::g_fail);
+    check_i16_adversarial(rng);
+    check_i16_moe(2304, 36, 12, 70, 8, 16, rng);
+    check_i16_moe(1152, 40, 9, 64, 8, 32, rng);
+    check_i16_moe(256, 22, 7, 37, 3, 8, rng);
+    check_i16_moe(64, 5, 3, 9, 1, 4, rng);
+    check_i16_moe(2304, 64, 4, 200, 8, 32, rng);  // up to ~400 pairs per expert: many tiles
+    std::printf("i16 moe done, cases %ld, fail %d\n", g_i16_cases, tu::g_fail);
+    // numerics vs double on the realistic case (2304x2304 gate/up, Gaussian activations): exact kernel vs i16 kernel, plus Q8_0 re-quantisation flips
+    {
+        const int k = 2304, rows = 2304, nt = 24;
+        Mat G = make_nvfp4(rows, k, 0, NORMAL, rng), U = make_nvfp4(rows, k, 0, NORMAL, rng);
+        Mat Gr = reencode(G, rows, k), Ur = reencode(U, rows, k);
+        std::vector<float> xf((size_t)nt * k);
+        for (auto& v : xf) v = rng.gauss();
+        std::vector<block_q8_0> acts((size_t)nt * (k / 32));
+        for (int t = 0; t < nt; ++t) quantize_row_q8_0(xf.data() + (size_t)t * k, acts.data() + (size_t)t * (k / 32), k);
+        AlignedBuf b(gemm_act_bytes(GEMM_FMT_I16, nt, k));
+        gemm_pack_act(GEMM_FMT_I16, acts.data(), 0, nt, nt, k, b.p);
+        const GemmAct a = gemm_act_view(GEMM_FMT_I16, b.p, nt, k);
+        std::vector<float> ge((size_t)nt * rows), gi((size_t)nt * rows), ue((size_t)nt * rows), ui((size_t)nt * rows);
+        gemm_nvfp4r(Gr.ptr(), Gr.rs, a, 0, nt, k, ge.data(), rows, rows);  // exact kernel on the I16 pack (superset)
+        gemm_nvfp4r_i16(Gr.ptr(), Gr.rs, a, 0, nt, k, gi.data(), rows, rows);
+        gemm_nvfp4r(Ur.ptr(), Ur.rs, a, 0, nt, k, ue.data(), rows, rows);
+        gemm_nvfp4r_i16(Ur.ptr(), Ur.rs, a, 0, nt, k, ui.data(), rows, rows);
+        double max_e = 0, max_i = 0, sum_e = 0, sum_i = 0, max_ie = 0, maxabs = 0;
+        long nref = 0;
+        for (int t = 0; t < nt; t += 3)
+            for (int r = 0; r < rows; r += 7) {
+                const uint8_t* wr = (const uint8_t*)G.ptr() + (size_t)r * G.rs;
+                const block_q8_0* x = acts.data() + (size_t)t * (k / 32);
+                const double ref = ref_dot(wr, k, x), ab = ref_abs(wr, k, x);
+                const double de = std::fabs((double)ge[(size_t)t * rows + r] - ref) / ab, di = std::fabs((double)gi[(size_t)t * rows + r] - ref) / ab;
+                max_e = std::max(max_e, de);
+                max_i = std::max(max_i, di);
+                sum_e += de;
+                sum_i += di;
+                max_ie = std::max(max_ie, std::fabs((double)gi[(size_t)t * rows + r] - (double)ge[(size_t)t * rows + r]));
+                maxabs = std::max(maxabs, std::fabs(ref));
+                ++nref;
+            }
+        std::printf("i16 numerics (2304x2304, 24 tokens, %ld samples vs double): max |y-ref|/sum|wx| exact %.3g, i16 %.3g; mean exact %.3g, i16 %.3g; max |i16-exact| %.3g (max |y| %.3g)\n",
+                    nref, max_e, max_i, sum_e / nref, sum_i / nref, max_ie, maxabs);
+        TU_CHECK(max_i < 1e-6);
+        long flips_raw = 0, flips_act = 0, dflips_raw = 0, dflips_act = 0, n = 0;
+        std::vector<float> he((size_t)rows), hi((size_t)rows);
+        std::vector<block_q8_0> qa(rows / 32), qb(rows / 32);
+        auto flips = [&](const float* p, const float* q, long& fq, long& fd) {
+            quantize_row_q8_0(p, qa.data(), rows);
+            quantize_row_q8_0(q, qb.data(), rows);
+            for (int i = 0; i < rows / 32; ++i) {
+                if (qa[i].d != qb[i].d) ++fd;
+                for (int j = 0; j < 32; ++j) fq += qa[i].qs[j] != qb[i].qs[j];
+            }
+        };
+        for (int t = 0; t < nt; ++t) {
+            flips(ge.data() + (size_t)t * rows, gi.data() + (size_t)t * rows, flips_raw, dflips_raw);
+            for (int r = 0; r < rows; ++r) {
+                const float g1 = ge[(size_t)t * rows + r], g2 = gi[(size_t)t * rows + r];
+                he[(size_t)r] = g1 / (1.f + std::exp(-g1)) * ue[(size_t)t * rows + r];
+                hi[(size_t)r] = g2 / (1.f + std::exp(-g2)) * ui[(size_t)t * rows + r];
+            }
+            flips(he.data(), hi.data(), flips_act, dflips_act);
+            n += rows;
+        }
+        std::printf("i16 Q8_0 re-quantisation flips vs exact kernel: raw GEMM output %ld of %ld int8 values (%.4f%%), %ld of %ld block scales; silu(gate)*up %ld of %ld (%.4f%%), %ld block scales\n",
+                    flips_raw, n, 100.0 * flips_raw / n, dflips_raw, n / 32, flips_act, n, 100.0 * flips_act / n, dflips_act);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -519,8 +777,9 @@ int main() {
         TU_CHECK(std::memcmp(a.p, b.p, gemm_act_bytes(fmt, nt, k)) == 0);
     }
     check_x4(rng);
+    if (!std::getenv("INK_TEST_SKIP_I16")) check_i16(rng);
     std::printf("moe + pack done, cases %ld (scalar-ref cases %ld, re-encoded nvfp4r cases %ld), failures %d, loadavg %s\n", g_cases, g_ref_cases,
                 g_r_cases, tu::g_fail, tu::loadavg().c_str());
-    std::printf(tu::g_fail ? "FAILED\n" : "ALL PASS (bit-identical to B1 gemv, incl. gemm_nvfp4r / gemm_moe_nvfp4r on re-encoded scales)\n");
+    std::printf(tu::g_fail ? "FAILED\n" : "ALL PASS (bit-identical to B1 gemv, incl. gemm_nvfp4r / gemm_moe_nvfp4r on re-encoded scales; i16 kernels == scalar model, %ld cases)\n", g_i16_cases);
     return tu::g_fail ? 1 : 0;
 }

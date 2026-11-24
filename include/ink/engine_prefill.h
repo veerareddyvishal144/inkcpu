@@ -26,6 +26,14 @@ struct PrefillTune {                    // read from the environment (INK_PF_*) 
                                         // once, no panel unpack) instead of gemm_moe_*; 0 = always the GEMM. Bit-identical either way. INK_PF_MULTIX. Default 8 = kMultixMaxX:
                                         // the kernel A/B (bench_gemv_multix, 4 threads) has multix ahead of gemm_moe_* at 1-8 pairs (1.15-1.5x), see docs/status/K2.md
     int multix_check = 0;               // K2 diagnostic: 1 = also run the GEMM for every multix item and report the first bitwise difference on stderr; INK_PF_MULTIX_CHECK
+    int i16 = 1;                        // P2 (wave 2): 1 = PROMPT CHUNKS run ALL NVFP4 MoE items (any pair count; the multix threshold is ignored) through the
+                                        // int16-accumulation kernel gemm_moe_nvfp4r_i16 (2.9 instead of 5 vector uops per 64 MACs; NUMERICS-DEVIATING: one float
+                                        // rounding per 16 weights instead of per 4, so prefill logits differ from decode (cosine ~0.999, argmax equal on the oracle
+                                        // prompts; parity gates in docs/status/P2.md, docs/KERNELS_GEMM.md 9). The result per (row, token) does not depend on the
+                                        // token tile, so the chunk size still does not change the logits. engine_verify (speculative decoding) and Engine::decode
+                                        // never use it: verify stays bit-identical to decode. 0 = the exact kernels everywhere (prefill == decode bit for bit as in
+                                        // wave 1). 2 = A/B only: i16 for experts with > multix pairs, multix (exact) below, so the logits depend on the chunk
+                                        // boundaries (P2's first wiring; not for production). INK_PF_I16. Requires LayerPacked::nvfp4r (else ignored).
 };
 
 // The tunables in effect (edit before the first call; chunk and the item sizes may be changed between calls).

@@ -21,7 +21,13 @@
 
 namespace ink {
 
-enum GemmFmt : int { GEMM_FMT_Q8 = 0, GEMM_FMT_NVFP4 = 1, GEMM_FMT_NVFP4X4 = 2 /* x4 prototype only: NVFP4 layout + Xs bias vector */ };
+enum GemmFmt : int {
+    GEMM_FMT_Q8 = 0,
+    GEMM_FMT_NVFP4 = 1,
+    GEMM_FMT_NVFP4X4 = 2, /* x4 prototype only: NVFP4 layout + Xs bias vector */
+    GEMM_FMT_I16 = 3      /* P2 (wave 2): NVFP4 layout + int32 per-sub-block sums xb (see GemmAct::xb). A superset of GEMM_FMT_NVFP4: every
+                             NVFP4 entry point (gemm_nvfp4, gemm_nvfp4r, gemm_moe_nvfp4*, ...) accepts an I16 pack unchanged; the i16 kernels need it. */
+};
 
 // Non-owning view of a packed activation matrix (token t: int8 quants at xq + t*k, float scales at dx + t*dxn).
 struct GemmAct {
@@ -32,6 +38,7 @@ struct GemmAct {
     const int8_t* xq = nullptr;  // nt * k bytes
     const float* dx = nullptr;   // nt * dxn floats
     const float* xs = nullptr;   // GEMM_FMT_NVFP4X4 only: nt * dxn floats, Xs[t][s] = 12 * dx * sum of sub-block s (x4 prototype)
+    const int32_t* xb = nullptr; // GEMM_FMT_I16 only: nt * dxn int32, xb[t][s] = 12 * (exact int sum of the 16 quants of sub-block s), zero padded
 };
 
 // Bytes of the buffer for nt tokens (allocate 64-byte aligned, e.g. alloc_weight_buffer(bytes, false) or std::aligned_alloc(64, ...)).
@@ -93,6 +100,24 @@ void gemm_moe_nvfp4r(const void* w, size_t expert_stride, size_t row_stride, con
 void gemm_nvfp4r_x4(const void* w, size_t row_stride, const GemmAct& act, int t0, int t1, int k, float* y, size_t ldy, int nrows);
 void gemm_moe_nvfp4r_x4(const void* w, size_t expert_stride, size_t row_stride, const GemmAct& act, const int32_t* act_rows, const MoeRoute& r,
                         const MoeItem& it, int k, float* y, size_t ldy);
+
+// ---- I16 KERNELS (P2, wave 2, 2026-11-24): int16-accumulation chain, NUMERICS-DEVIATING from gemv_nvfp4 (prefill prompt chunks only; see
+// docs/KERNELS_GEMM.md section 9). Weights (nvfp4r-encoded scales, as the engine arena holds them) are unpacked per 16-row panel into
+// zmm = 16 rows x 4 consecutive k as u8 = kv + 12; activations are broadcast per 4 k from a GEMM_FMT_I16 pack. Per (16 rows, token, 16 k):
+// 4 vpmaddubsw (|pair| <= 6096) + 3 vpaddw (|sum| <= 24384: no saturation possible) + 1 vpmaddwd(ones) -> the EXACT int32 dot product of the
+// sub-block after subtracting the bias 12*sum(x) (xb); the float part is, per Q8_0 block b with sub-blocks 2b, 2b+1 and weight scales sw:
+//      acc_t = fmaf( fmaf((float)I_{2b+1}, sw_{2b+1}, (float)I_{2b} * sw_{2b}), dx_t[b], acc_t )        (sequential over b; y = acc at the end)
+// i.e. one float rounding per 16 weights plus one per 32 instead of one per 4: fewer roundings than the exact kernels, but different bits.
+// The result does not depend on the token tile (g_gemm_i16_tile), the K segment (g_gemm_i16_seg), the row chunking or the thread. Same
+// argument conventions as gemm_nvfp4r / gemm_moe_nvfp4r; act.fmt must be GEMM_FMT_I16; K % 64 == 0, K <= 8192; any nrows (panels of 16 rows,
+// the last one masked). The per-expert F32 scale is NOT applied.
+void gemm_nvfp4r_i16(const void* w, size_t row_stride, const GemmAct& act, int t0, int t1, int k, float* y, size_t ldy, int nrows);
+void gemm_moe_nvfp4r_i16(const void* w, size_t expert_stride, size_t row_stride, const GemmAct& act, const int32_t* act_rows, const MoeRoute& r,
+                         const MoeItem& it, int k, float* y, size_t ldy);
+extern int g_gemm_i16_tile;  // max tokens per register tile (1..12, default 8); an expert's n tokens are split into balanced tiles of <= this
+extern int g_gemm_i16_seg;   // super-blocks (64 k) per unpacked K segment (default 16; the panel of a segment is 16 rows x seg x 64 u8 + scales)
+extern int g_gemm_i16_pf;    // 1 = software-prefetch the next segment's rows while computing (default), 0 = off
+extern int g_gemm_i16_uniform;  // 1 = full panels use the uniform-stride unpack (16 row addresses from 4 base pointers; default), 0 = pointer table (A/B only)
 
 // Benchmark-only (bench_gemm --what unpack): time of unpacking rows [0, nrows) `reps` times, in ns; enc 0 = GGUF, 1 = nvfp4r, 2 = x4 prototype.
 double gemm_bench_unpack_ns(const void* w, size_t row_stride, int k, int nrows, int enc, int reps);

@@ -167,3 +167,55 @@ All speculative cells produced exactly the plain tokens (0 mismatches in 2611 ve
 Run-to-run spread of identical configurations is ~5 % on this VM (the two old runs differ by 2.5 %, the two new runs by 7 %), so the decode gain is "+6..+10 %" rather than a single number;
 the per-phase profiles (INK_PROFILE=1 in the result files) attribute it to gate_up (22 -> 18 ms), attention at long context, controllers and fewer barriers. Prefill's gain is the
 K3 unpack/epilogue plus K2's multix for small experts (+8 % at 256 tokens, ~+3 % at 1024). What did NOT change: bytes per token (3.87 GB) and therefore the ~20 tok/s exact floor.
+
+## 2026-11-24 Optimisation wave 2 (orchestrator + agents L/L2 and P2/P2b; contract `docs/OPT_WAVE2.md`, logs `docs/status/{L,P2}.md`)
+
+Owner decision after `docs/RESEARCH_WAVE2.md`: build its items 2 and 3. Item 3 is the first deliberate numerics change of the engine: PROMPT CHUNKS may use a float accumulation
+order that differs from decode's; speculative verify and decode stay bit-identical to wave 1, so speculation remains token-identical to plain decode.
+
+### What changed (default ON)
+1. **Session-lookup drafter** (L/L2; `src/spec/lookup.cpp`, `docs/SPEC_DESIGN.md` 11): every token that enters a slot (prompt via ink_forward, emitted tokens, truncation on
+   rewind, clearing on reset) feeds a per-slot n-gram index; when the last >= 8 tokens match an earlier span, the tokens that followed it are drafted (free), up to 7 rows,
+   with per-match-length acceptance tracking. In `auto` the source with the higher predicted speed-up drafts (lookup vs the DSpark policy); without a drafter, auto =
+   lookup + plain, and a drafter-less server now speculates by default. Kill switch `INK_SPEC_LOOKUP=0`; mode `lookup`; knobs `INK_SPEC_LOOKUP_NMIN/_ENTER/_MAXDRAFT/_PROBE`.
+   Additive C ABI: `ink_spec_lookup`, `ink_spec_lookup_enabled`, `ink_spec_last_source`, `ink_spec_lookup_stats`.
+2. **Int16-accumulation expert GEMM for prompt chunks** (P2/P2b; `src/kernels_gemm/gemm_i16.cpp`, `docs/KERNELS_GEMM.md` 9): weights as kvalue+12 (u8) in 16-row x 4-k lanes,
+   4 vpmaddubsw + 3 vpaddw + vpmaddwd + bias vpsubd + cvt + fma per 16 rows x 16 k = 2.75 vector uops per 64 MACs instead of 5 (saturation impossible: pair sums <= 6096,
+   four summed <= 24384); integer dot products exact, float scale once per 16 weights. `PrefillTune::i16` / `INK_PF_I16` (1 = all NVFP4 expert items of prompt chunks,
+   0 = wave-1 bit-identical path, 2 = A/B-only mixed wiring); `engine_verify` and `Engine::decode` never use it (guarded).
+3. Server: `INK_SPEC_EXACT=1` is now the serve.sh default (exact verify attention beyond 768 keys keeps speculative output token-identical to plain decode on long prompts;
+   measured at no cost on a 1743-token prompt); `--spec auto|off|lookup|2..8`.
+
+### Agent measurements (shared host, loadavg 8-16: another session compiled all night; same-window A/B)
+* Lookup drafter, 12 threads, greedy, tok/s plain / DSpark-only / lookup-only / new auto: docstring re-emission (p 1743) 14.00 / 21.30 / 24.29 / **24.39**; fix-one-line-and-reprint
+  (p 537) 14.05 / 25.85 / 29.24 / **29.43**; tool-call JSON (p 568) 14.00 / 24.36 / 15.69 / **24.45** (lookup yields to DSpark); pooled 14.02 / 23.69 / 21.62 / **25.89**. The 8 standard
+  prompts pooled 15.04 / 15.04 / 15.35 / **15.50** (per prompt -3.6 %..+10 %, the losses being DSpark probes under load as before). 0 mismatches vs plain in 56 cells.
+* Int16 prefill, 16 threads, chunk 512 (server default), exact vs i16 in one lock hold: 87.1 / 87.1 / 87.0 -> **112.4 / 119.3 / 115.6 tok/s** at 256 / 512 / 1024 prompt tokens
+  (1.31-1.37x); chunk 256: 86.8 / 85.7 / 84.1 -> 113.6 / 113.6 / 110.8. Profile at 512 tokens: 11.31 -> 8.40 ms/token; MoE gate_up 4.62 -> 2.76 ms, down 2.52 -> 1.41 (1.71x);
+  the remaining 4.2 ms are dense Q8_0 projections (2.8), controllers, attention, misc. The MoE kernel runs at 86 % of the 5-uop ALU peak; experts stream at only 11.5 GB/s, so
+  prefill is now ALU-bound on the dense Q8_0 phases and the fixed work, not on DRAM.
+* Parity of the i16 prompt chunks vs llama.cpp (P2b): KL mean 0.00147 nats on the 6 oracle prompts (decode path 0.00163); NLL over 9 wikitext chunks / 3063 positions within 0.01
+  on every chunk, paired i16 - exact = -0.00005 nats, mean |NLL - llama.cpp| 0.00282 vs 0.00320 (exact); argmax mismatches 76 vs 70 of 3072. Literal oracle argmax 5/6 and
+  top-10 >= 9 on 5/6: both misses are reference ties (top-2 gap 0.095 logits; ranks 2-10 at ~1e-10 probability). Chunk sizes 1/2/7/64/256 bit-identical to each other;
+  determinism across 16/12/8/5 threads bit-identical; test_verify / test_rewind PASS; INK_PF_I16=0 bit-identical to decode.
+
+### Integration finding: prompt chunks of 1-2 tokens went through the decode path (fixed with `ink_prefill`)
+The real-server test "Caret re-rendered turn rewinds to the prompt end" failed on the integrated build and passed with INK_PF_I16=0. Root cause (found with a
+backend call trace, `INK_CALL_TRACE=<file>` in server/scheduler.py): the LCP of the re-rendered prompt is one token past the prompt end (the shared assistant-header
+token), the nearest checkpoint is the prompt end, so the scheduler forces a chunk boundary at the LCP and prefills a 1-token chunk; `Engine::forward(n < INK_PREFILL_MIN=3)`
+runs through the decode loop, i.e. with the exact kernels, while the cold run computes the same token inside an int16 chunk. With bit-identical kernels that never
+mattered; with the int16 path the two states differ by rounding and a near-tie flipped 15 tokens later. Fix: `Engine::prefill` / `ink_prefill` (always the batched
+executor, any n), used by the server for every prompt chunk; `ink_forward(n = 1)` stays the decode step. Engine-level replays of the full scheduler pattern (chunks,
+logits only on the last chunk, slot flushes, rewinds, ring wrap at 2048) were bit-identical before and after.
+
+### Integrated build gates and A/B (`build-final2`, orchestrator, host shared with another session: loadavg 8-16)
+Unit: all kernel/spec suites pass (test_gemm incl. 704 i16 cases, test_gemv_multix, test_lookup); server mock suite 73/73.
+Full model (lock): test_engine oracle/greedy/determinism as before; test_prefill quick: INK_PF_I16=0 bit-identical to decode, default at parity (argmax equal, top-10 10,
+cosine 0.99939 vs llama.cpp; vs decode 0.99952); chunks 64/256/1000 identical to each other; test_verify, test_spec quick, test_rewind, C ABI and spec C ABI tests, drafter model test PASS.
+Speculation (12 threads, same window): standard prompts pooled plain 15.32 / dspark 15.27 / lookup 15.60 / auto 15.70 (old build plain 15.23 / auto 15.52); copy-heavy
+prompts pooled plain 14.83 / dspark 22.35 / lookup 20.74 / auto 23.71. The only mismatching cells (long_context_qa, DSpark modes, 61/120) are the fast verify attention
+above 768 keys: INK_SPEC_EXACT=1 (now the serve.sh default) or INK_PF_I16=0 both give 0 mismatches there.
+Prefill (16 threads, chunk 512 = server default, same window): old build 87.2 / 90.4 / 88.6 tok/s at 256 / 512 / 1024 tokens -> new 111.6 / 121.0 / 117.4 (new with
+INK_PF_I16=0: 88.9 at 512). Decode is unchanged by wave 2 (A/B old vs new, alternating twice, 16 threads, loadavg 9-15): ctx 16 old 16.08 / 15.67 vs new 16.03 / 16.30 tok/s; ctx 1000 old 14.34 / 15.08
+vs new 14.84 / 14.87 (noise +-5 %). After the `ink_prefill` fix the real-server suite is 15/15 (greedy via HTTP == raw libink == llama.cpp, speculation incl. lookup, stop tokens,
+tool calls, shared-prefix rewind, Caret re-rendered turn == cold run, rewound slot). Production restarted on `build-final2` (symlink `build`) at ~05:35 UTC.

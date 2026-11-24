@@ -821,4 +821,18 @@ int Engine::forward(int slot, const int32_t* tokens, int n, float* logits_last) 
     return 0;
 }
 
+int Engine::prefill(int slot, const int32_t* tokens, int n, float* logits_last) {
+    if (n < 1) return -4;
+    if (slot < 0 || slot >= (int)slots.size() || !slots[slot].used) return -1;
+    if (slots[slot].pos + n > opt.max_ctx) return -2;
+#ifdef INK_HAVE_PREFILL
+    const auto t0 = std::chrono::steady_clock::now();
+    const int rc = engine_prefill(*this, slot, tokens, n, logits_last);
+    last_forward_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    return rc;
+#else
+    return forward(slot, tokens, n, logits_last);
+#endif
+}
+
 }  // namespace ink

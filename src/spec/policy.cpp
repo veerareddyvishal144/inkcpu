@@ -55,6 +55,19 @@ double SpecPolicy::verify_us(int T) const {
     return tp_ * o_.verify_ratio[T] * (k ? s / k : 1.0);
 }
 
+double SpecPolicy::verify_ratio(int T) const {
+    if (T < 1) T = 1;
+    if (T > 8) T = 8;
+    if (T == 1) return 1.0;
+    if (tp_ > 0) return verify_us(T) / tp_;
+    return o_.verify_ratio[T];
+}
+
+void SpecPolicy::observe_verify_time(int T, double us) {
+    if (T < 2 || T > 8 || us <= 0) return;
+    tv_[T] = tv_[T] > 0 ? (1 - o_.alpha_time) * tv_[T] + o_.alpha_time * us : us;
+}
+
 double SpecPolicy::draft_us(int n) const {
     if (n < 1) return 0;
     if (n > 7) n = 7;

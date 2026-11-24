@@ -168,6 +168,10 @@ public:
     int decode(int slot, int32_t token, float* logits);
     // n tokens (decode path looped for now; a batched prefill executor can replace it); logits of the last token only
     int forward(int slot, const int32_t* tokens, int n, float* logits_last);
+    // Prompt processing: like forward() but ALWAYS through the batched prefill executor, also for n = 1 or 2 (forward() routes n < INK_PREFILL_MIN
+    // through the decode loop). Needed since wave 2: prompt chunks use the int16 expert GEMM, so a 1-2-token prompt chunk computed by the decode
+    // path would not match the same tokens computed inside a larger chunk (cold vs rewound prefill must agree bit for bit).
+    int prefill(int slot, const int32_t* tokens, int n, float* logits_last);
 
     int n_vocab() const { return cfg.n_vocab; }
     void set_threads(int n_threads);                 // rebuilds the pool (results are bit-identical for any count)

@@ -31,9 +31,10 @@ def main(argv=None):
     ap.add_argument("--no-spec", action="store_true", help="never use the backend's speculative decoding path")
     ap.add_argument("--drafter", default=os.environ.get("INK_DRAFTER") or None,
                     help="DSpark drafter GGUF (ink backend): enables speculative steps when libink exports ink_spec_* (else a warning)")
-    ap.add_argument("--spec", default=None, metavar="auto|off|2..8",
-                    help="engine default for requests without a `speculation` field: auto (policy picks the width), off (plain decode), "
-                         "or a fixed verify width 2..8; default: the engine's (env INK_SPEC, else auto)")
+    ap.add_argument("--spec", default=None, metavar="auto|off|lookup|2..8",
+                    help="engine default for requests without a `speculation` field: auto (session-lookup draft when it predicts the larger speed-up, "
+                         "else the DSpark policy; without a drafter auto = lookup + plain), off (plain decode), lookup (lookup drafts only), "
+                         "or a fixed DSpark verify width 2..8; default: the engine's (env INK_SPEC, else auto). INK_SPEC_LOOKUP=0 disables the lookup drafter.")
     ap.add_argument("--sampler", choices=["numpy", "c"], default=os.environ.get("INK_SAMPLER", "numpy"),
                     help="plain-path sampler: numpy (server/sampling.py, default) or c (the engine's ink_sample: same kept set and probabilities, "
                          "other random stream per seed, ~1 ms less python per sampled token); penalties always use numpy")

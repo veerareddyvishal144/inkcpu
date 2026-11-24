@@ -21,6 +21,12 @@
 #include "ink/engine.h"
 #include "ink/engine_prefill.h"
 
+// Gate thresholds. With the wave-2 default (PrefillTune::i16 != 0) prompt chunks use the int16-accumulation expert GEMM whose float accumulation
+// order differs from decode's, so prefill == decode holds at the parity level (argmax + cosine >= 0.999, as vs llama.cpp), not bit for bit;
+// INK_PF_I16=0 restores the bit-identity criterion (0.99999). See docs/KERNELS_GEMM.md section 9.
+static double gate_cos() { return ink::prefill_tune().i16 ? 0.999 : 0.99999; }
+static const char* gate_label() { return ink::prefill_tune().i16 ? "PASS (parity: i16 prompt chunks)" : "PASS"; }
+
 using namespace ink;
 using clk = std::chrono::steady_clock;
 
@@ -271,8 +277,8 @@ int mode_oracle() {
             print_cmp("decode vs llama.cpp", compare(ref.data(), p.orc.data(), ref.size()));
             print_cmp("prefill(fast) vs llama.cpp", compare(pf.data(), p.orc.data(), ref.size()));
         }
-        const bool ok = cf.am_a == cf.am_b && cf.cos >= 0.99999;
-        std::printf("  -> %s (fast: argmax equal %d, cosine %.8f; decode-attn bit-identical %d)\n", ok ? "PASS" : "FAIL", cf.am_a == cf.am_b, cf.cos, cd.bits);
+        const bool ok = cf.am_a == cf.am_b && cf.cos >= gate_cos();
+        std::printf("  -> %s (fast: argmax equal %d, cosine %.8f; decode-attn bit-identical %d)\n", ok ? gate_label() : "FAIL", cf.am_a == cf.am_b, cf.cos, cd.bits);
         if (!ok) ++fails;
     }
     std::printf("gate (a) %s\n", fails ? "FAIL" : "PASS");
@@ -319,7 +325,7 @@ int mode_state() {
             // m = 1000: the decode attention kernel splits the keys of the global layers (>= 768 visible keys: nsplit >= 2) and merges the partial softmaxes, the
             // prefill kernel does one pass: rounding-level differences that the Q8_0 activation re-quantisation and the top-8 choice amplify. Informational only.
             const bool informational = m == 1000;
-            const bool ok = am_bad == 0 && worst_cos >= 0.99999;
+            const bool ok = am_bad == 0 && worst_cos >= gate_cos();
             std::printf("  24 decode steps after prefill vs reference: argmax mismatches %d, worst cosine %.8f, worst maxabs %.3e, bit-identical steps %d/24  %s\n",
                         am_bad, worst_cos, worst_abs, bit, informational ? (ok ? "(informational) PASS" : "(informational: nsplit>1 in the decode kernel)") : (ok ? "PASS" : "FAIL"));
             if (!ok && !informational) ++fails;
@@ -347,7 +353,7 @@ int mode_chunks() {
             char lab[80];
             std::snprintf(lab, sizeof lab, "300 tokens, chunk %d (%.1f s) vs decode", ch, secs);
             print_cmp(lab, c);
-            if (c.am_a != c.am_b || c.cos < 0.99999) ++fails;
+            if (c.am_a != c.am_b || c.cos < gate_cos()) ++fails;
         }
     }
     {   // ring wrap: the 1305-token llama.cpp prompt and a 1500-token prompt (the same text repeated); reference = prefill with the decode kernels

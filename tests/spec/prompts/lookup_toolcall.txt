@@ -1,0 +1,29 @@
+<|message_system|>tool_declare<|content_xml|>[{"description":"Read several files from the workspace and return their contents","name":"read_files","parameters":{"properties":{"paths":{"description":"Workspace-relative paths","items":{"type":"string"},"type":"array"}},"required":["paths"],"type":"object"},"type":"function"},{"description":"List the files below a directory","name":"list_dir","parameters":{"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"},"type":"function"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>I ran `list_dir` on src/inkserver and got:
+
+src/inkserver/__init__.py
+src/inkserver/app.py
+src/inkserver/backends/__init__.py
+src/inkserver/backends/ink_backend.py
+src/inkserver/backends/mock_backend.py
+src/inkserver/chat_template.py
+src/inkserver/metrics.py
+src/inkserver/parser.py
+src/inkserver/sampling.py
+src/inkserver/scheduler.py
+src/inkserver/tokenizer.py
+src/inkserver/tests/__init__.py
+src/inkserver/tests/helpers.py
+src/inkserver/tests/test_chat_template.py
+src/inkserver/tests/test_metrics.py
+src/inkserver/tests/test_parser.py
+src/inkserver/tests/test_sampling.py
+src/inkserver/tests/test_scheduler.py
+src/inkserver/tests/test_server_api.py
+src/inkserver/tests/test_tokenizer.py
+src/inkserver/tests/fixtures/prompts.json
+src/inkserver/tests/fixtures/tool_calls.json
+src/inkserver/util/__init__.py
+src/inkserver/util/paths.py
+src/inkserver/util/timing.py
+
+Read every test module under src/inkserver/tests (the test_*.py files, not the fixtures or helpers) with the read_files tool in a single call, so we can review them.<|end_message|><|message_model|>

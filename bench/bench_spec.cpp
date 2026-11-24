@@ -1,5 +1,8 @@
 // bench_spec (agent S2): plain vs fixed T=4 vs fixed T=8 vs auto on the DSpark prompts with the real drafter (S1) or a test double.
-//   INK_CPUS=... build/src/spec/bench_spec [--n 80] [--modes plain,4,8,auto] [--prompts name,name|all] [--drafter PATH|oracle|none] [--exact -1|0|1] [--temp 0.0] [--seed 1]
+//   INK_CPUS=... build/src/spec/bench_spec [--n 80] [--modes plain,4,8,auto] [--prompts name,name|all|dspark|lookup] [--drafter PATH|oracle|none] [--exact -1|0|1] [--temp 0.0] [--seed 1]
+// Agent L (wave 2) modes: `dspark` = the old auto (DSpark policy only, lookup drafter disabled), `lookup` = session lookup only (mode 9, plain fallback),
+// `auto` = lookup first + DSpark fallback (the new default). Per prompt the lookup modes also print the acceptance per match-length bucket, the draft-source histogram and the
+// wasted (rejected) verify rows. Prompt sets: `dspark` = the 8 DSpark prompts, `lookup` = the 3 copy-heavy prompts (tests/spec/prompts/lookup_*), `all` = both.
 // Every mode starts from a fresh prefill of the prompt (the tap hook feeds the drafter during the prefill, as in the server) and generates n tokens greedily (or sampled with --temp).
 // Reports per prompt and mode: tok/s of the generation (wall), L = tokens per speculative step, acceptance, mean draft / verify / plain step times, the T histogram (auto), and the
 // number of tokens that differ from the plain run (0 expected in exact mode and for greedy agreement; the fast attention kernel may flip low-margin tokens above 768 keys).
@@ -19,13 +22,16 @@ namespace {
 struct Row {
     std::string mode;
     int tokens = 0, steps = 0, spec_steps = 0, drafted = 0, accepted = 0, mismatches = 0, hist[9] = {};
+    int src_steps[3] = {}, src_drafted[3] = {}, src_accepted[3] = {};   // per draft source (0 plain, 1 DSpark, 2 lookup)
+    int lk_steps[4] = {}, lk_drafted[4] = {}, lk_accepted[4] = {};      // lookup steps per match-length bucket
     double wall = 0, draft_us = 0, verify_us = 0, accept_us = 0, plain_us = 0, prefill_s = 0;
     double L() const { return spec_steps ? (double)(tokens - (steps - spec_steps)) / spec_steps : 0; }
     double toks() const { return tokens / std::max(wall, 1e-9); }
 };
 int mode_id(const std::string& m) {
     if (m == "plain" || m == "off" || m == "0") return 0;
-    if (m == "auto") return 1;
+    if (m == "auto" || m == "dspark") return 1;
+    if (m == "lookup") return kSpecModeLookup;
     return std::atoi(m.c_str());
 }
 std::vector<std::string> split(const std::string& s) {
@@ -59,7 +65,11 @@ int main(int argc, char** argv) {
     Engine& E = *Ep;
     const int A = E.slot_new();
     const int V = E.n_vocab();
-    std::vector<std::string> names = prompts == "all" ? prompt_names() : split(prompts);
+    std::vector<std::string> names;
+    if (prompts == "all") names = prompt_names();
+    else if (prompts == "dspark") names.assign(prompt_names().begin(), prompt_names().begin() + 8);
+    else if (prompts == "lookup") names.assign(prompt_names().begin() + 8, prompt_names().end());
+    else names = split(prompts);
     std::vector<std::string> mode_list = split(modes);
     std::printf("bench_spec: n=%d modes=%s exact=%d temp=%.2f threads=%d load %s drafter=%s\n", n, modes.c_str(), exact, temp, E.opt.n_threads, load1().c_str(), drafter_path.c_str());
 
@@ -89,6 +99,9 @@ int main(int argc, char** argv) {
     so.mode = 1;
     so.exact = exact;
     SpecDecoder dec(E, std::move(dr), so);
+    const bool lookup_default = dec.options().lookup.enable;
+    std::printf("lookup drafter: %s (n_min %d, enter %.2f, max_draft %d)\n", lookup_default ? "enabled" : "disabled (INK_SPEC_LOOKUP=0)", dec.options().lookup.n_min,
+                dec.options().lookup.enter, dec.options().lookup.max_draft);
     std::vector<float> lg((size_t)V);
     std::map<std::string, std::vector<Row>> all;
     std::vector<int32_t> plain_tokens;
@@ -102,14 +115,17 @@ int main(int argc, char** argv) {
         std::printf("  %-6s %8s %6s %7s %9s %9s %9s %9s  %s\n", "mode", "tok/s", "L", "accept", "plain ms", "draft ms", "verify ms", "accept ms", "T hist / mismatches vs plain");
         for (const std::string& m : mode_list) {
             const int mode = mode_id(m);
+            dec.options().lookup.enable = lookup_default && m != "dspark";   // `dspark` = the old auto behaviour
             Row r;
             r.mode = m;
             E.slot_reset(A);
+            dec.note_reset(A);
             double t0 = now_s();
             if (E.forward(A, pr.data(), (int)pr.size(), lg.data()) != 0) {
                 std::printf("  prefill failed\n");
                 break;
             }
+            dec.note_tokens(A, 0, pr.data(), (int)pr.size());   // what ink_forward does for the server: the prompt enters the lookup history
             r.prefill_s = now_s() - t0;
             if (oracle) {   // the oracle needs the true continuation: plain run first
                 oracle->truth = pr;
@@ -139,6 +155,15 @@ int main(int argc, char** argv) {
                 }
                 ++r.steps;
                 ++r.hist[res.T];
+                ++r.src_steps[res.src];
+                r.src_drafted[res.src] += res.drafted;
+                r.src_accepted[res.src] += res.accepted;
+                if (res.src == 2) {
+                    const int b = LookupPolicy::bucket(res.match_len);
+                    ++r.lk_steps[b];
+                    r.lk_drafted[b] += res.drafted;
+                    r.lk_accepted[b] += res.accepted;
+                }
                 if (res.T > 1) {
                     ++r.spec_steps;
                     r.drafted += res.drafted;
@@ -166,6 +191,22 @@ int main(int argc, char** argv) {
                 if (r.hist[T]) std::printf("%d:%d ", T, r.hist[T]);
             if (mode != 0) std::printf(" mismatches %d/%d", r.mismatches, r.tokens);
             std::printf("  (prefill %.1f s, gen %.1f s)\n", r.prefill_s, r.wall);
+            if (r.src_steps[2] || r.src_steps[1]) {   // draft sources and the lookup acceptance per match length
+                std::printf("         sources: plain %d, dspark %d (acc %d/%d), lookup %d (acc %d/%d, wasted rows %d)", r.src_steps[0], r.src_steps[1], r.src_accepted[1], r.src_drafted[1],
+                            r.src_steps[2], r.src_accepted[2], r.src_drafted[2], r.src_drafted[2] - r.src_accepted[2]);
+                if (r.src_steps[2]) {
+                    std::printf("; lookup by match length:");
+                    for (int b = 0; b < 4; ++b)
+                        if (r.lk_steps[b]) std::printf(" [%s] %d steps %d/%d rows (%.2f/step)", LookupPolicy::bucket_name(b), r.lk_steps[b], r.lk_accepted[b], r.lk_drafted[b], (double)r.lk_accepted[b] / r.lk_steps[b]);
+                }
+                int declined = 0, yielded = 0;
+                for (int b = 0; b < 4; ++b) {
+                    declined += (int)dec.lookup_policy(A).stats(b).declined;
+                    yielded += (int)dec.lookup_policy(A).stats(b).yielded;
+                }
+                if (declined || yielded) std::printf("; matches declined %d (below break-even), yielded to dspark %d", declined, yielded);
+                std::printf("\n");
+            }
             std::fflush(stdout);
             // K2 (wave 1): per-phase profiles of this mode's steps. INK_PF_PROFILE=1 -> verify executor table (spec modes), INK_PROFILE=1 -> decode table (plain mode).
             if (std::getenv("INK_PF_PROFILE") && mode != 0) {
@@ -181,22 +222,39 @@ int main(int argc, char** argv) {
             all[m].push_back(r);
         }
     }
-    std::printf("\npooled over %zu prompts (n = %d each), load %s:\n  %-6s %8s %6s %7s %s\n", names.size(), n, load1().c_str(), "mode", "tok/s", "L", "accept", "mismatches");
-    for (const std::string& m : mode_list) {
-        double tok = 0, wall = 0, Lsum = 0;
-        int nL = 0, acc = 0, dr_ = 0, mm = 0;
-        for (const Row& r : all[m]) {
-            tok += r.tokens;
-            wall += r.wall;
-            if (r.spec_steps) {
-                Lsum += r.L();
-                ++nL;
+    auto pooled = [&](const char* title, size_t lo, size_t hi) {
+        if (lo >= hi) return;
+        std::printf("\npooled %s (%zu prompts, n = %d each), load %s:\n  %-6s %8s %6s %7s %7s  %s\n", title, hi - lo, n, load1().c_str(), "mode", "tok/s", "L", "accept", "lookup", "mismatches");
+        for (const std::string& m : mode_list) {
+            double tok = 0, wall = 0, Lsum = 0;
+            int nL = 0, acc = 0, dr_ = 0, mm = 0, lk = 0, lk_acc = 0, lk_dr = 0;
+            for (size_t i = lo; i < hi && i < all[m].size(); ++i) {
+                const Row& r = all[m][i];
+                tok += r.tokens;
+                wall += r.wall;
+                if (r.spec_steps) {
+                    Lsum += r.L();
+                    ++nL;
+                }
+                acc += r.accepted;
+                dr_ += r.drafted;
+                mm += r.mismatches;
+                lk += r.src_steps[2];
+                lk_acc += r.src_accepted[2];
+                lk_dr += r.src_drafted[2];
             }
-            acc += r.accepted;
-            dr_ += r.drafted;
-            mm += r.mismatches;
+            std::printf("  %-6s %8.2f %6.2f %7s %7s  %d\n", m.c_str(), tok / std::max(wall, 1e-9), nL ? Lsum / nL : 0.0, dr_ ? (std::to_string(acc) + "/" + std::to_string(dr_)).c_str() : "-",
+                        lk ? (std::to_string(lk_acc) + "/" + std::to_string(lk_dr)).c_str() : "-", mm);
         }
-        std::printf("  %-6s %8.2f %6.2f %7s %d\n", m.c_str(), tok / std::max(wall, 1e-9), nL ? Lsum / nL : 0.0, dr_ ? (std::to_string(acc) + "/" + std::to_string(dr_)).c_str() : "-", mm);
+    };
+    // pooled over the DSpark prompts (comparable with the documented tables), the lookup prompts and everything
+    size_t n_dspark = 0;
+    for (const std::string& nm : names)
+        if (nm.rfind("lookup_", 0) != 0) ++n_dspark;
+    if (n_dspark && n_dspark < names.size()) {
+        pooled("DSpark prompts", 0, n_dspark);
+        pooled("lookup prompts", n_dspark, names.size());
     }
+    pooled("over all prompts", 0, names.size());
     return 0;
 }

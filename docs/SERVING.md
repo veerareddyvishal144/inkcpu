@@ -272,3 +272,14 @@ prefills only the re-rendered assistant turn + the new user message instead of t
 tool schemas share the prefix as well. Memory: <= ~370 MB per slot of checkpoint buffers (allocated on first use). Logits after a rewind are
 bit-identical to a fresh slot fed the same tokens (tests/engine/test_rewind.cpp, test_ink_real.py m/n). Requires a libink.so with the
 `ink_slot_*` checkpoint symbols (build-s3 or later); older builds keep the append-only policy. Measurements: REWIND.md section 7.
+
+## 13. Wave 2 (2026-11-24): prompt chunks via `ink_prefill`, session-lookup speculation, exact verify by default
+* The backend now calls `ink_prefill` for every prompt chunk (any length) and `ink_forward(n = 1)` for generated tokens. Reason: prompt chunks use the int16
+  expert GEMM (`INK_PF_I16`, docs/KERNELS_GEMM.md 9) while decode keeps the exact kernels; a 1-2-token prompt chunk (the scheduler forces a chunk boundary at the
+  LCP of a rewound slot) must take the same path as the rest of the prompt, otherwise a cold prefill and a rewound continuation differ by rounding. Older libink
+  builds without `ink_prefill` fall back to `ink_forward`.
+* `--spec auto` (default) = session-lookup drafts when they predict the larger speed-up, else the DSpark policy; a server started without `--drafter` speculates
+  with lookup drafts by default (`--spec off` / `INK_SPEC=off` for the plain path, `INK_SPEC_LOOKUP=0` disables the lookup drafter). docs/SPEC_DESIGN.md 11.
+* `tools/serve.sh` exports `INK_SPEC_EXACT=1`: verify rows use the decode attention kernels, so speculative output is token-identical to plain decode also beyond
+  768 cached keys (the fast batched verify attention rounds differently there and flipped near-ties on long prompts). Measured at no cost at 1743 tokens.
+* Debug: `INK_CALL_TRACE=<file>` appends one JSON line per backend call (rewind, prefill chunk, decode step, reset) with a hash of the returned logits.

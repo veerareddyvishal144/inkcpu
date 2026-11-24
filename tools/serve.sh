@@ -3,7 +3,7 @@
 # Binds to 127.0.0.1 only; reach it from another machine through an SSH tunnel (ssh -L 8000:127.0.0.1:8000 <vm>).
 # env overrides: INK_PORT (8000; other ports get their own pid/log files so test instances can coexist), INK_THREADS (16),
 #   INK_CPUS (16 physical cores), INK_SLOTS (2), INK_CTX (65536), INK_PREFILL_CHUNK (512), INK_DEFAULT_EFFORT (none = answer
-#   without thinking when the client sends no reasoning_effort), INK_SPEC (auto|off|4|8), INK_MODEL_DIR (/data/inkling-mini/models),
+#   without thinking when the client sends no reasoning_effort), INK_SPEC (auto|off|lookup|4|8), INK_SPEC_EXACT (1), INK_PF_I16 (1), INK_MODEL_DIR (/data/inkling-mini/models),
 #   INK_LIB (build-orch/src/capi/libink.so), INK_NO_DOWNLOAD=1 (fail instead of fetching missing model files), INK_API_KEY (optional bearer key)
 ROOT=$(cd "$(dirname "$0")/.." && pwd); cd "$ROOT" || exit 1
 # python: INK_PY, else the repo venv (.venv), else the dev box venv, else python3 on PATH
@@ -19,6 +19,9 @@ MODEL=$MDIR/Inkling-2-Mini-UD-Q4_K_XL.gguf
 DRAFTER=$MDIR/dspark-Inkling-2-Mini-Q8_0.gguf
 LIB=${INK_LIB:-$( [ -f "$ROOT/build/src/capi/libink.so" ] && echo "$ROOT/build/src/capi/libink.so" || echo "$ROOT/build-orch/src/capi/libink.so" )}
 SPEC=${INK_SPEC:-auto}
+# Exact verify attention (decode kernels per verified row) so speculative output stays token-identical to plain decode beyond 768 cached keys;
+# measured at no cost on a 1743-token prompt (docs/status/L.md c3). INK_SPEC_EXACT=0 restores the batched (fast) verify attention.
+export INK_SPEC_EXACT=${INK_SPEC_EXACT:-1}
 mkdir -p "$RUN"
 alive() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
 case "${1:-status}" in

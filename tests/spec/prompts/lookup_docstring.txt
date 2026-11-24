@@ -1,0 +1,170 @@
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Add a one-line docstring to every function and method in this file. Return the whole file with the docstrings added and nothing else changed; no explanations, no markdown outside the code block.
+
+```python
+import csv
+import json
+import os
+from collections import defaultdict
+from datetime import date, datetime
+
+
+DEFAULT_RATE = 0.2
+LOW_STOCK = 5
+
+
+class InventoryError(Exception):
+    pass
+
+
+def load_rows(path):
+    if not os.path.exists(path):
+        raise InventoryError("missing file: %s" % path)
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = [dict(r) for r in reader]
+    for r in rows:
+        r["qty"] = int(r.get("qty", 0) or 0)
+        r["price"] = float(r.get("price", 0) or 0)
+    return rows
+
+
+def save_rows(path, rows, fields=("sku", "name", "qty", "price", "updated")):
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(fields))
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fields})
+    os.replace(tmp, path)
+
+
+def index_by_sku(rows):
+    out = {}
+    for r in rows:
+        sku = r["sku"].strip().upper()
+        if sku in out:
+            raise InventoryError("duplicate sku %s" % sku)
+        out[sku] = r
+    return out
+
+
+def total_value(rows):
+    return sum(r["qty"] * r["price"] for r in rows)
+
+
+def low_stock(rows, threshold=LOW_STOCK):
+    return sorted((r for r in rows if r["qty"] <= threshold), key=lambda r: (r["qty"], r["sku"]))
+
+
+def apply_tax(amount, rate=DEFAULT_RATE):
+    if rate < 0 or rate > 1:
+        raise ValueError("rate must be in [0, 1]")
+    return round(amount * (1.0 + rate), 2)
+
+
+def restock(rows, sku, amount, when=None):
+    when = when or date.today()
+    by = index_by_sku(rows)
+    key = sku.strip().upper()
+    if key not in by:
+        raise InventoryError("unknown sku %s" % key)
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+    by[key]["qty"] += amount
+    by[key]["updated"] = when.isoformat()
+    return by[key]
+
+
+def sell(rows, sku, amount, when=None):
+    when = when or date.today()
+    by = index_by_sku(rows)
+    key = sku.strip().upper()
+    if key not in by:
+        raise InventoryError("unknown sku %s" % key)
+    if by[key]["qty"] < amount:
+        raise InventoryError("insufficient stock for %s: %d < %d" % (key, by[key]["qty"], amount))
+    by[key]["qty"] -= amount
+    by[key]["updated"] = when.isoformat()
+    return by[key]
+
+
+def group_by_prefix(rows, length=3):
+    groups = defaultdict(list)
+    for r in rows:
+        groups[r["sku"][:length].upper()].append(r)
+    return dict(groups)
+
+
+def summarize(rows):
+    groups = group_by_prefix(rows)
+    lines = []
+    for prefix in sorted(groups):
+        items = groups[prefix]
+        lines.append("%s: %d items, %d units, value %.2f" % (prefix, len(items), sum(r["qty"] for r in items), total_value(items)))
+    lines.append("total: %d items, value %.2f" % (len(rows), total_value(rows)))
+    return "\n".join(lines)
+
+
+def parse_updated(r):
+    s = r.get("updated") or ""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def stale(rows, days=90, today=None):
+    today = today or date.today()
+    out = []
+    for r in rows:
+        d = parse_updated(r)
+        if d is None or (today - d).days > days:
+            out.append(r)
+    return out
+
+
+def to_json(rows, path):
+    with open(path, "w") as f:
+        json.dump(rows, f, indent=2, sort_keys=True)
+
+
+def from_json(path):
+    with open(path) as f:
+        rows = json.load(f)
+    if not isinstance(rows, list):
+        raise InventoryError("expected a list in %s" % path)
+    return rows
+
+
+def merge(primary, secondary):
+    by = index_by_sku(primary)
+    for r in secondary:
+        key = r["sku"].strip().upper()
+        if key in by:
+            by[key]["qty"] += r["qty"]
+        else:
+            primary.append(dict(r))
+    return primary
+
+
+def main(argv):
+    if len(argv) < 2:
+        print("usage: inventory.py <csv> [summary|low|stale]")
+        return 2
+    rows = load_rows(argv[1])
+    cmd = argv[2] if len(argv) > 2 else "summary"
+    if cmd == "summary":
+        print(summarize(rows))
+    elif cmd == "low":
+        for r in low_stock(rows):
+            print("%s %s %d" % (r["sku"], r["name"], r["qty"]))
+    elif cmd == "stale":
+        for r in stale(rows):
+            print("%s %s %s" % (r["sku"], r["name"], r.get("updated", "")))
+    else:
+        print("unknown command %s" % cmd)
+        return 2
+    return 0
+```<|end_message|><|message_model|><|content_text|>

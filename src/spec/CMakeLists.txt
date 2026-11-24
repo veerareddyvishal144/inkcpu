@@ -1,7 +1,7 @@
 # Module spec (agent S2): speculative decoding on top of the engine: sampler, adaptive width policy, verify loop (src/spec), tools and tests (tests/spec, bench/bench_spec.cpp).
 get_filename_component(INK_ROOT ${CMAKE_CURRENT_LIST_DIR}/../.. ABSOLUTE)
 set(INK_SPEC_SRCS "")
-foreach(f sampler.cpp policy.cpp spec.cpp)
+foreach(f sampler.cpp policy.cpp lookup.cpp spec.cpp)
   if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/${f})
     list(APPEND INK_SPEC_SRCS ${f})
   endif()
@@ -25,7 +25,7 @@ if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/dump_taps.cpp)
 endif()
 
 # tests (tests/spec/*.cpp): each file is its own executable linked with ink_spec (when it exists) and ink_engine
-foreach(t test_verify test_sampler test_policy test_spec test_spec_sampling)
+foreach(t test_verify test_sampler test_policy test_lookup test_spec test_spec_sampling)
   if(EXISTS ${INK_ROOT}/tests/spec/${t}.cpp AND TARGET ink_spec)
     add_executable(${t} ${INK_ROOT}/tests/spec/${t}.cpp)
     target_include_directories(${t} PRIVATE ${INK_ROOT}/tests/spec ${CMAKE_CURRENT_LIST_DIR})

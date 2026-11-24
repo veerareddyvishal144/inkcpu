@@ -57,6 +57,23 @@ from .tokenizer import InkTokenizer
 
 
 STEP_TRACE = os.environ.get("INK_STEP_TRACE", "0") not in ("", "0")
+CALL_TRACE = os.environ.get("INK_CALL_TRACE", "")   # debug: append one JSON line per backend call (rewind / prefill chunk / decode step) to this file
+
+
+def _ctrace(**kw) -> None:
+    if CALL_TRACE:
+        import json as _json
+        with open(CALL_TRACE, "a") as fh:
+            fh.write(_json.dumps(kw) + "\n")
+
+
+def _lhash(logits) -> str:
+    if logits is None:
+        return ""
+    import hashlib
+    import numpy as _np
+    a = _np.ascontiguousarray(logits, dtype=_np.float32)
+    return hashlib.sha1(a.tobytes()).hexdigest()[:12] + ":%d" % int(a.argmax())
 
 
 class StepTrace:
@@ -188,6 +205,7 @@ class SlotTable:
         cand.last_logits = None
         cand.busy = True
         self.n_rewinds += 1
+        _ctrace(op="rewind", slot=cand.id, lcp=cand_lcp, target=target, p=p, n_prompt=n_prompt)
         mark: Optional[int] = None
         if p == cand_lcp and cand_lcp < n_prompt:
             self.backend.checkpoint(cand.id, deep=True)   # the divergence point itself is a checkpoint: make it survive any continuation
@@ -196,6 +214,7 @@ class SlotTable:
         return cand, p, mark
 
     def reset(self, s: SlotInfo) -> None:
+        _ctrace(op="reset", slot=s.id, had=len(s.tokens))
         if s.tokens or s.last_logits is not None:
             self.backend.slot_reset(s.id)
         s.tokens, s.last_logits = [], None
@@ -314,6 +333,7 @@ class Sequence:
             chunk = self.req.prompt_ids[self.pos:end]
             last = end >= len(self.req.prompt_ids)
             logits = be.prefill(self.slot.id, chunk, want_logits=last)   # only the last chunk needs the lm head
+            _ctrace(op="prefill", slot=self.slot.id, pos=self.pos, end=end, n=len(chunk), last=last, mark=self.mark, logits=_lhash(logits), first=int(chunk[0]), lastid=int(chunk[-1]))
             self.slot.tokens.extend(chunk)
             self.slot.last_logits = logits
             self.pos = end
@@ -351,6 +371,7 @@ class Sequence:
                     if tr is not None and tr.t_ret is not None:
                         tr.gap.append(te - tr.t_ret)
                     self.logits = be.step(self.slot.id, tok)
+                    _ctrace(op="step", slot=self.slot.id, tok=int(tok), pos=len(self.slot.tokens) + 1, logits=_lhash(self.logits))
                     t3 = time.perf_counter()
                     self.t_engine_dec += t3 - te
                     if tr is not None:

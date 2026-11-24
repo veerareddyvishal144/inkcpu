@@ -143,6 +143,133 @@ SpecOptions opts(int exact) {
     return o;
 }
 
+// ------------------------------------------------------------------------------------------------------------ session-lookup drafts (agent L): exactness
+// No drafter. Mode 9 (lookup only) with a 2-token key, firing on every match whatever its predicted speed-up, so that most steps verify (mostly wrong) lookup drafts of every
+// length 1..7 while some copy runs get accepted: every emitted token must equal plain greedy, the slot state at the end must equal the plain slot, and the history the decoder
+// keeps must equal the tokens the slot processed. Also: auto with the ORACLE double (lookup first, DSpark fallback) and a mid-run truncation (note_truncate = rewind).
+void lookup_suite(Engine& E, int n_prompts, int N, int exact) {
+    const int A = 0, R = 1, X = 2, W1 = 3, W2 = 4;
+    const int V = E.n_vocab();
+    std::vector<float> lg((size_t)V);
+    const bool exact_gate = exact != 0;
+    std::printf("lookup exactness: %d prompts x %d tokens, exact=%d, load %s\n", n_prompts, N, exact, load1().c_str());
+    int fired_total[3] = {};   // per config over all prompts
+    int width_seen[9] = {};
+    for (int pi = 0; pi < n_prompts && pi < (int)prompt_names().size(); ++pi) {
+        const std::string& name = prompt_names()[(size_t)pi];
+        std::vector<int32_t> pr = prompt(name);
+        if (pr.empty()) continue;
+        const int p = (int)pr.size();
+        E.slot_reset(A);
+        SUT_CHECK(E.forward(A, pr.data(), p, lg.data()) == 0, "prefill %s", name.c_str());
+        E.slot_copy(A, R);
+        Ref ref = make_ref(E, R, lg.data(), N + 8);
+        std::vector<int32_t> truth = pr;
+        truth.insert(truth.end(), ref.gen.begin(), ref.gen.end());
+        struct Cfg {
+            const char* name;
+            int n_min, mode;
+            bool oracle;
+        };
+        const Cfg cfgs[3] = {{"lookup n_min=2 forced", 2, kSpecModeLookup, false}, {"lookup n_min=4 forced", 4, kSpecModeLookup, false}, {"auto lookup+oracle", 3, 1, true}};
+        for (int ci = 0; ci < 3; ++ci) {
+            const Cfg& cf = cfgs[ci];
+            SpecOptions o = opts(exact);
+            o.mode = cf.mode;
+            o.lookup.n_min = cf.n_min;
+            o.lookup.enter = 0.0;       // fire on every match
+            o.lookup.probe_every = 1;
+            for (int b = 0; b < 4; ++b) o.lookup.prior_c[b] = 0.99;   // start at T = 8; rejections shrink the width, so every width 2..8 gets exercised
+            std::unique_ptr<DoubleDrafter> ddp;
+            DoubleDrafter* dd = nullptr;
+            if (cf.oracle) {
+                ddp = std::make_unique<DoubleDrafter>(DoubleDrafter::ORACLE, V, 0.0, 77);
+                ddp->truth = truth;
+                dd = ddp.get();
+            }
+            SpecDecoder dec(E, std::move(ddp), o);
+            E.slot_copy(A, X);
+            dec.note_tokens(X, 0, pr.data(), p);   // the prompt enters the history (what ink_forward does)
+            if (dd) dd->set_pos(X, p);
+            const int fails0 = g_fail;
+            int32_t anchor = ref.gen[0];
+            std::vector<int32_t> out;
+            int steps = 0, lk_steps = 0, lk_drafted = 0, lk_acc = 0, ds_steps = 0, truncs = 0, mismatches = 0;
+            int hist_len[8] = {};
+            const double t0 = now_s();
+            for (int step = 0; (int)out.size() < N; ++step) {
+                // a "rewind" in the middle: drop the last few emitted tokens from the engine (slot_copy of a reference state) and tell the decoder
+                if (!cf.oracle && step == 12 && out.size() >= 6) {
+                    const int keep = (int)out.size() - 4;
+                    E.slot_copy(A, X);
+                    for (int i = 0; i < keep; ++i) SUT_CHECK(E.decode(X, ref.gen[(size_t)i], nullptr) == 0, "rewind refill");
+                    dec.note_truncate(X, p + keep);
+                    out.resize((size_t)keep);
+                    anchor = ref.gen[(size_t)keep];
+                    ++truncs;
+                }
+                SpecRequest rq;
+                rq.anchor = anchor;
+                rq.seed = 0;
+                rq.mode = cf.mode;
+                rq.max_emit = 2 + step % 7;   // budgets 2..8 cap the verify width, so widths 2..8 are all exercised
+                SpecResult res;
+                const int rc = dec.step(X, rq, &res);
+                SUT_CHECK(rc == 0, "%s step %d rc %d", cf.name, step, rc);
+                if (rc) break;
+                SUT_CHECK(res.n_tokens >= 1 && res.n_tokens <= rq.max_emit, "%s step %d n_tokens %d", cf.name, step, res.n_tokens);
+                SUT_CHECK(E.slot_pos(X) == p + (int64_t)out.size() + res.n_tokens, "%s step %d slot_pos", cf.name, step);
+                ++steps;
+                if (res.src == 2) {
+                    ++lk_steps;
+                    lk_drafted += res.drafted;
+                    lk_acc += res.accepted;
+                    ++hist_len[res.T - 1];
+                    ++width_seen[res.T];
+                    ++fired_total[ci];
+                } else if (res.src == 1) {
+                    ++ds_steps;
+                }
+                for (int i = 0; i < res.n_tokens; ++i) {
+                    const size_t idx = out.size() + 1;
+                    if (idx < ref.gen.size() && res.tokens[i] != ref.gen[idx]) {
+                        ++mismatches;
+                        if (exact_gate) SUT_CHECK(false, "%s: token %zu = %d, plain %d (margin %.4f)", cf.name, idx, res.tokens[i], ref.gen[idx], ref.margin[idx]);
+                    }
+                    out.push_back(res.tokens[i]);
+                }
+                anchor = res.tokens[res.n_tokens - 1];
+                // the decoder's history must be exactly prompt ++ gen[0..out.size()-1] (the last emitted token is the pending anchor)
+                const LookupIndex* lk = dec.lookup(X);
+                SUT_CHECK(lk && lk->size() == p + (int64_t)out.size(), "%s step %d: history %lld vs %lld", cf.name, step, lk ? (long long)lk->size() : -1LL, (long long)(p + out.size()));
+                if (lk && lk->size() == p + (int64_t)out.size() && !mismatches)
+                    for (int64_t i = p; i < lk->size(); i += 3) SUT_CHECK(lk->at(i) == truth[(size_t)i], "%s step %d: history[%lld] = %d vs %d", cf.name, step, (long long)i, lk->at(i), truth[(size_t)i]);
+                if (mismatches) break;
+            }
+            const double secs = now_s() - t0;
+            std::printf("    %-22s steps %3d (lookup %3d: acc %d/%d, dspark %d) emitted %3d  %.1f s  T hist", cf.name, steps, lk_steps, lk_acc, lk_drafted, ds_steps, (int)out.size(), secs);
+            for (int t = 1; t <= 8; ++t)
+                if (hist_len[t - 1]) std::printf(" %d:%d", t, hist_len[t - 1]);
+            if (truncs) std::printf("  (rewind x%d)", truncs);
+            if (!mismatches) {
+                check_final_state(E, X, R, W1, W2, p, ref, N, (int)out.size(), cf.name);
+                std::printf(g_fail == fails0 ? "  tokens == plain, state == plain" : "  STATE DIFFERS");
+            } else {
+                std::printf("  MISMATCH");
+            }
+            std::printf("%s\n", g_fail == fails0 ? "" : "  FAILED");
+            std::fflush(stdout);
+        }
+    }
+    for (int ci = 0; ci < 3; ++ci) SUT_CHECK(fired_total[ci] > 0, "config %d: the lookup drafter never fired on any prompt", ci);
+    std::printf("  lookup widths exercised:");
+    for (int t = 2; t <= 8; ++t) std::printf(" T%d:%d", t, width_seen[t]);
+    std::printf("\n");
+    int n_widths = 0;
+    for (int t = 2; t <= 8; ++t) n_widths += width_seen[t] > 0;
+    SUT_CHECK(n_widths >= 5 && width_seen[2] > 0 && width_seen[8] > 0, "at least 5 of the widths 2..8 incl. 2 and 8 must be exercised (%d)", n_widths);
+}
+
 // ------------------------------------------------------------------------------------------------------------ greedy exactness over the prompts
 void greedy_suite(Engine& E, int n_prompts, int N, int exact) {
     const int A = 0, R = 1, X = 2, W1 = 3, W2 = 4;
@@ -477,6 +604,7 @@ int main(int argc, char** argv) {
     std::printf("test_spec %s, load %s, threads %d\n", mode.c_str(), load1().c_str(), E.opt.n_threads);
     if (mode == "quick") greedy_suite(E, env_int("SPEC_PROMPTS", 2), env_int("SPEC_N", 40), exact);
     if (mode == "full" || mode == "all") greedy_suite(E, env_int("SPEC_PROMPTS", 8), env_int("SPEC_N", 200), exact);
+    if (mode == "quick" || mode == "lookup" || mode == "all") lookup_suite(E, env_int("SPEC_PROMPTS", 2), env_int("SPEC_N", 40), exact);
     if (mode == "quick" || mode == "stop" || mode == "all") stop_suite(E, exact);
     if (mode == "sample" || mode == "all") sample_suite(E, exact);
     std::printf("test_spec %s: %s (%d failures)\n", mode.c_str(), g_fail ? "FAIL" : "PASS", g_fail);

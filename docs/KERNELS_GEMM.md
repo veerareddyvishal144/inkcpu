@@ -156,3 +156,123 @@ Full log and raw numbers: `docs/status/K3.md`. All ratios are same-window A/B; t
   (argmax / top-10 / cosine) must be measured before it is ever enabled. Orchestrator decision pending.
 * Bench: `bench_gemm --what rvs|epi|x4|unpack|tail|tune|moe --cpus ... --ntok ...` (median-of-ratios A/B). Under the bench lock use `--ntok 256` only: the full MoE
   setup (two 570 MB random expert stacks + re-encoding + peak calibration) held the lock 17 minutes for 1 minute of timing.
+
+## 9. Wave 2 (2026-11-24, agent P2): int16-accumulation kernels `gemm_nvfp4r_i16` / `gemm_moe_nvfp4r_i16` (prompt chunks only)
+
+Full log: `docs/status/P2.md`. Research basis: `docs/research/wave2_compute.md` approach #1. File: `src/kernels_gemm/gemm_i16.cpp`.
+**Numerics-deviating by design** (owner decision in `docs/OPT_WAVE2.md`): the float accumulation runs once per 16 weights (+ once per 32) instead of once per 4,
+so the outputs are NOT bit-identical to `gemv_nvfp4` (same accuracy class vs the true dot product: max relative error 3.9e-8 vs 2.0e-8, mean 4.3e-9 vs 3.8e-9,
+see below). The engine uses them for PROMPT CHUNKS only (`PrefillTune::i16`, env `INK_PF_I16`, default 1); `engine_verify` and `Engine::decode` never do
+(the executor aborts if the verify path ever selects them). Final wiring, parity gates and end-to-end numbers: the "Wave 2b" subsections at the end of this section.
+
+### Scheme
+* Weights: u8 = kv + 12 (0..24, the x4 table), no sign masks. Activations: s8 as packed (Q8_0 quants). `vpmaddubsw` pair sums are bounded by 2*24*128 = 6144,
+  the sum of the 4 pair-sum vectors of a 16-k sub-block by 24576 < 32767: plain `vpaddw` is exact, no saturation can occur (unit test with w = +-12 everywhere,
+  x = +-127 / -128). `vpmaddwd` with ones gives sum (w+12) x over the sub-block; subtracting the per-token int32 `xb[t][sb] = 12 * sum x` (computed in the activation
+  pack) leaves the EXACT integer dot product I_sb. Float part per Q8_0 block b: `acc = fmaf(fmaf((float)I_{2b+1}, sw_{2b+1}, (float)I_{2b} * sw_{2b}), dx_t[b], acc)`.
+* Per (16 rows, token, Q8_0 block = 512 MACs): 8 maddubs + 6 paddw + 2 maddwd + 2 psubd + 2 cvt + 1 mul + 2 fma = **23 p0/p5 uops = 2.875 per 64 MACs** (exact
+  kernel: 5). Activation operands are `vpbroadcastd` loads (load ports only) straight from the existing lane-permuted NVFP4 pack (the 4 k of (sub-block s, quad q)
+  of chunk c sit at byte 64c + 4(4q+s)); the bias and dx use embedded broadcasts. Register tile: 16 rows (dword lanes) x N tokens (N <= `g_gemm_i16_tile` = 8;
+  an expert's n tokens are split into balanced tiles, e.g. 9 -> 5+4, 17 -> 6+6+5: no lane waste, and the per-token cost is nearly independent of N).
+  The accumulator IS the output vector (16 rows of one token): no reduction epilogue; partial sums between K segments live in y itself.
+* Unpack per 16-row panel and K segment (`g_gemm_i16_seg` = 16 super-blocks): 16 ymm loads of the nibble bytes -> 16x8 dword transpose (8 `vinserti64x4` +
+  16 `vpunpck` + 8 `vshufi32x4`) -> per transposed dword `vpand` / `vpsrlw`+`vpand` and `vpshufb` with the kv+12 table = 16 output zmm; scales: one `vpgatherdd` of the
+  16 rows' 4 re-encoded bytes, then per sub-block isolate the byte, shift to bits 20..27, `vmulps` 2^116 (the nvfp4r decode). ~90 vector uops per 16 rows x 64 k,
+  i.e. ~2 tokens' worth of compute: amortised over ALL tokens of the call (vs ~13 uops per ROW super-block = 208 per 16 rows in the exact unpack). The next
+  segment's rows are software-prefetched (T1) during the first tile of a segment.
+* Activation format `GEMM_FMT_I16` = the NVFP4 pack + `xb` (int32 per token per sub-block); every NVFP4 entry point accepts an I16 pack (superset), so the engine
+  packs once per layer visit whichever kernel runs (multix reads the raw Q8_0 rows anyway).
+
+### Correctness (test_gemm, section i16)
+704 cases bit-exact against a scalar model of the arithmetic (exact ints from the ORIGINAL GGUF bytes + the fmaf order above) over tile widths 1/3/5/8/12 x segment
+lengths 1/2/5/16/128, row and token splits, all value modes incl. random UE4M3 bytes, MoE items in shuffled order with token- and pair-indexed activations and up to
+~400 pairs per expert; adversarial saturation patterns bit-exact. Realistic 2304x2304 gate/up, 24 Gaussian tokens, 2640 samples vs double: max |y-ref|/sum|wx|
+exact kernel 2.0e-8, i16 3.9e-8; mean 3.8e-9 vs 4.3e-9; Q8_0 re-quantisation of the outputs vs the exact kernel: 2 of 55296 int8 flips, 0 block scales,
+0 flips on silu(gate)*up. (x4 prototype for comparison: 5.2e-8 / 1.1e-8.) The 2454 cases of the exact kernels are unchanged (ALL PASS).
+
+### Kernel speed (same-window A/B, shared host: loadavg 6.7-13; see P2.md for the exact windows)
+| single thread, i16 / exact nvfp4r | nt=1 | 2 | 4 | 9 | 16 | 64 | 256 |
+|---|---|---|---|---|---|---|---|
+| 192x2304 (L2-resident) | 1.19x (12.6 -> 15.0 GMAC/s) | 1.32x | 1.61x (23.7 -> 38.2) | 1.77x (29.4 -> 52.0) | 1.91x (32.4 -> 62.0) | 2.06x (35.5 -> 73.1) | 1.99x |
+| 192x1152 | | | 1.60x | 1.89x | 2.02x (30.5 -> 61.5) | 2.21x | |
+| 2304x2304 streamed / 2304x1152 | | | | 1.83x | 1.86x / 2.00x | 1.92x | |
+Unpack share of the kernel time (from the nt sweep, L2-resident 192 rows): ~20 % at nt=9, ~12 % at nt=16, ~5 % at nt=64. It is store/port bound
+(20 x 64-byte stores + 16 loads + ~90 vector uops per 16 rows x 64 k), not front-end bound: the uniform-stride address fast path (`g_gemm_i16_uniform`,
+`bench_gemm --what i16u`) is 0.97-1.01x on L2-resident panels and 1.02-1.10x on streamed 2304-row panels (kept on; bit-identical either way).
+MoE layer (gate_up + down), real routing code.rtrace visit 12, 4 threads, all experts through the GEMM: **1.53x at 64 tokens** (8.8 pairs per used expert, 111.5 GMAC/s)
+and **1.75x at 256 tokens** (19.7 pairs, 138.8 GMAC/s = 91 % of the same-window 5-uop peak). Tunables: tile 4 is 3-5 % slower at nt >= 16, tile 12 = tile 8,
+segment 36 (whole K at once) 5-20 % slower at nt <= 9 (cold unpack burst). Bench arms: `bench_gemm --what i16` (single thread), `--what moe` (i16 arm + engine-mix
+arms `--mx 8,4,0`: multix below the threshold, nvfp4r or i16 above), `--i16tile / --i16seg / --i16pf`.
+
+### Wave 2b (P2b, 2026-11-24 03:00-06:00 UTC): final wiring in the prefill executor
+* `PrefillTune::i16` (env `INK_PF_I16`, **default 1**): in PROMPT CHUNKS every NVFP4 expert item of phases G (gate_up) and H (down) runs `gemm_moe_nvfp4r_i16`,
+  whatever its pair count (the multix threshold `INK_PF_MULTIX` only applies when i16 is off, and in verify). `engine_verify` (speculative decoding, T <= 8 rows)
+  and `Engine::decode` never use it (the executor aborts if the verify path ever sees the I16 pack): speculation stays token-identical to plain decode.
+  `INK_PF_I16=0` = the wave-1 kernels everywhere: prefill == decode bit for bit. `INK_PF_I16=2` = A/B only: P2's first wiring (multix below 9 pairs, i16 above);
+  its logits depend on the chunk boundaries, so it is not a production setting.
+* Why ALL experts and not only the ones with > 8 pairs: the i16 result per (row, token) does not depend on the token tile, so with all-i16 the chunk size cannot
+  change the logits (gate (c) below: chunk 1/2/7/64/256 of a 300-token prompt bit-identical to each other; decode-attention mode chunk 1000 == chunk 256 at 1305 and
+  1500 tokens, exactly as in wave 1). With the mixed wiring the kernel choice depends on the pair count per expert, which depends on the chunking (P2's run: chunk
+  1/2/7 == decode, chunk 64/256 not, 1500-token chunk 1000 vs chunk 256 cosine 0.985). All-i16 was also 1-3 % faster in P2's engine-mix sweep (4 threads).
+* The activation pack of NVFP4 layers in prompt chunks is `GEMM_FMT_I16` (`efmt`), which the exact kernels and the multix diagnostic accept as a superset;
+  `max_act_bytes` covers it. The only edits outside `src/kernels_gemm` / `tests/kernels_gemm` are the kernel selection in phases G/H (`i16`, `efmt`, `mx_max`, the
+  verify guard), `max_act_bytes`, and the `i16` tune flag + env parsing.
+
+### Wave 2b: parity gates on the final binary (all-i16 prompt chunks, 16 threads, under the lock, 2026-11-24 03:10-04:10 UTC, loadavg 6-16)
+Decode is the engine's exact path (bit-identical to the wave-1 prefill); llama.cpp logits come from `tools/oracle` and `tools/build/oracle_logits` on the same GGUF.
+| gate | result |
+|---|---|
+| unit tests (`test_gemm`, dev CPUs) | ALL PASS: 704 i16 cases bit-exact vs the scalar model (tile 1/3/5/8/12 x segment 1/2/5/16/128, row/token splits, MoE items in shuffled order, up to ~400 pairs per expert); adversarial saturation (w = +-12 everywhere, x = +127 / -127 / -128, alternating) bit-exact, <= 2.4e-7 vs double; realistic numerics exact 2.0e-8 / i16 3.9e-8; the 2454 exact-kernel cases unchanged. |
+| (a) 6 oracle prompts + wiki300 (`test_prefill oracle`, `build-p2/oracle_dump.py`) | prefill vs llama.cpp: argmax equal 5/6, top-10 overlap 10/10/10/8/10/9, cosine 0.99939 / 0.99993 / 0.99917 / 0.99988 / 0.99927 / 0.99689 where decode has 0.99983 / 0.99982 / 0.99912 / 0.99998 / 0.99907 / 0.99166; KL(llama.cpp \|\| engine) mean 0.00147 nats vs decode's 0.00163 (prefill closer on s2 / s3 / m2, decode on s1 / m1). The two literal misses are ties: on m1 the engine puts p = 0.331 on its own top token and 0.329 on llama.cpp's (decode: 0.329 on the latter; llama.cpp's own top-2 gap is 0.095 logits), on c1 ranks 2-10 carry ~1e-10 probability (p(top) = 1.0000, KL 0.00000; llama.cpp's 10th-11th gap 0.032). Prefill vs decode: argmax 6/7, top-10 >= 8, cosine 0.9934-0.9999, max abs 0.4-3.3 logits: the flip-amplification regime of any non-bit-identical path (decode vs llama.cpp: 0.3-3.4). |
+| (d) NLL vs llama.cpp `logits_all` (`test_prefill nll`) | 9 wikitext chunks, 3063 positions (2 x 256 from wave 1 + a 1024-token chunk + 6 x 256 built from the ring token files): every chunk within the 0.01 limit for both paths (largest: i16 0.00977 on nll2, exact 0.00813 on nll8); mean \|NLL - llama.cpp\| i16 0.00282 vs exact 0.00320; paired (i16 - exact) weighted by positions -0.00005 nats, i16 above exact on 5 of 9 chunks; argmax mismatches vs llama.cpp 76 vs 70 of 3072. 1024-token context: i16 1.91447 vs llama.cpp 1.91375 (exact 1.91488). No measurable direction. Table in `docs/status/P2.md` 03:56. |
+| (b) prefill m tokens then 24 greedy decode steps (`test_prefill state`) | m = 43 vs all-decode: argmax agreement 24/24, worst cosine 0.99759, worst max abs 1.52 (no longer bit-identical, as accepted); m = 700 vs the decode-attention-kernel prefill: 24/24 bit-identical; m = 1000: 24/24 argmax, cosine 0.99652 (informational: decode nsplit > 1). |
+| (c) chunk sizes (`test_prefill chunks`, `build-p2/chunkcmp.py`) | 300 tokens, chunk 1 / 2 / 7 / 64 / 256: final logits **bit-identical to each other** (pairwise, max abs diff 0), all at cosine 0.99986 / max abs 0.42 vs decode. 1305 and 1500 tokens: decode-attention mode chunk 1000 == chunk 256 **bit-identical**, fast-attention chunk 64 == chunk 256; 1305 tokens vs llama.cpp cosine 0.9975 / 0.9976 (decode 0.9994, exact fast prefill 0.9993; P2's mixed wiring 0.9998 / 0.9984: the last position of this prompt is a flat distribution, p(top) 0.24-0.32, and swings 10x in (1 - cos) between equally valid paths). |
+| (e) determinism (`test_prefill determinism`) | 300-token prefill bit-identical across 16 / 16 / 12 / 8 / 8 / 5 threads and repeated runs. |
+| speculative verify (`test_verify quick`) | PASS: every `engine_verify` row and tap bit-identical to `Engine::decode`, commit/rollback exact, both attention modes, T = 2 / 4 / 8 at p = 40 and T = 8 at p = 61 (the prefix is prefilled through the i16 path in both arms: verify never touches it). |
+| rewind (`test_rewind quick`) | ALL PASS (29 checks, 0 failures): rewind to the prompt end / a mid-prompt chunk checkpoint / the exact bound / a deep checkpoint past the ring wrap, each followed by a 40-token tail prefill and 3-10 decodes: logits and slot state bit-identical to a fresh slot (both arms prefill through the i16 path with the same chunking; the i16 schedule is deterministic). |
+| exact path `INK_PF_I16=0` | unchanged: `test_prefill oracle` and `chunks` with INK_PF_I16=0 on the final binary: prefill == decode BIT-IDENTICAL on all 7 prompts and for chunk 1 / 2 / 7 / 64 / 256, decode-attention mode bit-identical at 1305 / 1500 tokens, gates (a) and (c) PASS exactly as in wave 1 (`quick` with INK_PF_I16=0: BIT-IDENTICAL, P2 02:53). |
+| final-binary smoke (after adding `INK_PF_I16=2`) | rebuild 38 steps, no warnings in kernel/engine files, `test_gemm` ALL PASS; `quick` with INK_PF_I16=2 reproduces P2's 02:47 mixed-wiring numbers to the last digit (s1 cosine 0.99971341 vs decode), `quick` with the default reproduces the pre-rebuild run (0.99951821), `determinism` PASS (16/16/12/8/8/5 threads). Mixed wiring on the 1305-token prompt: KL 0.0107 vs llama.cpp (exact fast prefill 0.0058, all-i16 0.0272, decode 0.0037); its 6-prompt KL mean 0.00107 (all-i16 0.00147, decode 0.00163): the three paths sit in one band. |
+
+**Default decision (P2b): `INK_PF_I16=1`.** Every gate holds in substance: chunk independence and determinism bit for bit, verify and the exact path untouched, NLL /
+KL / argmax rate at the exact path's level over 3000+ positions. The two binary misses of gate (a) (argmax on m1, top-10 on c1) are decided by 0.03-0.1-logit ties in the
+reference that any non-bit-identical path (decode included) resolves by chance; they are reported, not hidden. `INK_PF_I16=0` restores wave-1 bit-identity with one env
+var and is the fallback if the owner prefers prefill == decode over the 1.3x. The orchestrator's final idle-host run should measure bench_prefill at chunk 512 (server default)
+with both settings.
+
+Open items: the dense Q8_0 projections (2.8 of 8.4 ms/token) are the next kernel lever (3-uop int32 chain, ~1.3x on those phases, or the offset trick); ~6 % barrier /
+straggler share; `tests/engine/test_prefill.cpp` (not P2's file) still prints FAIL for gates (a) / (b) / (c) on its bit-identity criteria when i16 is on: an INK_PF_I16-aware
+criterion (argmax agreement + chunk-pairwise bit identity + NLL) or running those gates with INK_PF_I16=0 for the bit-identity check is requested in docs/requests.md;
+docs/PREFILL_DESIGN.md sections 3 and 5 describe the INK_PF_I16=0 behaviour only.
+
+### Wave 2b: end-to-end speed (bench_prefill, 16 threads, default CPU list, under the lock; exact = `INK_PF_I16=0`, i16 = default; one lock hold per A/B/A)
+| chunk | prompt tokens | exact tok/s (A, then A again) | i16 tok/s | ratio (vs mean of the two A) | loadavg window |
+|---|---|---|---|---|---|
+| 512 (server default) | 256 | 87.1 / 84.3 | **112.4** | 1.31x | 12.7-15.7, instantaneous non-idle 0 % at the start |
+| 512 | 512 | 87.1 / 87.2 | **119.3** | 1.37x | (target 120 at 512 tokens: reached within noise on a loaded host) |
+| 512 | 1024 | 87.0 / 86.9 | **115.6** | 1.33x | |
+| 256 | 256 | 87.8 / 85.8 | **113.6** | 1.31x | 13.5-15.8, non-idle 0 % at the start |
+| 256 | 512 | 85.9 / 85.5 | **113.6** | 1.33x | |
+| 256 | 1024 | 83.9 / 84.3 | **110.8** | 1.32x | |
+| 256 (P2's mixed wiring, 02:57, separate holds) | 256 / 512 / 1024 | 87.2 / 85.6 / 83.2 | 116.8 / 113.6 / 110.2 | 1.34x / 1.33x / 1.32x | 10-13.6 |
+Wave-2 baseline for reference (build-final, idle host): 86.8 / 83.5 / 82.3 at chunk 256: the exact arms above reproduce it, so the loaded windows are representative.
+
+Per-phase profile (`INK_PF_PROFILE=1`, 512-token prompts, chunk 512, 16 threads, loadavg 16): exact 11.31 ms/token = 88.4 tok/s, i16 **8.40 ms/token = 119.1 tok/s**.
+| phase | exact ms/tok (GMAC/s) | i16 ms/tok (GMAC/s) |
+|---|---|---|
+| MoE gate_up + SiTU + q8 | 4.619 (441) | **2.757 (739)** |
+| MoE down GEMM | 2.520 (405) | **1.408 (724)** |
+| proj q,k,v,gate,rel,sink GEMM (dense Q8_0) | 2.040 (467) | 2.053 (464) |
+| wo GEMM + post-conv + resid (dense Q8_0) | 0.746 | 0.776 |
+| loop controllers (batched) | 0.560 | 0.553 |
+| attention + quant / conv / mixes / router / combine / lm_head | 0.82 | 0.85 |
+| busy-time bound (no barrier wait) | 92.1 tok/s | 126.0 tok/s |
+What limits it now: the two MoE phases are 1.71x faster (uop count 5 -> 2.875 = 1.74x theoretical) and now take 4.17 of 8.40 ms; the other half of the token is
+unchanged: 2.8 ms of dense Q8_0 GEMMs (int8 x int8 cannot use the int16 chain: |w| <= 127 saturates 4 pair sums; the 3-uop int32 chain would give ~1.3x there),
+0.55 ms of controllers, 0.27 ms attention, ~0.6 ms of mixes/quantisation/router/combine, plus ~6 % barrier/straggler wait (126 vs 119 tok/s busy-time bound).
+DRAM is not the limit at the server's chunk size: the MoE phases stream 11.5 GB/s of expert weights at 64 MAC/B (= ~36 pairs per used expert at 512-token chunks;
+the DRAM ceiling 80 GB/s x 64 MAC/B = 5.1 TMAC/s is 3.4x above the idle-host ALU peak of the i16 chain, 44.5 MAC/cycle/core x 16 x 2.14 GHz = 1.5 TMAC/s); at
+256-token chunks (19.7 pairs, 35 MAC/B) it is still ALU-bound, only at 64-token chunks (8.8 pairs, 1.25 TMAC/s DRAM ceiling) do the two meet. The achieved 739 GMAC/s is
+~49 % of the idle-host i16 peak in a loaded window (the exact kernel ran at 51 % of its own peak in the same window), i.e. the kernels keep the efficiency of wave 1 and
+the whole gain is the shorter uop chain. Next levers (not done): the dense Q8_0 phases (3-uop int32 chain or offset trick), the barrier/straggler share, token-count-aware
+work items for the small experts of short prompts.
+

@@ -24,6 +24,30 @@ std::string g_err;
 void set_err(const std::string& s) { g_err = s; }
 }  // namespace
 
+#ifdef INK_HAVE_SPEC
+// speculative-decoding helpers (C++ linkage)
+namespace {
+ink::SamplingParams to_sp(const ink_sampling_params* p) {
+    ink::SamplingParams sp;
+    if (p) {
+        sp.temperature = p->temperature;
+        sp.top_k = p->top_k;
+        sp.top_p = p->top_p;
+        sp.min_p = p->min_p;
+    }
+    return sp;
+}
+ink::SpecDecoder& ensure_spec(ink_engine* h, std::unique_ptr<ink::Drafter> drafter) {
+    ink::SpecOptions o;
+    o.mode = h->spec_mode;
+    h->spec.reset();   // releases the previous drafter / tap hook first
+    h->spec = std::make_unique<ink::SpecDecoder>(*h->e, std::move(drafter), o);
+    h->spec_mode = h->spec->options().mode;   // env INK_SPEC applied
+    return *h->spec;
+}
+}  // namespace
+#endif
+
 extern "C" {
 
 ink_engine* ink_load(const char* gguf_path, int n_threads, int n_slots, int max_ctx) {
@@ -70,12 +94,22 @@ const char* ink_version(void) {
 
 int ink_n_vocab(const ink_engine* h) { return h && h->e ? h->e->n_vocab() : 0; }
 
-int ink_slot_new(ink_engine* h) { return h && h->e ? h->e->slot_new() : -1; }
+int ink_slot_new(ink_engine* h) {
+    if (!h || !h->e) return -1;
+    const int s = h->e->slot_new();
+#ifdef INK_HAVE_SPEC
+    if (s >= 0 && h->spec) h->spec->note_reset(s);
+#endif
+    return s;
+}
 void ink_slot_free(ink_engine* h, int slot) {
     if (h && h->e) h->e->slot_free(slot);
 }
 void ink_slot_reset(ink_engine* h, int slot) {
     if (h && h->e) h->e->slot_reset(slot);
+#ifdef INK_HAVE_SPEC
+    if (h && h->spec) h->spec->note_reset(slot);
+#endif
 }
 int ink_slot_pos(const ink_engine* h, int slot) { return h && h->e ? (int)h->e->slot_pos(slot) : -1; }
 
@@ -85,6 +119,7 @@ int ink_forward(ink_engine* h, int slot, const int32_t* tokens, int n, float* lo
         return -10;
     }
     int rc;
+    const int64_t pos0 = h->e->slot_pos(slot);
     try {
         rc = h->e->forward(slot, tokens, n, logits_out);
     } catch (const std::exception& ex) {
@@ -92,6 +127,37 @@ int ink_forward(ink_engine* h, int slot, const int32_t* tokens, int n, float* lo
         return -11;
     }
     if (rc) set_err("ink_forward failed: code " + std::to_string(rc) + " (-1 bad slot, -2 context full, -3 bad token, -4 n < 1)");
+#ifdef INK_HAVE_SPEC
+    else {   // session-lookup history (agent L): every row the slot processed outside ink_spec_step
+        if (!h->spec) ensure_spec(h, nullptr);
+        h->spec->note_tokens(slot, pos0, tokens, n);
+    }
+#endif
+    h->total_us = h->e->last_forward_us;   // all tokens of the call; every microsecond is spent inside the executor
+    h->kernel_us = h->e->last_forward_us;
+    return rc;
+}
+
+int ink_prefill(ink_engine* h, int slot, const int32_t* tokens, int n, float* logits_out) {
+    if (!h || !h->e || !tokens) {
+        set_err("bad arguments");
+        return -10;
+    }
+    int rc;
+    const int64_t pos0 = h->e->slot_pos(slot);
+    try {
+        rc = h->e->prefill(slot, tokens, n, logits_out);
+    } catch (const std::exception& ex) {
+        set_err(std::string("exception: ") + ex.what());
+        return -11;
+    }
+    if (rc) set_err("ink_prefill failed: code " + std::to_string(rc) + " (-1 bad slot, -2 context full, -3 bad token, -4 n < 1)");
+#ifdef INK_HAVE_SPEC
+    else {   // session-lookup history (agent L): every row the slot processed outside ink_spec_step
+        if (!h->spec) ensure_spec(h, nullptr);
+        h->spec->note_tokens(slot, pos0, tokens, n);
+    }
+#endif
     h->total_us = h->e->last_forward_us;   // all tokens of the call; every microsecond is spent inside the executor
     h->kernel_us = h->e->last_forward_us;
     return rc;
@@ -105,31 +171,18 @@ void ink_last_timing(const ink_engine* h, double* total_us, double* kernel_us) {
 // ======================================================================= slot checkpoints and rewind (agent S3, docs/REWIND.md)
 int ink_slot_checkpoint(ink_engine* h, int slot) { return h && h->e ? h->e->slot_checkpoint(slot, false) : -10; }
 int ink_slot_checkpoint_deep(ink_engine* h, int slot) { return h && h->e ? h->e->slot_checkpoint(slot, true) : -10; }
-int64_t ink_slot_rewind(ink_engine* h, int slot, int64_t pos) { return h && h->e ? h->e->slot_rewind(slot, pos) : -10; }
+int64_t ink_slot_rewind(ink_engine* h, int slot, int64_t pos) {
+    if (!h || !h->e) return -10;
+    const int64_t r = h->e->slot_rewind(slot, pos);
+#ifdef INK_HAVE_SPEC
+    if (r >= 0 && h->spec) h->spec->note_truncate(slot, r);
+#endif
+    return r;
+}
 int ink_slot_checkpoints(const ink_engine* h, int slot, int64_t* out, int max) { return h && h->e ? h->e->slot_checkpoints(slot, out, max) : 0; }
 
 // ======================================================================= speculative decoding
 #ifdef INK_HAVE_SPEC
-namespace {
-ink::SamplingParams to_sp(const ink_sampling_params* p) {
-    ink::SamplingParams sp;
-    if (p) {
-        sp.temperature = p->temperature;
-        sp.top_k = p->top_k;
-        sp.top_p = p->top_p;
-        sp.min_p = p->min_p;
-    }
-    return sp;
-}
-ink::SpecDecoder& ensure_spec(ink_engine* h, std::unique_ptr<ink::Drafter> drafter) {
-    ink::SpecOptions o;
-    o.mode = h->spec_mode;
-    h->spec.reset();   // releases the previous drafter / tap hook first
-    h->spec = std::make_unique<ink::SpecDecoder>(*h->e, std::move(drafter), o);
-    h->spec_mode = h->spec->options().mode;   // env INK_SPEC applied
-    return *h->spec;
-}
-}  // namespace
 
 int ink_spec_load(ink_engine* h, const char* drafter_gguf) {
     if (!h || !h->e || !drafter_gguf) {
@@ -161,7 +214,7 @@ void ink_spec_free(ink_engine* h) {
 }
 
 int ink_spec_enable(ink_engine* h, int mode) {
-    if (!h || !h->e || mode < 0 || mode > 8) {
+    if (!h || !h->e || mode < 0 || (mode > 8 && mode != ink::kSpecModeLookup)) {
         set_err("bad arguments");
         return -10;
     }
@@ -233,7 +286,36 @@ int32_t ink_sample(const ink_engine* h, const float* logits, const ink_sampling_
     if (next_seed) *next_seed = rng.next_seed();
     return t;
 }
+
+// ---- session lookup (agent L)
+int ink_spec_lookup(ink_engine* h, int enable) {
+    if (!h || !h->e) {
+        set_err("bad arguments");
+        return -10;
+    }
+    if (!h->spec) ensure_spec(h, nullptr);
+    h->spec->options().lookup.enable = enable != 0;
+    return 0;
+}
+int ink_spec_lookup_enabled(const ink_engine* h) { return h && h->e && h->spec && h->spec->options().lookup.enable ? 1 : 0; }
+int ink_spec_last_source(const ink_engine* h) { return h && h->e && h->spec ? h->spec->last_src() : 0; }
+int ink_spec_lookup_stats(const ink_engine* h, int slot, int64_t* out, int cap) {
+    if (!h || !h->e || !h->spec || !out || cap <= 0 || slot < 0 || slot >= (int)h->e->slots.size()) return 0;
+    int k = 0;
+    for (int b = 0; b < 4 && k < cap; ++b) {
+        const ink::LookupPolicy::Stats& st = h->spec->lookup_policy(slot).stats(b);
+        const int64_t v[5] = {st.steps, st.drafted, st.accepted, st.declined, st.yielded};
+        for (int i = 0; i < 5 && k < cap; ++i) out[k++] = v[i];
+    }
+    return k;
+}
 #else
+int ink_spec_lookup(ink_engine*, int) { return -13; }
+int ink_spec_lookup_enabled(const ink_engine*) { return 0; }
+int ink_spec_last_source(const ink_engine*) { return 0; }
+int ink_spec_lookup_stats(const ink_engine*, int, int64_t*, int) { return 0; }
+#endif
+#ifndef INK_HAVE_SPEC
 int ink_spec_load(ink_engine*, const char*) {
     set_err("libink was built without the spec module");
     return -13;

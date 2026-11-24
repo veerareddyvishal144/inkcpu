@@ -10,6 +10,14 @@ int engine_prefill_all(Engine& e, int slot, const int32_t* tokens, int n, float*
 PrefillTune& prefill_tune();   // chunk (default 256, max 1024), item sizes, attention kernel switch; env INK_PF_*
 ```
 
+> **Wave 2 (2026-11-24, agent P2/P2b): prompt chunks use the int16-accumulation expert GEMM by default.** `PrefillTune::i16 = 1` (`INK_PF_I16`) routes every NVFP4
+> expert item of a PROMPT CHUNK through `gemm_moe_nvfp4r_i16` (2.75 vector uops per 64 MACs instead of 5; integer dot products exact, float scale applied once per 16
+> weights instead of per 4). Consequences: the statements "prefill == decode bit for bit" in sections 3 and 5 now describe `INK_PF_I16=0` only; with the default, prompt-chunk
+> logits differ from decode at the flip-amplification level (argmax agreement 24/24 after a 43-token prefill, cosine 0.9976-0.9999 on the oracle prompts, NLL within 0.003
+> nats of llama.cpp over 3063 positions, i.e. the same parity class as decode itself), while chunk independence and thread determinism still hold BIT FOR BIT (chunk 1 ==
+> chunk 256; decode-attention mode chunk 1000 == chunk 256 at 1305 / 1500 tokens). `engine_verify` and `Engine::decode` never use the kernel (guarded), so speculative
+> decoding stays token-identical to plain decode. Speed at 16 threads, chunk 512: 87 -> 112 / 119 / 116 tok/s at 256 / 512 / 1024 prompt tokens. Details: `docs/KERNELS_GEMM.md` section 9.
+
 ## 1. Structure
 
 One `ThreadPool::run()` per chunk of up to `chunk` tokens (default 256, up to 1024; longer prompts loop over chunks, state carries over in the slot). Inside, every thread executes the

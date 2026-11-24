@@ -65,6 +65,8 @@ inline float hsum16(__m512 v) {  // identical tree to B1 (lanes j+8, j+4, j+2, j
 inline int pad16(int n) { return (n + 15) & ~15; }
 inline int dxn_of(int fmt, int k) { return pad16(fmt == GEMM_FMT_Q8 ? k / 32 : k / 16); }
 inline int xsn_of(int fmt, int k) { return fmt == GEMM_FMT_NVFP4X4 ? pad16(k / 16) : 0; }
+inline int xbn_of(int fmt, int k) { return fmt == GEMM_FMT_I16 ? pad16(k / 16) : 0; }  // P2: int32 sub-block sums per token
+inline bool fmt_ok(int want, bool x4, int have) { return have == (x4 ? GEMM_FMT_NVFP4X4 : want) || (!x4 && want == GEMM_FMT_NVFP4 && have == GEMM_FMT_I16); }
 inline size_t align64(size_t n) { return (n + 63) & ~(size_t)63; }
 
 inline __m512i ld2(const void* a, const void* b) {
@@ -84,8 +86,18 @@ inline __m512i unperm() {  // logical lane l <- physical lane idx[l]
 }
 
 // ---------------------------------------------------------------- activation packing
-void pack_one(int fmt, const block_q8_0* xr, int k, int8_t* q, float* d, int dxn, float* xs) {
+void pack_one(int fmt, const block_q8_0* xr, int k, int8_t* q, float* d, int dxn, float* xs, int32_t* xb) {
     const int nc = k / 64;
+    if (fmt == GEMM_FMT_I16) {  // P2: xb[s] = 12 * exact int sum of the 16 quants of sub-block s (the weight-offset bias of the i16 kernels)
+        const int ns = k / 16, nsp = pad16(ns);
+        for (int sb = 0; sb < ns; ++sb) {
+            const int8_t* qs = xr[sb / 2].qs + (sb & 1) * 16;
+            int sum = 0;
+            for (int i = 0; i < 16; ++i) sum += qs[i];
+            xb[sb] = 12 * sum;
+        }
+        for (int i = ns; i < nsp; ++i) xb[i] = 0;
+    }
     if (fmt == GEMM_FMT_NVFP4X4) {  // x4 prototype: Xs[s] = 12 * dx(block of s) * sum of the 16 quants of sub-block s (exact int sum, one float multiply)
         const int ns = k / 16, nsp = pad16(ns);
         for (int sb = 0; sb < ns; ++sb) {
@@ -478,7 +490,7 @@ template <int FMT, int ENC = ENC_GGUF, bool X4 = false>
 void gemm_dense(const void* w, size_t rs, const GemmAct& a, int t0, int t1, int k, float* y, size_t ldy, int nrows, const char* name) {
     if (nrows <= 0 || t1 <= t0) return;
     if (k <= 0 || k % 64 || k > KMAX) bad_arg(name, "K", k);
-    if (a.fmt != (X4 ? GEMM_FMT_NVFP4X4 : FMT) || a.k != k) bad_arg(name, "activation pack (fmt/k mismatch)", a.fmt);
+    if (!fmt_ok(FMT, X4, a.fmt) || a.k != k) bad_arg(name, "activation pack (fmt/k mismatch)", a.fmt);
     if (t0 < 0 || t1 > a.nt) bad_arg(name, "token range", t1);
     gemm_core<FMT, ENC, X4>((const char*)w, rs, a, nullptr, t0, t1 - t0, k, y + (size_t)t0 * ldy, ldy, nrows, g_gemm_group);
 }
@@ -487,7 +499,7 @@ template <int FMT, int ENC = ENC_GGUF, bool X4 = false>
 void moe_core(const void* w, size_t es, size_t rs, const GemmAct& a, const int32_t* act_rows, const MoeRoute& r, const MoeItem& it, int k,
               float* y, size_t ldy, const char* name) {
     if (k <= 0 || k % 64 || k > KMAX) bad_arg(name, "K", k);
-    if (a.fmt != (X4 ? GEMM_FMT_NVFP4X4 : FMT) || a.k != k) bad_arg(name, "activation pack (fmt/k mismatch)", a.fmt);
+    if (!fmt_ok(FMT, X4, a.fmt) || a.k != k) bad_arg(name, "activation pack (fmt/k mismatch)", a.fmt);
     const int p0 = r.offset[it.expert], p1 = r.offset[it.expert + 1];
     const int n = p1 - p0;
     if (n <= 0 || it.row1 <= it.row0) return;
@@ -518,7 +530,8 @@ double gemm_bench_unpack_ns(const void* w, size_t rs, int k, int nrows, int enc,
 
 // ---------------------------------------------------------------- public API
 size_t gemm_act_bytes(int fmt, int nt, int k) {
-    return align64((size_t)nt * (size_t)k) + (size_t)nt * (size_t)dxn_of(fmt, k) * 4 + (size_t)nt * (size_t)xsn_of(fmt, k) * 4;
+    return align64((size_t)nt * (size_t)k) + (size_t)nt * (size_t)dxn_of(fmt, k) * 4 + (size_t)nt * (size_t)xsn_of(fmt, k) * 4 +
+           (size_t)nt * (size_t)xbn_of(fmt, k) * 4;
 }
 
 GemmAct gemm_act_view(int fmt, const void* buf, int nt, int k) {
@@ -530,6 +543,7 @@ GemmAct gemm_act_view(int fmt, const void* buf, int nt, int k) {
     a.xq = (const int8_t*)buf;
     a.dx = (const float*)((const char*)buf + align64((size_t)nt * (size_t)k));
     a.xs = fmt == GEMM_FMT_NVFP4X4 ? a.dx + (size_t)nt * (size_t)a.dxn : nullptr;
+    a.xb = fmt == GEMM_FMT_I16 ? (const int32_t*)(a.dx + (size_t)nt * (size_t)a.dxn) : nullptr;
     return a;
 }
 
@@ -539,7 +553,7 @@ void gemm_pack_act(int fmt, const block_q8_0* x, int t0, int t1, int nt, int k, 
     const int nb = k / 32;
     for (int t = t0; t < t1; ++t)
         pack_one(fmt, x + (size_t)t * nb, k, const_cast<int8_t*>(a.xq) + (size_t)t * k, const_cast<float*>(a.dx) + (size_t)t * a.dxn, a.dxn,
-                 a.xs ? const_cast<float*>(a.xs) + (size_t)t * a.dxn : nullptr);
+                 a.xs ? const_cast<float*>(a.xs) + (size_t)t * a.dxn : nullptr, a.xb ? const_cast<int32_t*>(a.xb) + (size_t)t * a.dxn : nullptr);
 }
 
 void gemm_quantize_pack_act(int fmt, const float* x, size_t ldx, int t0, int t1, int nt, int k, void* buf) {
@@ -549,7 +563,7 @@ void gemm_quantize_pack_act(int fmt, const float* x, size_t ldx, int t0, int t1,
     for (int t = t0; t < t1; ++t) {
         quantize_row_q8_0(x + (size_t)t * ldx, tmp, k);
         pack_one(fmt, tmp, k, const_cast<int8_t*>(a.xq) + (size_t)t * k, const_cast<float*>(a.dx) + (size_t)t * a.dxn, a.dxn,
-                 a.xs ? const_cast<float*>(a.xs) + (size_t)t * a.dxn : nullptr);
+                 a.xs ? const_cast<float*>(a.xs) + (size_t)t * a.dxn : nullptr, a.xb ? const_cast<int32_t*>(a.xb) + (size_t)t * a.dxn : nullptr);
     }
 }
 

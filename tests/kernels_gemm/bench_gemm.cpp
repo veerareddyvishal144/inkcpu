@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "ink/kernels_gemm.h"
+#include "ink/kernels_gemv_multix.h"
 #include "ink/nvfp4_repack.h"
 #include "ink/threadpool.h"
 #include "testutil.h"
@@ -69,6 +70,8 @@ struct Opt {
     int threads = 16, reps = 7, visit = 12, group = 64, chunk = 64;
     std::vector<int> cpus;  // --cpus a,b,c (default 2,4,...,30,0)
     std::vector<int> ntok = {64, 128, 256};  // --ntok a,b,c: token chunks for the MoE section
+    int i16tile = 0, i16seg = 0, i16pf = -1;    // --i16tile N / --i16seg S / --i16pf 0|1: override the i16 kernel tunables (P2)
+    std::vector<int> mx = {8, 4, 0};             // --mx a,b,c: multix thresholds of the engine-mix arms in --what moe (experts with <= mx pairs run gemv_nvfp4r_multix)
 } opt;
 
 template <class F>
@@ -234,6 +237,87 @@ static void bench_x4() {
         std::fflush(stdout);
         free_weight_buffer(w);
     }
+}
+
+
+// ------------------------------------------------------------------ P2: i16 kernel A/B (gemm_nvfp4r exact vs gemm_nvfp4r_i16), single thread, interleaved
+static void bench_i16() {
+    const int cpu = default_cpus()[0];
+    std::printf("== i16 A/B (gemm_nvfp4r exact vs gemm_nvfp4r_i16), single thread CPU %d, interleaved, tile %d seg %d pf %d, load %s\n", cpu, g_gemm_i16_tile,
+                g_gemm_i16_seg, g_gemm_i16_pf, tu::loadavg().c_str());
+    ThreadPool pool(1, {cpu});
+    struct Cfg { int k, rows, nt; };
+    const Cfg cfgs[] = {{2304, 192, 1}, {2304, 192, 2}, {2304, 192, 4}, {2304, 192, 9}, {2304, 192, 16}, {2304, 192, 64}, {2304, 192, 256},
+                        {1152, 192, 4}, {1152, 192, 9}, {1152, 192, 16}, {1152, 192, 64}, {2304, 2304, 9}, {2304, 2304, 16}, {2304, 2304, 64}, {1152, 2304, 16}};
+    for (const Cfg& c : cfgs) {
+        const size_t rs = row_bytes_nvfp4(c.k);
+        char* w = (char*)alloc_weight_buffer(rs * c.rows, true);
+        fill_random(w, rs * c.rows);
+        fix_nv(w, c.rows, rs, c.k);
+        reencode_rows(w, c.rows, rs, c.k);
+        const std::vector<block_q8_0> q = make_acts(c.nt, c.k);
+        ActBuf a1(GEMM_FMT_I16, c.nt, c.k, &q);  // the I16 pack serves both kernels
+        std::vector<float> y0((size_t)c.nt * c.rows), y1((size_t)c.nt * c.rows);
+        auto run0 = [&]() { pool.run([&](int, int) { gemm_nvfp4r(w, rs, a1.a, 0, c.nt, c.k, y0.data(), c.rows, c.rows); }); };
+        auto run1 = [&]() { pool.run([&](int, int) { gemm_nvfp4r_i16(w, rs, a1.a, 0, c.nt, c.k, y1.data(), c.rows, c.rows); }); };
+        run0(); run1();
+        double md = 0, ma = 0;
+        for (size_t i = 0; i < y0.size(); ++i) { md = std::max(md, (double)std::fabs(y0[i] - y1[i])); ma = std::max(ma, (double)std::fabs(y0[i])); }
+        const int reps = std::max(3, opt.reps * (c.rows > 1000 ? 1 : 3));
+        double b0 = 1e30, b1 = 1e30;
+        std::vector<double> ratios;
+        for (int i = 0; i < reps; ++i) {
+            double t0 = now_s(); run0(); const double ta = now_s() - t0; b0 = std::min(b0, ta);
+            t0 = now_s(); run1(); const double tb = now_s() - t0; b1 = std::min(b1, tb);
+            ratios.push_back(ta / tb);
+        }
+        std::sort(ratios.begin(), ratios.end());
+        const double gm = (double)c.rows * c.nt * c.k * 1e-9;
+        std::printf("NVFP4r %4dx%d nt=%3d  exact %8.3f ms %5.1f GMAC/s | i16 %8.3f ms %5.1f GMAC/s | i16/exact speed %.3fx (median %.3fx) | max|dy| %.2g of max|y| %.3g  load %s\n",
+                    c.rows, c.k, c.nt, b0 * 1e3, gm / b0, b1 * 1e3, gm / b1, b0 / b1, ratios[ratios.size() / 2], md, ma, tu::loadavg().c_str());
+        std::fflush(stdout);
+        free_weight_buffer(w);
+    }
+}
+
+
+// ------------------------------------------------------------------ P2: unpack fast path A/B (pointer-table unpack vs uniform-stride unpack), same i16 kernel
+static void bench_i16u() {
+    const int cpu = default_cpus()[0];
+    std::printf("== i16 unpack A/B (g_gemm_i16_uniform 0 vs 1), single thread CPU %d, interleaved, tile %d seg %d, load %s\n", cpu, g_gemm_i16_tile, g_gemm_i16_seg,
+                tu::loadavg().c_str());
+    ThreadPool pool(1, {cpu});
+    struct Cfg { int k, rows, nt; };
+    const Cfg cfgs[] = {{2304, 192, 4}, {2304, 192, 9}, {2304, 192, 16}, {2304, 192, 64}, {1152, 192, 9}, {1152, 192, 16}, {2304, 2304, 9}, {2304, 2304, 16}};
+    for (const Cfg& c : cfgs) {
+        const size_t rs = row_bytes_nvfp4(c.k);
+        char* w = (char*)alloc_weight_buffer(rs * c.rows, true);
+        fill_random(w, rs * c.rows);
+        fix_nv(w, c.rows, rs, c.k);
+        reencode_rows(w, c.rows, rs, c.k);
+        const std::vector<block_q8_0> q = make_acts(c.nt, c.k);
+        ActBuf a1(GEMM_FMT_I16, c.nt, c.k, &q);
+        std::vector<float> y0((size_t)c.nt * c.rows), y1((size_t)c.nt * c.rows);
+        auto run0 = [&]() { g_gemm_i16_uniform = 0; pool.run([&](int, int) { gemm_nvfp4r_i16(w, rs, a1.a, 0, c.nt, c.k, y0.data(), c.rows, c.rows); }); };
+        auto run1 = [&]() { g_gemm_i16_uniform = 1; pool.run([&](int, int) { gemm_nvfp4r_i16(w, rs, a1.a, 0, c.nt, c.k, y1.data(), c.rows, c.rows); }); };
+        run0(); run1();
+        const bool same = std::memcmp(y0.data(), y1.data(), y0.size() * 4) == 0;
+        const int reps = std::max(3, opt.reps * (c.rows > 1000 ? 1 : 3));
+        double b0 = 1e30, b1 = 1e30;
+        std::vector<double> ratios;
+        for (int i = 0; i < reps; ++i) {
+            double t0 = now_s(); run0(); const double ta = now_s() - t0; b0 = std::min(b0, ta);
+            t0 = now_s(); run1(); const double tb = now_s() - t0; b1 = std::min(b1, tb);
+            ratios.push_back(ta / tb);
+        }
+        std::sort(ratios.begin(), ratios.end());
+        const double gm = (double)c.rows * c.nt * c.k * 1e-9;
+        std::printf("i16 %4dx%d nt=%3d  table-unpack %8.3f ms %5.1f GMAC/s | uniform-unpack %8.3f ms %5.1f GMAC/s | speed %.3fx (median %.3fx) | bits %s  load %s\n",
+                    c.rows, c.k, c.nt, b0 * 1e3, gm / b0, b1 * 1e3, gm / b1, b0 / b1, ratios[ratios.size() / 2], same ? "identical" : "DIFFERENT", tu::loadavg().c_str());
+        std::fflush(stdout);
+        free_weight_buffer(w);
+    }
+    g_gemm_i16_uniform = 1;
 }
 
 // ------------------------------------------------------------------ direct unpack timing (gguf / nvfp4r / x4), L1- and L2-resident rows
@@ -522,6 +606,7 @@ static void bench_moe(ThreadPool& pool) {
         moe_work_items(r, N, opt.chunk, items);
         ActBuf at(1, nt, Kg), ap(1, np, Kd);
         ActBuf at4(2, nt, Kg), ap4(2, np, Kd);  // x4 prototype packs
+        ActBuf at16(GEMM_FMT_I16, nt, Kg), ap16(GEMM_FMT_I16, np, Kd);  // P2 i16 packs
         // pre-gathered variant: activation of pair p = row pair_token[p] of the token pack, copied into pair order
         std::vector<block_q8_0> qg = make_acts(nt, Kg);
         std::vector<block_q8_0> qgp((size_t)np * (Kg / 32));
@@ -537,7 +622,8 @@ static void bench_moe(ThreadPool& pool) {
             return [&, rows_idx, kind]() {
                 pool.run_chunks((int64_t)items.size(), 1, [&](int, int64_t b, int64_t e) {
                     for (int64_t i = b; i < e; ++i) {
-                        if (kind == 2) gemm_moe_nvfp4r_x4(wgr, esg, rsg, at4.a, rows_idx, r, items[(size_t)i], Kg, yg.data(), N);
+                        if (kind == 3) gemm_moe_nvfp4r_i16(wgr, esg, rsg, at16.a, rows_idx, r, items[(size_t)i], Kg, yg.data(), N);
+                        else if (kind == 2) gemm_moe_nvfp4r_x4(wgr, esg, rsg, at4.a, rows_idx, r, items[(size_t)i], Kg, yg.data(), N);
                         else if (kind == 1) gemm_moe_nvfp4r(wgr, esg, rsg, a, rows_idx, r, items[(size_t)i], Kg, yg.data(), N);
                         else gemm_moe_nvfp4(wg, esg, rsg, a, rows_idx, r, items[(size_t)i], Kg, yg.data(), N);
                     }
@@ -548,7 +634,8 @@ static void bench_moe(ThreadPool& pool) {
             return [&, kind]() {
                 pool.run_chunks((int64_t)items.size(), 1, [&](int, int64_t b, int64_t e) {
                     for (int64_t i = b; i < e; ++i) {
-                        if (kind == 2) gemm_moe_nvfp4r_x4(wdr, esd, rsd, ap4.a, nullptr, r, items[(size_t)i], Kd, yd.data(), N);
+                        if (kind == 3) gemm_moe_nvfp4r_i16(wdr, esd, rsd, ap16.a, nullptr, r, items[(size_t)i], Kd, yd.data(), N);
+                        else if (kind == 2) gemm_moe_nvfp4r_x4(wdr, esd, rsd, ap4.a, nullptr, r, items[(size_t)i], Kd, yd.data(), N);
                         else if (kind == 1) gemm_moe_nvfp4r(wdr, esd, rsd, ap.a, nullptr, r, items[(size_t)i], Kd, yd.data(), N);
                         else gemm_moe_nvfp4(wd, esd, rsd, ap.a, nullptr, r, items[(size_t)i], Kd, yd.data(), N);
                     }
@@ -575,6 +662,9 @@ static void bench_moe(ThreadPool& pool) {
         auto a4 = ab_time(run_gu(at.a, r.pair_token.data(), 1), run_gu(at.a, r.pair_token.data(), 2));
         std::snprintf(name, sizeof name, "moe gate_up %dx%d, indirect, x4 PROTOTYPE", N, Kg);
         report(name, gm_gu, a4.second, a4.second, pool.size(), g_peak_mt);
+        auto a16 = ab_time(run_gu(at.a, r.pair_token.data(), 1), run_gu(at.a, r.pair_token.data(), 3));
+        std::snprintf(name, sizeof name, "moe gate_up %dx%d, indirect, i16 (P2)", N, Kg);
+        report(name, gm_gu, a16.second, a16.second, pool.size(), g_peak_mt);
         auto b = time_best(run_gu(agat, nullptr, 0), opt.reps);
         std::snprintf(name, sizeof name, "moe gate_up %dx%d, pre-gathered, gguf", N, Kg);
         report(name, gm_gu, b.first, b.second, pool.size(), g_peak_mt);
@@ -582,6 +672,50 @@ static void bench_moe(ThreadPool& pool) {
         auto c4 = ab_time(run_dn(1), run_dn(2));
         std::snprintf(name, sizeof name, "moe down %dx%d (per-pair act), x4 PROTOTYPE", N, Kd);
         report(name, gm_dn, c4.second, c4.second, pool.size(), g_peak_mt);
+        auto c16 = ab_time(run_dn(1), run_dn(3));
+        std::snprintf(name, sizeof name, "moe down %dx%d (per-pair act), i16 (P2)", N, Kd);
+        report(name, gm_dn, c16.second, c16.second, pool.size(), g_peak_mt);
+        std::snprintf(name, sizeof name, "moe layer (gate_up + down), i16 (P2)");
+        report(name, gm_gu + gm_dn, a16.second + c16.second, a16.second + c16.second, pool.size(), g_peak_mt);
+        std::printf("   i16 / nvfp4r (same-pair A/B): gate_up %.3fx, down %.3fx, layer %.3fx  (i16 tile %d seg %d pf %d)\n", a16.first / a16.second, c16.first / c16.second,
+                    (a16.first + c16.first) / (a16.second + c16.second), g_gemm_i16_tile, g_gemm_i16_seg, g_gemm_i16_pf);
+        // engine mix (phases G/H as wired): experts with <= mx pairs -> gemv_nvfp4r_multix (K2), bigger ones -> nvfp4r (exact) or i16 (P2); per item
+        {
+            std::vector<block_q8_0> qd = make_acts(np, Kd);
+            const int nbg = Kg / 32, nbd = Kd / 32;
+            auto run_mix = [&](int mx, bool i16, bool down) {
+                return [&, mx, i16, down]() {
+                    pool.run_chunks((int64_t)items.size(), 1, [&](int, int64_t b, int64_t e) {
+                        for (int64_t i = b; i < e; ++i) {
+                            const MoeItem& it = items[(size_t)i];
+                            const int p0 = r.offset[it.expert], npe = r.offset[it.expert + 1] - p0, nr = it.row1 - it.row0;
+                            if (npe <= mx) {
+                                const block_q8_0* xs[kMultixMaxX > 8 ? kMultixMaxX : 8];
+                                for (int q = 0; q < npe && q < 8; ++q) xs[q] = down ? &qd[(size_t)(p0 + q) * nbd] : &qg[(size_t)r.pair_token[(size_t)(p0 + q)] * nbg];
+                                if (down) gemv_nvfp4r_multix(wdr + (size_t)it.expert * esd + (size_t)it.row0 * rsd, rsd, nr, xs, npe, Kd, yd.data() + (size_t)p0 * N + it.row0, N);
+                                else gemv_nvfp4r_multix(wgr + (size_t)it.expert * esg + (size_t)it.row0 * rsg, rsg, nr, xs, npe, Kg, yg.data() + (size_t)p0 * N + it.row0, N);
+                            } else if (down) {
+                                if (i16) gemm_moe_nvfp4r_i16(wdr, esd, rsd, ap16.a, nullptr, r, it, Kd, yd.data(), N);
+                                else gemm_moe_nvfp4r(wdr, esd, rsd, ap.a, nullptr, r, it, Kd, yd.data(), N);
+                            } else {
+                                if (i16) gemm_moe_nvfp4r_i16(wgr, esg, rsg, at16.a, r.pair_token.data(), r, it, Kg, yg.data(), N);
+                                else gemm_moe_nvfp4r(wgr, esg, rsg, at.a, r.pair_token.data(), r, it, Kg, yg.data(), N);
+                            }
+                        }
+                    });
+                };
+            };
+            for (int mx : opt.mx) {
+                if (mx > 8) continue;
+                auto g = ab_time(run_mix(mx, false, false), run_mix(mx, true, false));
+                auto d = ab_time(run_mix(mx, false, true), run_mix(mx, true, true));
+                std::snprintf(name, sizeof name, "engine mix mx=%d: multix + nvfp4r (exact)", mx);
+                report(name, gm_gu + gm_dn, g.first + d.first, g.first + d.first, pool.size(), g_peak_mt);
+                std::snprintf(name, sizeof name, "engine mix mx=%d: multix + i16", mx);
+                report(name, gm_gu + gm_dn, g.second + d.second, g.second + d.second, pool.size(), g_peak_mt);
+                std::printf("   mx=%d i16-mix / exact-mix: gate_up %.3fx, down %.3fx, layer %.3fx\n", mx, g.first / g.second, d.first / d.second, (g.first + d.first) / (g.second + d.second));
+            }
+        }
         std::snprintf(name, sizeof name, "moe down %dx%d (per-pair act), gguf", N, Kd);
         report(name, gm_dn, c.first, c.first, pool.size(), g_peak_mt);
         std::snprintf(name, sizeof name, "moe down %dx%d (per-pair act), nvfp4r", N, Kd);
@@ -704,6 +838,10 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
         if (a == "--what") opt.what = next();
+        else if (a == "--i16tile") opt.i16tile = std::stoi(next());
+        else if (a == "--i16seg") opt.i16seg = std::stoi(next());
+        else if (a == "--i16pf") opt.i16pf = std::stoi(next());
+        else if (a == "--mx") { opt.mx.clear(); for (const char* q = next().c_str(); *q;) { opt.mx.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; } }
         else if (a == "--threads") opt.threads = std::atoi(next().c_str());
         else if (a == "--cpus" || a == "--ntok") {
             std::string l = next();
@@ -729,11 +867,16 @@ int main(int argc, char** argv) {
     }
     g_gemm_group = opt.group;
     std::printf("bench_gemm loadavg %s, group=%d chunk=%d reps=%d\n", tu::loadavg().c_str(), opt.group, opt.chunk, opt.reps);
+    if (opt.i16tile > 0) g_gemm_i16_tile = opt.i16tile;
+    if (opt.i16seg > 0) g_gemm_i16_seg = opt.i16seg;
+    if (opt.i16pf >= 0) g_gemm_i16_pf = opt.i16pf;
     const bool all = opt.what == "all";
     if (all || opt.what == "st") bench_st();
     if (opt.what == "rvs") bench_rvs();
     if (opt.what == "epi") bench_epi();
     if (opt.what == "x4") bench_x4();
+    if (opt.what == "i16") bench_i16();
+    if (opt.what == "i16u") bench_i16u();
     if (opt.what == "unpack") bench_unpack();
     if (opt.what == "tail") bench_tail();
     if (all || opt.what == "dense" || opt.what == "nvfp4" || opt.what == "moe" || opt.what == "small" || opt.what == "tune") {

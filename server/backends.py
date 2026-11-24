@@ -448,6 +448,10 @@ class InkBackend(Backend):
         lib.ink_slot_pos.argtypes = [c_void_p, c_int]
         lib.ink_forward.restype = c_int
         lib.ink_forward.argtypes = [c_void_p, c_int, self._pi, c_int, self._pf]
+        self._has_prefill = hasattr(lib, "ink_prefill")        # wave 2: prompt chunks always through the prefill executor (any n)
+        if self._has_prefill:
+            lib.ink_prefill.restype = c_int
+            lib.ink_prefill.argtypes = [c_void_p, c_int, self._pi, c_int, self._pf]
         lib.ink_last_timing.argtypes = [c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
         self.supports_rewind = all(hasattr(lib, s) for s in self.REWIND_SYMBOLS)   # S3's additions; older libink.so builds lack them
         if self.supports_rewind:
@@ -516,18 +520,19 @@ class InkBackend(Backend):
     def slot_pos(self, slot: int) -> int:
         return int(self._lib.ink_slot_pos(self._eng, slot))
 
-    def _forward(self, slot: int, arr: np.ndarray, want_logits: bool) -> Optional[np.ndarray]:
+    def _forward(self, slot: int, arr: np.ndarray, want_logits: bool, prompt: bool = False) -> Optional[np.ndarray]:
         out = self._bufs[slot]
-        rc = self._lib.ink_forward(self._eng, slot, arr.ctypes.data_as(self._pi), int(arr.size),
-                                   out.ctypes.data_as(self._pf) if want_logits else None)
+        fn = self._lib.ink_prefill if (prompt and self._has_prefill) else self._lib.ink_forward
+        rc = fn(self._eng, slot, arr.ctypes.data_as(self._pi), int(arr.size), out.ctypes.data_as(self._pf) if want_logits else None)
         if rc != 0:
-            msg = "ink_forward failed (rc=%d %s): %s" % (rc, self._RC.get(rc, "?"), (self._lib.ink_last_error() or b"").decode(errors="replace"))
+            msg = "%s failed (rc=%d %s): %s" % ("ink_prefill" if fn is not self._lib.ink_forward else "ink_forward", rc, self._RC.get(rc, "?"),
+                                                (self._lib.ink_last_error() or b"").decode(errors="replace"))
             raise (ContextFull(msg) if rc == -2 else BackendError(msg))
         return out if want_logits else None
 
     def prefill(self, slot: int, tokens: Sequence[int], want_logits: bool = True) -> Optional[np.ndarray]:
         arr = np.ascontiguousarray(np.asarray(tokens, dtype=np.int32))
-        return self._forward(slot, arr, want_logits)
+        return self._forward(slot, arr, want_logits, prompt=True)
 
     def step(self, slot: int, token: int) -> np.ndarray:
         self._tok1[0] = token
@@ -566,7 +571,8 @@ class InkBackend(Backend):
     # ink_spec_load BEFORE any slot is filled (installs the tap hook) -> per request: prefill via ink_forward, first anchor = ink_sample(logits),
     # then ink_spec_step(anchor) until the stop / the budget; the engine applies stop ids and max_emit; slot_pos advances by n_fed per step.
     SPEC_SYMBOLS = ("ink_spec_load", "ink_spec_free", "ink_spec_enable", "ink_spec_mode", "ink_spec_synced", "ink_spec_step", "ink_sample")
-    SPEC_MODES = {"off": 0, "plain": 0, "none": 0, "auto": 1}
+    SPEC_MODES = {"off": 0, "plain": 0, "none": 0, "auto": 1, "lookup": 9}   # lookup = session-lookup drafter only (agent L; auto = lookup + DSpark fallback)
+    SPEC_MODE_LOOKUP = 9
 
     class SamplingParamsC(ctypes.Structure):          # ink_sampling_params
         _fields_ = [("temperature", ctypes.c_float), ("top_k", ctypes.c_int32), ("top_p", ctypes.c_float), ("min_p", ctypes.c_float)]
@@ -582,8 +588,8 @@ class InkBackend(Backend):
 
     @staticmethod
     def parse_spec_mode(v) -> Optional[int]:
-        """`speculation` request field / --spec flag -> ink mode: None (absent: engine default), 0 off, 1 auto, 2..8 fixed verify width.
-        Raises ValueError for anything else."""
+        """`speculation` request field / --spec flag -> ink mode: None (absent: engine default), 0 off, 1 auto, 2..8 fixed verify width,
+        9 / "lookup" session lookup only. Raises ValueError for anything else."""
         if v is None:
             return None
         if isinstance(v, bool):
@@ -595,10 +601,10 @@ class InkBackend(Backend):
             if k.isdigit():
                 v = int(k)
             else:
-                raise ValueError("speculation must be auto, off or an integer 2..8 (verify width)")
-        if isinstance(v, int) and (v == 0 or v == 1 or 2 <= v <= 8):
+                raise ValueError("speculation must be auto, off, lookup or an integer 2..8 (verify width)")
+        if isinstance(v, int) and (v == 0 or v == 1 or 2 <= v <= 8):   # the lookup mode is spelled "lookup" (its number, 9, is an engine detail)
             return int(v)
-        raise ValueError("speculation must be auto, off or an integer 2..8 (verify width)")
+        raise ValueError("speculation must be auto, off, lookup or an integer 2..8 (verify width)")
 
     @classmethod
     def _bind_spec(cls, lib) -> Optional[str]:
@@ -623,6 +629,9 @@ class InkBackend(Backend):
         lib.ink_sample.restype = ctypes.c_int32
         lib.ink_sample.argtypes = [c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(cls.SamplingParamsC), ctypes.c_uint64,
                                    ctypes.POINTER(ctypes.c_uint64)]
+        if hasattr(lib, "ink_spec_lookup_enabled"):   # agent L's additive symbols (older libink.so builds lack them: nothing changes then)
+            lib.ink_spec_lookup_enabled.restype = c_int
+            lib.ink_spec_lookup_enabled.argtypes = [c_void_p]
         return None
 
     def _setup_spec(self, lib) -> None:
@@ -633,7 +642,21 @@ class InkBackend(Backend):
                 print("WARNING: --drafter given but %s: running without speculative decoding" % why, flush=True)
             return
         if not self.drafter_path:
-            self.spec_info = {"reason": "no --drafter given"}
+            # Agent L: without a drafter the engine still speculates from its session-lookup index (exact n-gram matches of the slot's own history,
+            # ink_spec_lookup in ink_abi.h; docs/SPEC_DESIGN.md 11). The server default (no --spec = the engine's default, auto) and --spec auto / lookup
+            # use it; --spec off (or env INK_SPEC=off, or --no-spec) keeps the plain path. Older libink.so builds without the symbol: nothing changes.
+            if self.spec_mode in (None, 1, self.SPEC_MODE_LOOKUP) and hasattr(lib, "ink_spec_lookup"):
+                lib.ink_spec_lookup.restype = ctypes.c_int
+                lib.ink_spec_lookup.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                ok = int(lib.ink_spec_lookup(self._eng, 1)) == 0
+                if ok and self.spec_mode is not None and int(lib.ink_spec_enable(self._eng, int(self.spec_mode))) != 0:
+                    ok = False
+                if ok:
+                    self.spec_default_mode = int(lib.ink_spec_mode(self._eng))   # env INK_SPEC applied (off -> 0: requests default to the plain path)
+                    self.spec_info = {"drafter": None, "lookup": True, "exact_verify": os.environ.get("INK_SPEC_EXACT", "0")}
+                    self.supports_spec = True
+                    return
+            self.spec_info = {"reason": "no --drafter given" if self.spec_mode not in (None, 1, self.SPEC_MODE_LOOKUP) else "no --drafter given and libink has no ink_spec_lookup"}
             return
         t0 = time.monotonic()
         rc = int(lib.ink_spec_load(self._eng, self.drafter_path.encode()))
@@ -645,7 +668,8 @@ class InkBackend(Backend):
             print("WARNING: ink_spec_enable(%d) failed: %s" % (self.spec_mode, (lib.ink_last_error() or b"").decode(errors="replace")), flush=True)
         self.spec_default_mode = int(lib.ink_spec_mode(self._eng))
         self.spec_info = {"drafter": self.drafter_path, "load_seconds": round(time.monotonic() - t0, 2),
-                          "exact_verify": os.environ.get("INK_SPEC_EXACT", "0")}
+                          "exact_verify": os.environ.get("INK_SPEC_EXACT", "0"),
+                          "lookup": bool(hasattr(lib, "ink_spec_lookup_enabled") and lib.ink_spec_lookup_enabled(self._eng))}
         self.supports_spec = True
 
     def spec_synced(self, slot: int) -> bool:

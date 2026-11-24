@@ -143,7 +143,9 @@ struct Carver {
     }
 };
 
-size_t max_act_bytes(int nt, int k) { return std::max(gemm_act_bytes(GEMM_FMT_Q8, nt, k), gemm_act_bytes(GEMM_FMT_NVFP4, nt, k)); }
+size_t max_act_bytes(int nt, int k) {   // the expert packs may be Q8, NVFP4 or I16 (P2: NVFP4 + int32 sub-block sums, the largest)
+    return std::max({gemm_act_bytes(GEMM_FMT_Q8, nt, k), gemm_act_bytes(GEMM_FMT_NVFP4, nt, k), gemm_act_bytes(GEMM_FMT_I16, nt, k)});
+}
 
 void carve(PfScratch& X, Carver& A, int cap) {
     const size_t C = (size_t)cap;
@@ -224,6 +226,7 @@ PrefillTune make_tune() {
     if (const char* a = std::getenv("INK_PF_ATTN")) t.attn_decode_kernels = std::strcmp(a, "decode") == 0 ? 1 : 0;
     t.multix = env_int("INK_PF_MULTIX", t.multix);
     t.multix_check = env_int("INK_PF_MULTIX_CHECK", 0);
+    t.i16 = env_int("INK_PF_I16", t.i16);
     return t;
 }
 
@@ -445,7 +448,10 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     float* h_f = h_a + 3 * kD;
     KvLayer& kv = S.kv[vis.index];
     const bool nv = L.expert_type == T_NVFP4;
-    const int efmt = nv ? GEMM_FMT_NVFP4 : GEMM_FMT_Q8;
+    // P2 (wave 2): prompt chunks may run the big NVFP4 experts through the int16-accumulation kernel (needs the I16 activation pack = NVFP4 pack +
+    // sub-block sums, which the exact nvfp4r kernels and the multix diagnostic accept too). NEVER in verify (c.verify): verify == decode bit for bit.
+    const bool i16 = nv && L.nvfp4r && c.tu.i16 != 0 && !c.verify;
+    const int efmt = nv ? (i16 ? GEMM_FMT_I16 : GEMM_FMT_NVFP4) : GEMM_FMT_Q8;
     const int tapk = c.taps ? tap_index(vis.index) : -1;
     float *rec_k = nullptr, *rec_v = nullptr, *rec_a = nullptr, *rec_f = nullptr;   // verify: conv-input records of this visit
     if (c.rec) {
@@ -722,8 +728,16 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
     // Kernel per item (K2, wave 1): experts with <= tu.multix routed pairs run the multi-activation GEMV (one weight stream, activations addressed indirectly
     // through pair_token, no 4-row panel unpack); bigger experts run the batched GEMM. Both are bit-identical per (row, token) to the decode GEMV.
     // nvfp4r (K1): the arena holds re-encoded NVFP4 scale bytes -> the nvfp4r_* kernels (K3's gemm_moe_nvfp4r, K2's gemv_nvfp4r_multix) must read them.
-    const int mx_max = std::min(c.tu.multix, kMultixMaxX);
+    // i16 (P2, wave 2): in prompt chunks with the int16 kernel enabled, EVERY NVFP4 expert item runs gemm_moe_nvfp4r_i16, whatever its pair count: its result
+    // per (row, token) does not depend on the token tile, so the chunk size cannot change the logits (gate (c): chunk 1 == chunk 256 bit for bit), and the
+    // multix path (exact arithmetic) is only taken when i16 is off or in verify. (P2's mix sweep: all-i16 is 1-3 % faster than multix + i16 anyway.)
+    // INK_PF_I16=2 (A/B only): P2's original mixed selection (multix below the threshold, i16 above), whose logits depend on the chunk boundaries.
+    const int mx_max = (i16 && c.tu.i16 != 2) ? 0 : std::min(c.tu.multix, kMultixMaxX);
     const bool nvr = nv && L.nvfp4r;
+    if (c.verify && (i16 || efmt == GEMM_FMT_I16)) {   // P2 guard: the deviating kernel must never run in the verify path
+        std::fprintf(stderr, "engine_prefill: i16 kernel selected in the verify path (bug)\n");
+        std::abort();
+    }
     {
         const GemmAct axe = gemm_act_view(efmt, X.act_xe, n, kD);
         float* tmp = X.gu_tmp + (size_t)t.tid * X.gu_tmp_stride;
@@ -769,7 +783,10 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
                 float* yg = off_floats(tmp, -((int64_t)p0 * ldt + it.row0));
                 float* yu = off_floats(tmp, -((int64_t)p0 * ldt + (kFF + it.row0)) + w);
                 const MoeItem ig{it.expert, it.row0, it.row1}, iu{it.expert, kFF + it.row0, kFF + it.row1};
-                if (nvr) {
+                if (i16) {   // P2: int16 chain (prompt chunks only; i16 implies nvr and !c.verify)
+                    gemm_moe_nvfp4r_i16(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
+                    gemm_moe_nvfp4r_i16(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
+                } else if (nvr) {
                     gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, ig, kD, yg, (size_t)ldt);
                     gemm_moe_nvfp4r(L.gu, L.gu_eb, L.gu_rs, axe, X.route.pair_token.data(), X.route, iu, kD, yu, (size_t)ldt);
                 } else if (nv) {
@@ -832,6 +849,8 @@ void visit(PCtx& c, PTh& t, const Visit& vis, float*& cur, float*& nxt, int& nb)
                                 break;
                             }
                 }
+            } else if (i16) {   // P2: int16 chain (prompt chunks only)
+                gemm_moe_nvfp4r_i16(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, X.y_dn, kD);
             } else if (nvr) {
                 gemm_moe_nvfp4r(L.dn, L.dn_eb, L.dn_rs, adn, nullptr, X.route, it, kFF, X.y_dn, kD);
             } else if (nv) {

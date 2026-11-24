@@ -51,7 +51,10 @@ inline void write_i32(const std::string& p, const std::vector<int32_t>& v) {
     }
 }
 inline const std::vector<std::string>& prompt_names() {
-    static const std::vector<std::string> n = {"code_completion", "tool_call", "chat_code", "reasoning", "chat_answer", "prose_continuation", "chat_email", "long_context_qa"};
+    // the first 8 are the DSpark prompts (tools/dspark/prompts); the lookup_* prompts (agent L: copy-heavy editor / tool-call turns, tests/spec/prompts/lookup_*.txt) follow,
+    // so that SPEC_PROMPTS <= 8 and the pooled bench numbers over the first 8 are unchanged
+    static const std::vector<std::string> n = {"code_completion", "tool_call", "chat_code", "reasoning", "chat_answer", "prose_continuation", "chat_email", "long_context_qa",
+                                               "lookup_docstring", "lookup_toolcall", "lookup_typo"};
     return n;
 }
 inline std::vector<int32_t> prompt(const std::string& name) { return read_i32(std::string(INK_SOURCE_DIR) + "/tests/spec/prompts/" + name + ".i32"); }

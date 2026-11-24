@@ -26,6 +26,10 @@ int  ink_slot_pos(const ink_engine*, int slot);  // number of tokens currently i
 // Append n tokens to the slot (prefill if n > 1, decode if n == 1). If logits_out != NULL it receives the logits of
 // the LAST token, float[ink_n_vocab] (final softcap already applied: 30*tanh(x/30)). Returns 0 on success.
 int ink_forward(ink_engine*, int slot, const int32_t* tokens, int n, float* logits_out);
+// Prompt processing. Same contract as ink_forward but always through the batched prefill executor, also for n = 1 or 2 (ink_forward runs
+// n < INK_PREFILL_MIN tokens through the decode loop). Servers should use it for every prompt chunk and ink_forward(n = 1) for generated tokens,
+// so a prompt processed in different chunkings (cold vs rewound continuation) gives bit-identical state (wave 2: prompt chunks use the int16 GEMM).
+int ink_prefill(ink_engine*, int slot, const int32_t* tokens, int n, float* logits_out);
 
 // Fetch counters for the last ink_forward: wall time in microseconds spent in kernels vs total (best effort, may be 0).
 void ink_last_timing(const ink_engine*, double* total_us, double* kernel_us);
@@ -45,7 +49,8 @@ typedef struct ink_sampling_params {
 
 typedef struct ink_spec_request {
     int32_t anchor;            // the last sampled token, NOT yet processed by the engine (it sits at position ink_slot_pos)
-    int32_t mode;              // -1 = engine default (ink_spec_enable / env INK_SPEC), 0 = plain, 1 = auto, 2..8 = fixed verify width T (rows incl. the anchor)
+    int32_t mode;              // -1 = engine default (ink_spec_enable / env INK_SPEC), 0 = plain, 1 = auto, 2..8 = fixed verify width T (rows incl. the anchor),
+                               // 9 = session lookup only (agent L: auto = lookup first, then the DSpark policy; 9 = lookup, else plain)
     ink_sampling_params sp;
     uint64_t seed;             // sampled mode: the step is a deterministic function of (slot state, request); chain result.next_seed into the next step
     const int32_t* stop_ids;   // may be NULL when n_stop == 0
@@ -68,13 +73,23 @@ typedef struct ink_spec_result {
 
 int  ink_spec_load(ink_engine*, const char* drafter_gguf);   // loads the DSpark drafter and installs the tap hook; 0 ok (see ink_last_error)
 void ink_spec_free(ink_engine*);                             // removes the drafter (ink_spec_step keeps working as a sampled plain decode step)
-int  ink_spec_enable(ink_engine*, int mode);                 // default mode for requests with mode = -1: 0 plain, 1 auto, 2..8 fixed; 0 ok
+int  ink_spec_enable(ink_engine*, int mode);                 // default mode for requests with mode = -1: 0 plain, 1 auto, 2..8 fixed, 9 lookup only; 0 ok
 int  ink_spec_mode(const ink_engine*);                       // the default mode in effect (env INK_SPEC applied)
 int  ink_spec_synced(const ink_engine*, int slot);           // 1 when the drafter context equals the slot (speculation possible), else 0
 // One step: [draft ->] verify / decode -> sample -> stop / budget -> rollback. Returns result->rc (0 ok). ink_last_timing reports total_us of the step afterwards.
 int  ink_spec_step(ink_engine*, int slot, const ink_spec_request*, ink_spec_result*);
 // Samples one token from a logits row (ink_n_vocab floats, as written by ink_forward) with the sampler the spec step uses (first anchor); next_seed may be NULL.
 int32_t ink_sample(const ink_engine*, const float* logits, const ink_sampling_params*, uint64_t seed, uint64_t* next_seed);
+// ---- session-lookup drafter (agent L, wave 2; docs/SPEC_DESIGN.md 11). Draft-model-free speculation: exact n-gram matches of the slot's own history (prompt, generated
+// text, tool results) are verified like DSpark drafts, so the output stays token-identical. The decoder keeps the token history itself: ink_forward, ink_slot_reset,
+// ink_slot_new and ink_slot_rewind feed it (nothing to do on the caller's side). Works without ink_spec_load: a decoder without a drafter is created at the first
+// ink_forward / ink_spec_step / ink_spec_lookup call (auto then means lookup + plain; ink_spec_synced stays 0 because there is no drafter context).
+int  ink_spec_lookup(ink_engine*, int enable);               // 1 / 0: enable / disable the lookup drafter (default: enabled, env INK_SPEC_LOOKUP=0 disables); 0 ok
+int  ink_spec_lookup_enabled(const ink_engine*);             // 1 when lookup drafts may be used (auto / mode 9)
+int  ink_spec_last_source(const ink_engine*);                // draft source of the last ink_spec_step: 0 plain step, 1 DSpark, 2 session lookup
+// Per match-length bucket [8,12) [12,16) [16,32) [32,inf): steps, drafted rows, accepted rows, declined matches (predicted speed-up below break-even), yielded matches
+// (auto: the DSpark policy predicted more) = 20 int64 values; returns the count written (<= cap).
+int  ink_spec_lookup_stats(const ink_engine*, int slot, int64_t* out, int cap);
 
 // ======================================================================= slot checkpoints and rewind (agent S3; docs/REWIND.md)
 // The engine takes a SHALLOW checkpoint (position + conv histories, 3.83 MB) automatically after every prefill chunk and at the end of every

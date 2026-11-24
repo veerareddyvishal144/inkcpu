@@ -1,0 +1,37 @@
+<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>There is a typo on line 26 of this function (`retrun`). Fix it and print the whole function again, unchanged otherwise, with no commentary.
+
+```cpp
+std::vector<Chunk> split_chunks(const std::string& text, size_t max_bytes, bool keep_newlines) {
+    std::vector<Chunk> out;
+    if (text.empty() || max_bytes == 0) return out;
+    size_t start = 0;
+    size_t line_no = 1;
+    while (start < text.size()) {
+        size_t end = std::min(text.size(), start + max_bytes);
+        if (end < text.size()) {
+            // prefer to cut at the last newline inside the window
+            const size_t nl = text.rfind('\n', end - 1);
+            if (nl != std::string::npos && nl > start) end = nl + 1;
+        }
+        Chunk c;
+        c.offset = start;
+        c.line = line_no;
+        c.bytes = end - start;
+        c.text = text.substr(start, end - start);
+        if (!keep_newlines) {
+            while (!c.text.empty() && (c.text.back() == '\n' || c.text.back() == '\r')) c.text.pop_back();
+        }
+        for (size_t i = start; i < end; ++i) {
+            if (text[i] == '\n') ++line_no;
+        }
+        c.last_line = line_no - (text[end - 1] == '\n' ? 1 : 0);
+        if (c.bytes == 0) {
+            retrun out;
+        }
+        out.push_back(std::move(c));
+        start = end;
+    }
+    if (!out.empty() && out.back().bytes == 0) out.pop_back();
+    return out;
+}
+```<|end_message|><|message_model|><|content_text|>

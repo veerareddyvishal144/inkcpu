@@ -51,7 +51,7 @@ lib.ink_sample.argtypes = [ctypes.c_void_p, P(ctypes.c_float), P(SP), ctypes.c_u
 
 print("version:", lib.ink_version().decode())
 t0 = time.time()
-h = lib.ink_load(b"/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf", int(os.environ.get("INK_THREADS", "6")), 2, 2048)
+h = lib.ink_load(os.environ.get("INK_GGUF", "/data/inkling-mini/models/Inkling-2-Mini-UD-Q4_K_XL.gguf").encode(), int(os.environ.get("INK_THREADS", "6")), 2, 2048)
 assert h, lib.ink_last_error()
 print("engine loaded in %.1f s" % (time.time() - t0))
 nv = lib.ink_n_vocab(h)
@@ -59,7 +59,7 @@ assert nv == 200058, nv
 have_drafter = False
 if not no_drafter:
     t0 = time.time()
-    rc = lib.ink_spec_load(h, b"/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf")
+    rc = lib.ink_spec_load(h, os.environ.get("INK_DRAFTER", "/data/inkling-mini/models/dspark-Inkling-2-Mini-Q8_0.gguf").encode())
     print("ink_spec_load rc", rc, "" if rc == 0 else lib.ink_last_error().decode(), "(%.1f s)" % (time.time() - t0))
     have_drafter = rc == 0
 assert lib.ink_spec_enable(h, 1) == 0 and lib.ink_spec_mode(h) in (0, 1, 4, 8)
